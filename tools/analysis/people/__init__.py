@@ -1,6 +1,6 @@
 """SP3 people: 3D-first player / non-player detection and identity ("tracker3d").
 
-Spec: docs/superpowers/specs/2026-09-27-sp3-player-nonplayer-detection-design.md. Pipeline per clip:
+Spec: _archive/superpowers/specs/2026-09-27-sp3-player-nonplayer-detection-design.md. Pipeline per clip:
 candidates (cross-view 3D people per synced frame) -> tracklets -> seeds pin tracklets -> per-tracklet
 player score -> per-half identity (min-cost flow) -> persons/1 sidecar.
 """

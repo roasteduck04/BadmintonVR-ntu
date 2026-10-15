@@ -14,14 +14,14 @@ def _minimal_valid_doc():
         "stroke": {"label": "clear", "confidence": 0.9},
     }
     return {
-        "schema_version": "3.0", "clip_id": "synth_rally_01",
+        "schema_version": "5.0", "clip_id": "synth_rally_01",
         "meta": {"fps": 30.0, "frame_count": 1, "source_clip": "synthetic",
                  "camera": None,
                  "producers": {"pose": "synthetic", "position": "synthetic",
                                "racket": None, "grip": None,
                                "stroke": "synthetic", "shuttle": "synthetic"}},
         "court": court,
-        "skeleton": {"type": "smpl-24",
+        "skeleton": {"type": "smpl-x58",
                      "joint_names": schema.JOINT_NAMES, "parents": schema.PARENTS},
         "players": [
             {"id": "P1", "side": "near", "frames": [dict(pf)]},
@@ -34,11 +34,11 @@ def _minimal_valid_doc():
     }
 
 
-def test_topology_is_reused_smpl24():
-    assert schema.NUM_JOINTS == 24 and schema.STRIDE == 4
-    assert len(schema.JOINT_NAMES) == 24 and len(schema.PARENTS) == 24
+def test_topology_is_58_joints():
+    assert schema.NUM_JOINTS == 58 and schema.STRIDE == 4
+    assert len(schema.JOINT_NAMES) == 58 and len(schema.PARENTS) == 58
     assert schema.PARENTS[0] == -1
-    assert schema.REST_POSE.shape == (24, 3)
+    assert schema.REST_POSE.shape == (58, 3)
 
 
 def test_court_block_matches_regulation():

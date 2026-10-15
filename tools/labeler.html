@@ -1,0 +1,100 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Identity labels</title>
+<!-- Pre-fill + confirm identity labelling (SP3, v0.7.2). Served by tools/serve_calibrator.py at /labeler;
+     backend analysis/people/labels.py (LabelService). Labels -> data/gt/labels/<clip>_ids.json (idlabels/1). -->
+<style>
+ body{margin:0;background:#1d1f24;color:#ddd;font:14px system-ui}
+ #bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:6px 10px;background:#2a2d34}
+ #seeds{padding:4px 10px} #seeds img{height:64px;margin:0 8px 0 4px;border:2px solid #555;vertical-align:middle}
+ #seeds span{font-size:12px}
+ #why{color:#ffcc66} #msg{color:#8f8}
+ canvas{display:block;margin:6px auto;max-width:98vw;max-height:84vh;cursor:crosshair}
+ kbd{background:#444;padding:1px 5px;border-radius:3px}
+</style></head><body>
+<div id="bar"><select id="clip"></select><span id="prog"></span><span id="why"></span><span id="msg"></span>
+ <span><kbd>click</kbd>/<kbd>Tab</kbd> select · <kbd>1</kbd>-<kbd>4</kbd> P1-P4 · <kbd>N</kbd> non-player · <kbd>S</kbd> skip ·
+ <kbd>Esc</kbd> deselect · <kbd>Enter</kbd> accept all + next (stops at an unset person) · <kbd>Shift</kbd>+<kbd>Enter</kbd> save + next anyway · <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> prev / next</span></div>
+<div id="seeds"></div><canvas id="cv"></canvas>
+<script>
+const COL={P1:"#33b3ff",P2:"#ff8033",P3:"#4de666",P4:"#e64db3",N:"#8a8a8a",S:"#555",U:"#fff"};
+const EDGES=[[5,7],[7,9],[6,8],[8,10],[5,6],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16],[0,1],[0,2],[1,3],[2,4],
+             [15,17],[15,18],[15,19],[16,20],[16,21],[16,22]];
+const CONF=0.3;
+let clip=null,items=[],cur=0,frame=null,sel=null,img=null,scale=1,busy=false,token=0;
+const seedCache={};
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+const enc=encodeURIComponent;
+async function j(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(`${r.status} ${u}`);return r.json();}
+function msg(t){document.getElementById("msg").textContent=t||"";}
+async function init(){const cl=await j("/api/label/clips");const s=document.getElementById("clip");
+ s.innerHTML=cl.map(c=>`<option value="${c.clip}">${c.clip} (${c.persons})</option>`).join("");
+ s.onchange=()=>{s.blur();load(s.value);};
+ if(cl.length)load(cl[0].clip);else msg("no persons files found (run: python -m analysis.people track)");}
+async function load(c){clip=c;const r=await j(`/api/label/frames?clip=${enc(c)}`);items=r.items;
+ const i=items.findIndex(x=>!x.done);cur=i<0?0:i;show();}
+function progress(){const it=items[cur];if(!it)return;
+ document.getElementById("prog").textContent=
+  `${items.filter(x=>x.done).length} / ${items.length} · #${cur+1} ${it.view} raw ${it.raw} (frame ${it.f})${it.done?" ✓":""}`;}
+async function show(){const it=items[cur];if(!it)return;const my=++token;
+ frame=null;sel=null;          // keys are ignored until this frame's detections arrive
+ progress();document.getElementById("why").textContent=it.reasons.join(", ");
+ const fr=await j(`/api/label/frame?clip=${enc(clip)}&view=${enc(it.view)}&raw=${it.raw}`);
+ if(my!==token)return;
+ // pre-fill: a saved label, else the tracker's proposal ("U" = unknown track -> needs a decision, left unset)
+ fr.dets.forEach(d=>d.cur=d.label||(d.proposal==="U"?"":d.proposal)||"");
+ frame=fr;sel=null;img=null;draw();
+ const key=clip+"|"+it.view;
+ if(!(key in seedCache))seedCache[key]=await j(`/api/label/seeds?clip=${enc(clip)}&view=${enc(it.view)}`).catch(()=>[]);
+ if(my!==token)return;
+ document.getElementById("seeds").innerHTML=seedCache[key].map(s=>
+  `<span style="color:${COL[s.pid]||"#ddd"}">${s.pid}<img style="border-color:${COL[s.pid]||"#555"}" src="data:image/jpeg;base64,${s.jpeg}"></span>`).join("");
+ const im=new Image();
+ im.onload=()=>{if(my===token){img=im;draw();}};
+ im.onerror=()=>{};                                  // no video: stay on the grey background
+ im.src=`/api/label/image?clip=${enc(clip)}&view=${enc(it.view)}&raw=${it.raw}`;}
+// drawn = the backend's d.visible (labels._visible on the unrounded scores; kps are rounded to 0.1, so recomputing
+// here could disagree at the CONF edge): only drawn detections must be labelled (draw, click, Tab, Enter-stop)
+function box(d){if(!d.visible)return null;let p=d.kps.filter(q=>q[2]>=CONF);if(!p.length)p=d.kps;
+ const xs=p.map(q=>q[0]*scale),ys=p.map(q=>q[1]*scale);return[Math.min(...xs),Math.min(...ys),Math.max(...xs),Math.max(...ys)];}
+function draw(){if(!frame)return;const W=frame.width||2160,H=frame.height||3840;scale=Math.min(1,1600/Math.max(W,H));
+ cv.width=Math.round(W*scale);cv.height=Math.round(H*scale);ctx.fillStyle="#444";ctx.fillRect(0,0,cv.width,cv.height);
+ if(img)ctx.drawImage(img,0,0,cv.width,cv.height);
+ ctx.font="bold 15px system-ui";
+ frame.dets.forEach(d=>{const bb=box(d);if(!bb)return;const c=COL[d.cur]||"#fff";
+  ctx.strokeStyle=c;ctx.lineWidth=d===sel?4:2;ctx.setLineDash(d.cur?[]:[6,4]);
+  const k=d.kps.map(p=>[p[0]*scale,p[1]*scale,p[2]]);
+  EDGES.forEach(([a,b])=>{if(k[a][2]>=CONF&&k[b][2]>=CONF){ctx.beginPath();ctx.moveTo(k[a][0],k[a][1]);ctx.lineTo(k[b][0],k[b][1]);ctx.stroke();}});
+  if(d===sel){ctx.lineWidth=2;ctx.strokeStyle="#ff0";ctx.strokeRect(bb[0]-6,bb[1]-6,bb[2]-bb[0]+12,bb[3]-bb[1]+12);ctx.strokeStyle=c;}
+  ctx.strokeRect(bb[0],bb[1],bb[2]-bb[0],bb[3]-bb[1]);ctx.setLineDash([]);
+  const was=d.proposal&&d.cur!==d.proposal?` (was ${d.proposal})`:"";
+  ctx.fillStyle=c;ctx.fillText(`#${d.det} ${d.cur||"?"}${was}`,bb[0],Math.max(14,bb[1]-5));});}
+// click: the smallest box (8 px margin) that contains the point, so a far player inside a near player's box is reachable
+cv.onclick=e=>{if(!frame)return;const r=cv.getBoundingClientRect(),x=(e.clientX-r.left)*cv.width/r.width,y=(e.clientY-r.top)*cv.height/r.height;
+ let best=null,area=Infinity;
+ frame.dets.forEach(d=>{const b=box(d);if(!b)return;
+  if(x>=b[0]-8&&x<=b[2]+8&&y>=b[1]-8&&y<=b[3]+8){const a=(b[2]-b[0]+16)*(b[3]-b[1]+16);if(a<area){area=a;best=d;}}});
+ sel=best;draw();};
+async function save(){const it=items[cur];const labels=frame.dets.filter(d=>d.cur).map(d=>({det:d.det,label:d.cur}));
+ const r=await j("/api/label/save",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({clip,view:it.view,raw:it.raw,labels})});
+ const open=frame.dets.filter(d=>!d.cur&&box(d)).length;it.done=!open;   // backend rule: every drawn detection labelled
+ msg(`saved ${r.saved}`+(open?` · ${open} unset detection(s) left, frame not done`:""));}
+function go(i){cur=Math.max(0,Math.min(items.length-1,i));show();}
+document.onkeydown=async e=>{if(!frame||busy||e.target.tagName==="SELECT")return;const k=e.key.toUpperCase();
+ if(sel&&["1","2","3","4"].includes(k)){sel.cur="P"+k;draw();}
+ else if(sel&&(k==="N"||k==="S")){sel.cur=k;draw();}
+ else if(e.key==="Escape"){sel=null;draw();}
+ else if(e.key==="Tab"){e.preventDefault();const ds=frame.dets.filter(d=>box(d));if(!ds.length)return;
+  const i=ds.indexOf(sel);sel=ds[(i+(e.shiftKey?ds.length-1:1))%ds.length];draw();}
+ else if(e.key==="Enter"){e.preventDefault();
+  // Enter accepts every current label (selected or not), but stops at the first unset drawn detection (likely a
+  // missed player): select it and wait for a decision. Shift+Enter saves what is set and moves on anyway.
+  const unset=frame.dets.find(d=>!d.cur&&box(d));
+  if(unset&&!e.shiftKey){sel=unset;draw();msg(`#${unset.det} is unset: press 1-4 / N / S (Shift+Enter saves and moves on anyway)`);return;}
+  busy=true;
+  try{await save();progress();if(cur<items.length-1)go(cur+1);else msg("last frame saved");}
+  catch(err){msg("save failed: "+err.message);}finally{busy=false;}}
+ else if(e.key==="ArrowRight"){e.preventDefault();go(cur+1);}
+ else if(e.key==="ArrowLeft"){e.preventDefault();go(cur-1);}};
+init().catch(err=>msg(err.message));
+</script></body></html>

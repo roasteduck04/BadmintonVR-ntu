@@ -73,14 +73,27 @@ class TestComputeMetrics:
         assert m["P1"]["jump_count_2m"] >= 1
         assert m["P1"]["jump_max"] >= 4.9
 
+    def test_no_jump_across_a_gap(self):
+        """Review 2 L15: a player reappearing 2.5 m away after a long gap is not a frame-to-frame jump."""
+        from analysis.eval_tracking import compute_metrics
+        def gap_then_elsewhere(f):
+            if f < 20:
+                return [0.0] * 96, [0.0, 0.0]
+            if f < 120:
+                return None, None
+            return [0.0] * 96, [2.5, 0.0]
+        doc = _make_analysis([("P1", "near", gap_then_elsewhere)], frame_count=150)
+        m = compute_metrics(doc)
+        assert m["P1"]["jump_count_1m"] == 0 and m["P1"]["jump_count_2m"] == 0
+
     def test_wrong_side_detection(self):
         """Detect frames on wrong court side."""
         from analysis.eval_tracking import compute_metrics
-        # "near" side = positive Z (court origin at center, Z = 13.40m total)
+        # "near" side = negative Z (as the tracker and the data: side "near" if z < 0)
         def on_wrong_side(f):
             if f < 10:
-                return [0.0] * 96, [0.0, -3.0]  # negative Z = far side
-            return [0.0] * 96, [0.0, 3.0]
+                return [0.0] * 96, [0.0, 3.0]  # positive Z = far side
+            return [0.0] * 96, [0.0, -3.0]
         doc = _make_analysis([("P1", "near", on_wrong_side)], frame_count=50)
         m = compute_metrics(doc)
         assert m["P1"]["wrong_side_frames"] == 10

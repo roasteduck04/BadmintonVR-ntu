@@ -3,7 +3,7 @@
 Assumed-focal pinhole: intrinsics come from a field-of-view guess (no lens
 metadata in the phone footage); extrinsics come from court-point PnP in the
 Y-up court world frame (floor at Y=0). See
-docs/superpowers/specs/2026-08-06-real-footage-triangulation-pose-position-design.md.
+_archive/superpowers/specs/2026-08-06-real-footage-triangulation-pose-position-design.md.
 """
 from __future__ import annotations
 

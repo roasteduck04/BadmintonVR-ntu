@@ -160,3 +160,7 @@ data/pose_eval/
 results/
 .venv*/
 Assets/StreamingAssets/analysis/*.json
+
+# v0.7.1 overlay renders + video proxies (generated)
+data/overlays/
+data/video_proxy/

@@ -70,11 +70,13 @@ def _player_metrics(player):
                     jump_max = d
             prev_pos = pos
 
-            # Wrong side: near = positive Z, far = negative Z
-            if side == "near" and pos[1] < 0:
+            # Wrong side: near = negative Z, far = positive Z (tracker: side "near" if z < 0)
+            if side == "near" and pos[1] > 0:
                 wrong_side += 1
-            elif side == "far" and pos[1] > 0:
+            elif side == "far" and pos[1] < 0:
                 wrong_side += 1
+        else:
+            prev_pos = None     # jumps are frame-to-frame: never measured across a gap (review 2 L15)
 
     if cur_gap > 0:
         gaps.append(cur_gap)

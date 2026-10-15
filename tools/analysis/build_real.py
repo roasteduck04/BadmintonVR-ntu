@@ -1,6 +1,6 @@
-"""Assemble a real analysis.json v3 from triangulated world-frame pose.
+"""Assemble a real analysis.json v4 from triangulated world-frame pose.
 
-Multi-camera 2D keypoints → RANSAC DLT triangulation → SMPL-24 body-local 3D
+Multi-camera 2D keypoints → RANSAC DLT triangulation → SMPL-28 body-local 3D
 → court position. Racket 2D keypoints (from RacketVision) are triangulated the
 same way and fed into racket.fill_player_rackets. Shuttle tracking via
 TrackNetV3 triangulation. Subcommands: multi, resmooth.
@@ -15,6 +15,14 @@ import numpy as np
 
 from analysis import schema
 from analysis import triangulate as tri
+
+
+def _write_doc(path, doc):
+    """Write an analysis doc Unity reads. NaN is rejected here: JsonUtility silently drops the whole file."""
+    text = json.dumps(doc, allow_nan=False)
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
 
 
 def _fix_3d_swaps(player_data, anchor_window=200):
@@ -121,10 +129,18 @@ def _fix_3d_swaps_multi(player_data, anchor_window=200):
         if not mapping:
             continue
 
-        old_frames = {i: pfs[i][f] for i in set(mapping.keys()) | set(mapping.values())}
-        for src, dst in mapping.items():
-            pfs[dst][f] = old_frames[src]
-            pfs[src][f] = old_frames.get(dst, pfs[src][f])
+        # Apply the assignment as a permutation (review 2 L7: the old pairwise write-back assumed 2-cycles and
+        # corrupted 3-cycles). A player whose frame moved but who receives none (its own slot had no position)
+        # takes a frame nobody claimed, which reduces to a plain swap.
+        involved = sorted(set(mapping.keys()) | set(mapping.values()))
+        old_frames = {i: pfs[i][f] for i in involved}
+        new = {dst: old_frames[src] for src, dst in mapping.items()}
+        receivers = [i for i in involved if i not in new]
+        unclaimed = [i for i in involved if i not in mapping]
+        for r, u in zip(receivers, unclaimed):
+            new[r] = old_frames[u]
+        for i, fr in new.items():
+            pfs[i][f] = fr
         total += 1
 
     if total:
@@ -141,23 +157,65 @@ def world_to_bodylocal_and_position(joints24_world):
     return j, position
 
 
-_MAX_BONE = {
-    (4, 1): 0.50, (5, 2): 0.50,     # thighs
-    (7, 4): 0.50, (8, 5): 0.50,     # shins
-    (18, 16): 0.40, (19, 17): 0.40, # upper arms
-    (20, 18): 0.35, (21, 19): 0.35, # forearms
-    (22, 20): 0.12, (23, 21): 0.12, # hands
-    (15, 12): 0.30,                  # head
-    (3, 0): 0.18, (6, 3): 0.18,     # spine segments
-    (9, 6): 0.18, (12, 9): 0.18,
+def _joint_names(n_joints):
+    """Joint names of a 58 (SMPL-X), 28 (SMPL-28) or 24 (SMPL-24) joint layout."""
+    if n_joints == schema.NUM_JOINTS:
+        return list(schema.JOINT_NAMES)
+    from analysis import skeleton24
+    if n_joints in (24, 28):
+        return list(skeleton24.SMPL28_NAMES[:n_joints])
+    raise ValueError(f"no joint names for a {n_joints}-joint skeleton")
+
+
+def _by_index(table, names):
+    """Name-keyed table -> index-keyed, keeping the entries whose joints exist in `names` (review 2 L9: SMPL-24
+    indices 22/23 are left_hand/right_hand, but left_thumb1/left_thumb2 in SMPL-X 58)."""
+    pos = {nm: i for i, nm in enumerate(names)}
+    out = {}
+    for key, v in table.items():
+        ks = (key,) if isinstance(key, str) else key
+        if all(k in pos for k in ks):
+            out[pos[ks[0]] if len(ks) == 1 else tuple(pos[k] for k in ks)] = v
+    return out
+
+
+_MAX_BONE_BY_NAME = {
+    ("left_knee", "left_hip"): 0.50, ("right_knee", "right_hip"): 0.50,            # thighs
+    ("left_ankle", "left_knee"): 0.50, ("right_ankle", "right_knee"): 0.50,        # shins
+    ("left_elbow", "left_shoulder"): 0.40, ("right_elbow", "right_shoulder"): 0.40,  # upper arms
+    ("left_wrist", "left_elbow"): 0.35, ("right_wrist", "right_elbow"): 0.35,      # forearms
+    ("left_hand", "left_wrist"): 0.12, ("right_hand", "right_wrist"): 0.12,        # hands (SMPL-24/28)
+    ("left_middle1", "left_wrist"): 0.12, ("right_middle1", "right_wrist"): 0.12,  # hands (SMPL-X 58)
+    ("head", "neck"): 0.30,                                                          # head
+    ("spine1", "pelvis"): 0.18, ("spine2", "spine1"): 0.18,                          # spine segments
+    ("spine3", "spine2"): 0.18, ("neck", "spine3"): 0.18,
 }
+_MAX_BONE = _by_index(_MAX_BONE_BY_NAME, schema.JOINT_NAMES)      # the 58-joint table build_real uses
+
+
+JOINT_Y_RANGE = (-0.3, 3.2)     # m above the floor: a jump smash reaches ~3 m (pose_v2.postprocess uses the same)
+PELVIS_Y_RANGE = (-0.3, 2.0)
+
+
+def _height_gate(local, conf):
+    """Height plausibility of one body-local frame (local Y = height above the floor). Joints outside
+    JOINT_Y_RANGE lose their confidence (pack_joints_flat then zeroes them); the frame is dropped only when the
+    pelvis itself is implausible. The old gate dropped the whole frame when any joint was > 2.0 m, losing
+    overhead reaches and jumps (review 2 L10). Returns (local, conf, drop)."""
+    conf = np.asarray(conf, dtype=np.float64).copy()
+    y = np.asarray(local, dtype=np.float64)[:, 1]
+    drop = bool(conf[0] > 0.1 and not (PELVIS_Y_RANGE[0] <= y[0] <= PELVIS_Y_RANGE[1]))
+    bad = (conf > 0.1) & ((y < JOINT_Y_RANGE[0]) | (y > JOINT_Y_RANGE[1]))
+    conf[bad] = 0.0
+    return local, conf, drop
 
 
 def _enforce_bone_lengths(joints24, conf24, parents):
-    """Clamp child joints along the bone direction when bones exceed max length."""
+    """Clamp child joints along the bone direction when bones exceed max length (name-based table)."""
     j = np.asarray(joints24, dtype=np.float64).copy()
     c = np.asarray(conf24, dtype=np.float64).copy()
-    for (child, parent), max_len in _MAX_BONE.items():
+    table = _MAX_BONE if len(j) == schema.NUM_JOINTS else _by_index(_MAX_BONE_BY_NAME, _joint_names(len(j)))
+    for (child, parent), max_len in table.items():
         if c[child] < 1e-6 or c[parent] < 1e-6:
             continue
         bone = j[child] - j[parent]
@@ -465,18 +523,56 @@ def _smooth_poses(pose_frames, alpha=0.25, fps=60.0):
     pose_frames = _kalman_smooth_positions(pose_frames, fps=fps)
 
     # EMA on body-local joints only (position already handled by Kalman)
-    prev_joints = None
+    return _ema_joints(pose_frames, alpha)
+
+
+_CONF_VALID = 0.1      # pack_joints_flat zeroes the xyz of joints below this: they are placeholders, not data
+
+
+def _ema_joints(pose_frames, alpha=0.25):
+    """Causal EMA per joint. A joint is reset (not blended) when it or its previous value is a dropout
+    (confidence < 0.1, xyz zeroed): blending in the zeroed placeholder put the returning joint on the floor
+    (review 2 M2)."""
+    prev = None
     for pf in pose_frames:
         jf = pf.get("joints_flat")
         if jf is None:
-            prev_joints = None
+            prev = None
             continue
-        cur = np.array(jf, dtype=np.float64)
-        if prev_joints is not None:
-            for i in range(0, len(cur), 4):
-                cur[i:i+3] = alpha * cur[i:i+3] + (1 - alpha) * prev_joints[i:i+3]
-            pf["joints_flat"] = [round(float(v), 5) for v in cur]
-        prev_joints = cur
+        cur = np.array(jf, dtype=np.float64).reshape(-1, 4)
+        if prev is not None and len(prev) == len(cur):
+            ok = (cur[:, 3] >= _CONF_VALID) & (prev[:, 3] >= _CONF_VALID)
+            cur[ok, :3] = alpha * cur[ok, :3] + (1 - alpha) * prev[ok, :3]
+            pf["joints_flat"] = [round(float(v), 5) for v in cur.ravel()]
+        prev = cur
+    return pose_frames
+
+
+def _joint_runs(valid):
+    """Contiguous True runs of a boolean array -> [(start, end)]."""
+    edges = np.diff(np.r_[0, np.asarray(valid, dtype=int), 0])
+    return list(zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]))
+
+
+def _per_joint_runs(pose_frames):
+    """(data (n, J, 4) NaN where the frame is missing, J, {joint: [(start, end)]}) with runs over frames where the
+    joint is a measurement (confidence >= 0.1), so dropouts never enter a filter (review 2 M2)."""
+    n = len(pose_frames)
+    nj = next((len(pf["joints_flat"]) // 4 for pf in pose_frames if pf.get("joints_flat") is not None), 0)
+    data = np.full((n, nj, 4), np.nan)
+    for i, pf in enumerate(pose_frames):
+        jf = pf.get("joints_flat")
+        if jf is not None and len(jf) == nj * 4:
+            data[i] = np.asarray(jf, dtype=np.float64).reshape(nj, 4)
+    conf = np.nan_to_num(data[:, :, 3], nan=0.0)
+    runs = {j: _joint_runs(conf[:, j] >= _CONF_VALID) for j in range(nj)}
+    return data, nj, runs
+
+
+def _write_back(pose_frames, data):
+    for i, pf in enumerate(pose_frames):
+        if pf.get("joints_flat") is not None and np.isfinite(data[i]).all():
+            pf["joints_flat"] = [round(float(v), 5) for v in data[i].ravel()]
     return pose_frames
 
 
@@ -485,57 +581,24 @@ def _sg_smooth_joints(pose_frames, window=11, polyorder=3):
 
     SG fits a local polynomial to each joint's trajectory, preserving the
     shape of fast movements (smashes, lunges) instead of lagging behind them
-    like EMA does.  Handles gaps by filtering contiguous segments independently.
+    like EMA does. Each joint is filtered on its own contiguous measured runs (dropouts excluded).
     """
     from scipy.signal import savgol_filter
 
-    n = len(pose_frames)
-    n_coords = schema.NUM_JOINTS * schema.STRIDE  # 96
-
-    # Build a (frames, coords) array; track which frames are valid
-    data = np.full((n, n_coords), np.nan, dtype=np.float64)
-    valid = np.zeros(n, dtype=bool)
-    for i, pf in enumerate(pose_frames):
-        jf = pf.get("joints_flat")
-        if jf is not None:
-            data[i] = jf
-            valid[i] = True
-
-    # Find contiguous valid segments
-    segments = []
-    start = None
-    for i in range(n + 1):
-        if i < n and valid[i]:
-            if start is None:
-                start = i
-        else:
-            if start is not None:
-                segments.append((start, i))
-                start = None
-
-    # Apply SG filter to each segment, each XYZ coordinate (skip confidence)
-    for seg_start, seg_end in segments:
-        seg_len = seg_end - seg_start
-        if seg_len < window:
-            w = max(5, seg_len | 1)  # ensure odd, at least 5
-            if w > seg_len:
-                continue  # segment too short for any SG window
-            po = min(polyorder, w - 1)
-        else:
-            w = window
-            po = polyorder
-        seg = data[seg_start:seg_end]
-        for j in range(schema.NUM_JOINTS):
-            base = j * schema.STRIDE
-            for axis in range(3):  # x, y, z — skip confidence at offset 3
-                seg[:, base + axis] = savgol_filter(seg[:, base + axis], w, po)
-
-    # Write back
-    for i in range(n):
-        if valid[i]:
-            pose_frames[i]["joints_flat"] = [round(float(v), 5)
-                                             for v in data[i]]
-    return pose_frames
+    data, nj, runs = _per_joint_runs(pose_frames)
+    for j in range(nj):
+        for s, e in runs[j]:
+            seg_len = e - s
+            if seg_len < window:
+                w = seg_len if seg_len % 2 else seg_len - 1   # largest odd window that fits (review 2 L8)
+                if w < 5:
+                    continue  # segment too short for any SG window
+                po = min(polyorder, w - 1)
+            else:
+                w = window
+                po = polyorder
+            data[s:e, j, :3] = savgol_filter(data[s:e, j, :3], w, po, axis=0)
+    return _write_back(pose_frames, data)
 
 
 def _bspline_smooth_joints(pose_frames, knot_spacing=5, spline_order=3):
@@ -544,72 +607,34 @@ def _bspline_smooth_joints(pose_frames, knot_spacing=5, spline_order=3):
     Unlike SG (local polynomial), B-splines fit a global smooth curve with
     control points every *knot_spacing* frames.  This enforces continuity
     across the entire segment and produces very smooth output while
-    preserving the overall motion shape.  Handles gaps by fitting contiguous
-    segments independently.
+    preserving the overall motion shape. Each joint is fitted on its own contiguous measured runs (dropouts
+    excluded).
     """
     from scipy.interpolate import make_lsq_spline
 
-    n = len(pose_frames)
-    n_coords = schema.NUM_JOINTS * schema.STRIDE
-
-    data = np.full((n, n_coords), np.nan, dtype=np.float64)
-    valid = np.zeros(n, dtype=bool)
-    for i, pf in enumerate(pose_frames):
-        jf = pf.get("joints_flat")
-        if jf is not None:
-            data[i] = jf
-            valid[i] = True
-
-    segments = []
-    start = None
-    for i in range(n + 1):
-        if i < n and valid[i]:
-            if start is None:
-                start = i
-        else:
-            if start is not None:
-                segments.append((start, i))
-                start = None
-
     k = spline_order
     min_points = k + 2  # need at least k+2 data points for a spline of order k
-
-    for seg_start, seg_end in segments:
-        seg_len = seg_end - seg_start
-        if seg_len < min_points:
-            continue
-
-        t = np.arange(seg_len, dtype=np.float64)
-
-        # Interior knots spaced every knot_spacing frames
-        n_interior = max(1, (seg_len - 1) // knot_spacing - 1)
-        interior_knots = np.linspace(t[1], t[-2], n_interior + 2)[1:-1]
-        if len(interior_knots) == 0:
-            interior_knots = np.array([(t[0] + t[-1]) / 2.0])
-
-        # Full knot vector: k+1 copies at each end + interior
-        knots = np.concatenate([
-            np.full(k + 1, t[0]),
-            interior_knots,
-            np.full(k + 1, t[-1]),
-        ])
-
-        seg = data[seg_start:seg_end]
-        for j in range(schema.NUM_JOINTS):
-            base = j * schema.STRIDE
+    data, nj, runs = _per_joint_runs(pose_frames)
+    for j in range(nj):
+        for s, e in runs[j]:
+            seg_len = e - s
+            if seg_len < min_points:
+                continue
+            t = np.arange(seg_len, dtype=np.float64)
+            # Interior knots spaced every knot_spacing frames
+            n_interior = max(1, (seg_len - 1) // knot_spacing - 1)
+            interior_knots = np.linspace(t[1], t[-2], n_interior + 2)[1:-1]
+            if len(interior_knots) == 0:
+                interior_knots = np.array([(t[0] + t[-1]) / 2.0])
+            # Full knot vector: k+1 copies at each end + interior
+            knots = np.concatenate([np.full(k + 1, t[0]), interior_knots, np.full(k + 1, t[-1])])
             for axis in range(3):
-                y = seg[:, base + axis]
                 try:
-                    spl = make_lsq_spline(t, y, knots, k=k)
-                    seg[:, base + axis] = spl(t)
+                    spl = make_lsq_spline(t, data[s:e, j, axis], knots, k=k)
+                    data[s:e, j, axis] = spl(t)
                 except (ValueError, np.linalg.LinAlgError):
                     pass  # keep original if spline fit fails
-
-    for i in range(n):
-        if valid[i]:
-            pose_frames[i]["joints_flat"] = [round(float(v), 5)
-                                             for v in data[i]]
-    return pose_frames
+    return _write_back(pose_frames, data)
 
 
 # ---- Biomechanical constraints ----
@@ -617,43 +642,48 @@ def _bspline_smooth_joints(pose_frames, knot_spacing=5, spline_order=3):
 # Joint angle limits: (parent, joint, child) → (min_angle_deg, max_angle_deg)
 # Angle is measured at `joint` between vectors parent→joint and joint→child.
 # 180° = fully extended (straight), 0° = fully folded.
-_ANGLE_LIMITS = {
+_ANGLE_LIMITS_BY_NAME = {
     # Knees: can't hyperextend (>175°) or fold past ~30°
-    (1, 4, 7):   (30.0, 175.0),   # left knee
-    (2, 5, 8):   (30.0, 175.0),   # right knee
+    ("left_hip", "left_knee", "left_ankle"): (30.0, 175.0),
+    ("right_hip", "right_knee", "right_ankle"): (30.0, 175.0),
     # Elbows: can't hyperextend or fold past ~20°
-    (16, 18, 20): (20.0, 175.0),  # left elbow
-    (17, 19, 21): (20.0, 175.0),  # right elbow
-    # Ankles: dorsiflexion/plantarflexion
-    (4, 7, 10):  (60.0, 160.0),   # left ankle
-    (5, 8, 11):  (60.0, 160.0),   # right ankle
+    ("left_shoulder", "left_elbow", "left_wrist"): (20.0, 175.0),
+    ("right_shoulder", "right_elbow", "right_wrist"): (20.0, 175.0),
+    # Ankles: dorsiflexion/plantarflexion (toe joint: big_toe in SMPL-X 58, foot in SMPL-24/28)
+    ("left_knee", "left_ankle", "left_big_toe"): (60.0, 160.0),
+    ("right_knee", "right_ankle", "right_big_toe"): (60.0, 160.0),
+    ("left_knee", "left_ankle", "left_foot"): (60.0, 160.0),
+    ("right_knee", "right_ankle", "right_foot"): (60.0, 160.0),
     # Spine segments: limited bend per segment
-    (0, 3, 6):   (120.0, 180.0),  # lower spine
-    (3, 6, 9):   (120.0, 180.0),  # mid spine
-    (6, 9, 12):  (120.0, 180.0),  # upper spine
+    ("pelvis", "spine1", "spine2"): (120.0, 180.0),
+    ("spine1", "spine2", "spine3"): (120.0, 180.0),
+    ("spine2", "spine3", "neck"): (120.0, 180.0),
     # Neck
-    (9, 12, 15): (100.0, 180.0),  # neck→head
+    ("spine3", "neck", "head"): (100.0, 180.0),
 }
+_ANGLE_LIMITS = _by_index(_ANGLE_LIMITS_BY_NAME, schema.JOINT_NAMES)
 
 # Per-joint max velocity in m/frame at 60fps.
 # Generous limits — anything beyond these is measurement noise.
-_MAX_JOINT_VELOCITY = {
+_MAX_JOINT_VELOCITY_BY_NAME = {
     # Extremities can move fast relative to pelvis
-    20: 0.40, 21: 0.40,   # wrists
-    22: 0.45, 23: 0.45,   # hands
-    18: 0.35, 19: 0.35,   # elbows
+    "left_wrist": 0.40, "right_wrist": 0.40,
+    "left_hand": 0.45, "right_hand": 0.45,            # SMPL-24/28
+    "left_middle1": 0.45, "right_middle1": 0.45,      # SMPL-X 58
+    "left_elbow": 0.35, "right_elbow": 0.35,
     # Legs
-    7: 0.35, 8: 0.35,     # ankles
-    10: 0.40, 11: 0.40,   # feet
-    4: 0.30, 5: 0.30,     # knees
+    "left_ankle": 0.35, "right_ankle": 0.35,
+    "left_big_toe": 0.40, "right_big_toe": 0.40, "left_foot": 0.40, "right_foot": 0.40,
+    "left_knee": 0.30, "right_knee": 0.30,
     # Core (moves slower relative to pelvis)
-    15: 0.20,              # head
-    12: 0.15,              # neck
-    3: 0.10, 6: 0.10, 9: 0.10,  # spine
-    1: 0.15, 2: 0.15,     # hips
-    13: 0.12, 14: 0.12,   # collars
-    16: 0.25, 17: 0.25,   # shoulders
+    "head": 0.20,
+    "neck": 0.15,
+    "spine1": 0.10, "spine2": 0.10, "spine3": 0.10,
+    "left_hip": 0.15, "right_hip": 0.15,
+    "left_collar": 0.12, "right_collar": 0.12,
+    "left_shoulder": 0.25, "right_shoulder": 0.25,
 }
+_MAX_JOINT_VELOCITY = _by_index(_MAX_JOINT_VELOCITY_BY_NAME, schema.JOINT_NAMES)
 
 
 def _clamp_joint_angles(pose_frames, parents):
@@ -681,7 +711,8 @@ def _clamp_joint_angles(pose_frames, parents):
 
     # Pre-sort angle constraints by BFS position of the joint (middle element)
     bfs_rank = {j: i for i, j in enumerate(bfs_order)}
-    sorted_limits = sorted(_ANGLE_LIMITS.items(),
+    limits = _ANGLE_LIMITS if n_joints == schema.NUM_JOINTS else _by_index(_ANGLE_LIMITS_BY_NAME, _joint_names(n_joints))
+    sorted_limits = sorted(limits.items(),
                            key=lambda x: bfs_rank.get(x[0][1], 0))
 
     for pf in pose_frames:
@@ -750,8 +781,10 @@ def _clamp_joint_velocities(pose_frames, fps=60.0):
             continue
         arr = np.array(jf, dtype=np.float64).reshape(-1, 4)
 
-        if prev_arr is not None:
-            for j_idx, max_vel in _MAX_JOINT_VELOCITY.items():
+        if prev_arr is not None and len(prev_arr) == len(arr):
+            table = (_MAX_JOINT_VELOCITY if len(arr) == schema.NUM_JOINTS
+                     else _by_index(_MAX_JOINT_VELOCITY_BY_NAME, _joint_names(len(arr))))
+            for j_idx, max_vel in table.items():
                 if arr[j_idx, 3] < 0.1 or prev_arr[j_idx, 3] < 0.1:
                     continue
                 delta = arr[j_idx, :3] - prev_arr[j_idx, :3]
@@ -799,7 +832,7 @@ def build_real_doc(clip_id, fps, frame_count, pose_frames, side):
                                "racket": None, "grip": None,
                                "stroke": None, "shuttle": None}},
         "court": schema.court_block(),
-        "skeleton": {"type": "smpl-24",
+        "skeleton": {"type": schema.SKELETON_TYPE,
                      "joint_names": schema.JOINT_NAMES, "parents": schema.PARENTS},
         "players": [player],
         "shuttle": {"frames": []},
@@ -845,7 +878,7 @@ def build_real_doc_multi(clip_id, fps, frame_count, player_data,
         "clip_id": clip_id,
         "meta": meta,
         "court": schema.court_block(),
-        "skeleton": {"type": "smpl-24",
+        "skeleton": {"type": schema.SKELETON_TYPE,
                      "joint_names": schema.JOINT_NAMES, "parents": schema.PARENTS},
         "players": players,
         "shuttle": {"frames": []},
@@ -954,6 +987,7 @@ def _to_bodylocal_racket(tracks, pose_frames):
 
 RACKET_WRIST_MAX = 150      # px — max handle-to-wrist distance for assignment
 RACKET_STICKY_BONUS = 50.0  # px — temporal consistency bonus
+RACKET_STICKY_PX = 40.0     # px — same racket as last frame when its handle is this close
 
 
 def _sync_racket2d(racket2d_paths, offsets, frame_count):
@@ -981,63 +1015,87 @@ def _sync_racket2d(racket2d_paths, offsets, frame_count):
     return synced
 
 
+RACKET_LINK_PX = 60.0       # px — a candidate continues a racket track when its handle is this close
+
+
+def _racket_candidates(raw):
+    """One racket2d frame -> list of candidates (5 x [x, y, s]); accepts the old single-detection frame
+    (5 x [x, y, s]) and the multi-candidate one (review 2 L6). None / empty -> []."""
+    if not raw or not isinstance(raw[0], list) or not raw[0]:
+        return []
+    return [raw] if not isinstance(raw[0][0], list) else raw
+
+
+def _link_racket_tracks(frames, link_px=RACKET_LINK_PX):
+    """Per frame, a track id per candidate: candidates are re-sorted by detection score every frame, so the
+    index is no identity (review 2 L5); a candidate continues the previous frame's track whose handle is
+    nearest (Hungarian, <= link_px), else it starts a new track."""
+    from scipy.optimize import linear_sum_assignment as lsa
+    ids, prev, next_id = [], [], 0
+    for cands in frames:
+        cur = [None] * len(cands)
+        if cands and prev:
+            cost = np.array([[np.hypot(c[_HANDLE_IDX][0] - p[_HANDLE_IDX][0], c[_HANDLE_IDX][1] - p[_HANDLE_IDX][1])
+                              for _tid, p in prev] for c in cands])
+            for r, k in zip(*lsa(np.where(cost <= link_px, cost, 1e6))):
+                if cost[r, k] <= link_px:
+                    cur[r] = prev[k][0]
+        for i in range(len(cands)):
+            if cur[i] is None:
+                cur[i] = next_id
+                next_id += 1
+        ids.append(cur)
+        prev = list(zip(cur, cands))
+    return ids
+
+
 def _smooth_racket_2d(rkp_by_view, window=5, order=2):
     """SG-smooth racket keypoint (x,y) trajectories per view.
 
-    Filters the best candidate (index 0) per frame within contiguous
-    detection runs. Does not interpolate across gaps. Scores are preserved.
-    Secondary candidates are left untouched.
+    Candidates are linked into racket tracks by handle proximity (not by candidate index, which follows the
+    per-frame score order) and each track is filtered within its contiguous runs. Does not interpolate
+    across gaps. Scores are preserved. Frames come back in the multi-candidate format.
     """
     from scipy.signal import savgol_filter
 
     result = {}
     for v, frames in rkp_by_view.items():
         n = len(frames)
-        out = [None] * n
+        cands = [[[list(kp) for kp in c] for c in _racket_candidates(frames[f])] for f in range(n)]
+        out = [c if frames[f] is not None else None for f, c in enumerate(cands)]
+        ids = _link_racket_tracks(cands)
+        tracks = {}
         for f in range(n):
-            if frames[f] is not None:
-                # Deep copy the frame
-                out[f] = [list(list(kp) for kp in cand) for cand in frames[f]]
-            else:
-                out[f] = None
-
-        # Find contiguous runs of non-None frames
-        segments = []
-        start = None
-        for f in range(n + 1):
-            if f < n and out[f] is not None:
-                if start is None:
-                    start = f
-            else:
-                if start is not None:
-                    segments.append((start, f))
-                    start = None
-
-        # SG-smooth the best candidate's (x, y) per keypoint within each segment
-        for seg_start, seg_end in segments:
-            seg_len = seg_end - seg_start
-            if seg_len < 3:
-                continue
-            w = window
-            po = order
-            if seg_len < w:
-                # NOTE: seg_len | 1 rounds UP for even seg_len, which can
-                # exceed seg_len and crash savgol_filter. Round DOWN to the
-                # nearest odd value <= seg_len instead.
-                w = seg_len if seg_len % 2 == 1 else seg_len - 1
-                w = max(3, w)
-                po = min(po, w - 1)
-
-            for kp_idx in range(5):
-                xs = np.array([out[f][0][kp_idx][0] for f in range(seg_start, seg_end)])
-                ys = np.array([out[f][0][kp_idx][1] for f in range(seg_start, seg_end)])
-                xs_smooth = savgol_filter(xs, w, po)
-                ys_smooth = savgol_filter(ys, w, po)
-                for i, f in enumerate(range(seg_start, seg_end)):
-                    out[f][0][kp_idx][0] = round(float(xs_smooth[i]), 2)
-                    out[f][0][kp_idx][1] = round(float(ys_smooth[i]), 2)
-                    # score at index 2 is preserved
-
+            for ci, tid in enumerate(ids[f]):
+                tracks.setdefault(tid, []).append((f, ci))
+        for members in tracks.values():
+            # contiguous runs of the track (frame indices consecutive)
+            runs, cur = [], [members[0]]
+            for m in members[1:]:
+                if m[0] == cur[-1][0] + 1:
+                    cur.append(m)
+                else:
+                    runs.append(cur)
+                    cur = [m]
+            runs.append(cur)
+            for run in runs:
+                seg_len = len(run)
+                if seg_len < 3:
+                    continue
+                w, po = window, order
+                if seg_len < w:
+                    # round DOWN to the nearest odd value <= seg_len (seg_len | 1 would overshoot)
+                    w = seg_len if seg_len % 2 == 1 else seg_len - 1
+                    w = max(3, w)
+                    po = min(po, w - 1)
+                for kp_idx in range(5):
+                    xs = np.array([cands[f][ci][kp_idx][0] for f, ci in run], dtype=np.float64)
+                    ys = np.array([cands[f][ci][kp_idx][1] for f, ci in run], dtype=np.float64)
+                    xs_s, ys_s = savgol_filter(xs, w, po), savgol_filter(ys, w, po)
+                    for i, (f, ci) in enumerate(run):
+                        cands[f][ci][kp_idx][0] = round(float(xs_s[i]), 2)
+                        cands[f][ci][kp_idx][1] = round(float(ys_s[i]), 2)
+                        # score at index 2 is preserved
         result[v] = out
     return result
 
@@ -1073,8 +1131,9 @@ def _assign_racket_to_players(matched, racket2d_paths, views, frame_count,
     assigned = {pid: {v: [None] * frame_count for v in views}
                 for pid in player_ids}
 
-    # Track previous frame's (view, candidate_index) → pid for sticky bonus
-    prev_assign = {}  # (view, cand_idx) → pid
+    # Previous frame's racket handle per (view, pid) for the sticky bonus: candidates are re-sorted by score
+    # every frame, so the bonus follows the racket (handle within RACKET_STICKY_PX), not a candidate index (L5)
+    prev_assign = {}  # (view, pid) -> (hx, hy)
 
     for f in range(frame_count):
         cur_assign = {}
@@ -1147,7 +1206,9 @@ def _assign_racket_to_players(matched, racket2d_paths, views, frame_count,
                     # Apply sticky bonus if same candidate was assigned to
                     # same player in previous frame
                     bonus = 0.0
-                    if sticky_bonus > 0 and prev_assign.get((v, ci)) == pid:
+                    last = prev_assign.get((v, pid))
+                    if sticky_bonus > 0 and last is not None and \
+                            ((hx - last[0]) ** 2 + (hy - last[1]) ** 2) ** 0.5 <= RACKET_STICKY_PX:
                         bonus = sticky_bonus
                     cost[ci, pi] = best_d - bonus
 
@@ -1157,7 +1218,7 @@ def _assign_racket_to_players(matched, racket2d_paths, views, frame_count,
                     continue
                 pid = player_ids[c]
                 assigned[pid][v][f] = candidates[r]
-                cur_assign[(v, r)] = pid
+                cur_assign[(v, pid)] = (candidates[r][_HANDLE_IDX][0], candidates[r][_HANDLE_IDX][1])
 
         prev_assign = cur_assign
 
@@ -1463,11 +1524,16 @@ def _to_bodylocal_racket_multi(tracks, player_data):
     direction, blending in the triangulated direction only on high-confidence
     "detected" frames. A Savitzky-Golay pass then smooths the final shaft direction.
     """
-    from analysis import smpl24
-    _LH = smpl24.SMPL_JOINT_NAMES.index("left_hand")
-    _RH = smpl24.SMPL_JOINT_NAMES.index("right_hand")
-    _LW = smpl24.SMPL_JOINT_NAMES.index("left_wrist")
-    _RW = smpl24.SMPL_JOINT_NAMES.index("right_wrist")
+    from analysis import skeleton
+    names = skeleton.JOINT_NAMES
+    hand_name = "middle1" if "left_middle1" in names else "hand"
+    _LH = names.index(f"left_{hand_name}")
+    _RH = names.index(f"right_{hand_name}")
+    _LW = names.index("left_wrist")
+    _RW = names.index("right_wrist")
+    _LE = names.index("left_elbow")
+    _RE = names.index("right_elbow")
+    _HAND_CONF_MIN = 0.1
 
     pd_map = {pd["id"]: pd["pose_frames"] for pd in player_data}
     for pid, tr in tracks.items():
@@ -1490,6 +1556,15 @@ def _to_bodylocal_racket_multi(tracks, player_data):
         def _jxyz(jf, idx):
             return np.array(jf[idx * 4:idx * 4 + 3], dtype=np.float64)
 
+        def _hand_xyz(jf, hand_idx, wrist_idx):
+            """Middle-finger MCP position, falling back to the wrist when
+            the MCP joint's confidence is below _HAND_CONF_MIN (occluded hand)."""
+            base = hand_idx * 4
+            conf = jf[base + 3]
+            if conf < _HAND_CONF_MIN:
+                return _jxyz(jf, wrist_idx)
+            return _jxyz(jf, hand_idx)
+
         # First pass: determine dominant hand by majority vote
         hand_votes = []
         for f in range(n):
@@ -1498,7 +1573,7 @@ def _to_bodylocal_racket_multi(tracks, player_data):
             jf = pf[f].get("joints_flat")
             if jf is None:
                 continue
-            lh, rh = _jxyz(jf, _LH), _jxyz(jf, _RH)
+            lh, rh = _hand_xyz(jf, _LH, _LW), _hand_xyz(jf, _RH, _RW)
             grip = tr["grip"][f]
             is_left = np.linalg.norm(grip - lh) < np.linalg.norm(grip - rh)
             hand_votes.append("left" if is_left else "right")
@@ -1515,21 +1590,28 @@ def _to_bodylocal_racket_multi(tracks, player_data):
             if jf is None:
                 continue
 
-            hand = _jxyz(jf, _LH) if use_left else _jxyz(jf, _RH)
-            wrist = _jxyz(jf, _LW) if use_left else _jxyz(jf, _RW)
+            hand = _hand_xyz(jf, _LH, _LW) if use_left else _hand_xyz(jf, _RH, _RW)
+            wrist_idx, elbow_idx = (_LW, _LE) if use_left else (_RW, _RE)
+            wrist = _jxyz(jf, wrist_idx)
 
-            # Snap grip to dominant hand
+            # Snap grip to dominant hand; triangulated shaft = triangulated head - snapped grip
             tr["grip"][f] = hand.copy()
+            tri_shaft = _unit_safe(tr["head"][f] - tr["grip"][f])
 
-            # Body-derived shaft direction: wrist → hand
+            # Body-derived shaft direction: wrist → hand; when the hand joint is unseen (hand == wrist, e.g.
+            # build_real triangulates no hand keypoints) the forearm (elbow → wrist) instead of a constant
+            # -Z (review 2 H2); no confident forearm either: the triangulated shaft alone
             body_shaft = _unit_safe(hand - wrist)
+            if body_shaft is None and jf[elbow_idx * 4 + 3] >= _HAND_CONF_MIN \
+                    and jf[wrist_idx * 4 + 3] >= _HAND_CONF_MIN:
+                body_shaft = _unit_safe(wrist - _jxyz(jf, elbow_idx))
             if body_shaft is None:
-                body_shaft = np.array([0.0, 0.0, -1.0])
+                shaft_dirs[f] = tri_shaft
+                continue
 
             # Blend with triangulated direction on full-confidence frames
             blend = _shaft_blend_weight(tr["confidence"][f], tr["status"][f])
             if blend > 0:
-                tri_shaft = _unit_safe(tr["head"][f] - tr["grip"][f])
                 if tri_shaft is not None:
                     blended = body_shaft * (1 - blend) + tri_shaft * blend
                     shaft_dirs[f] = _unit_safe(blended)
@@ -1863,11 +1945,11 @@ def assemble_multi(cam_paths, seeds_path, kp2d_multi_paths,
     kp_format = kp_meta.get("keypoint_format", "coco17")
     if kp_format.startswith("coco_wholebody"):
         from analysis import wholebody
-        to_smpl24 = wholebody.wholebody133_to_smpl24
+        to_smpl58 = wholebody.wholebody133_to_smpl58
         n_kpts = 133
         print(f"  keypoint format: {kp_format} ({n_kpts} keypoints)")
     else:
-        to_smpl24 = coco17.coco17_to_smpl24
+        to_smpl58 = coco17.coco17_to_smpl58
         n_kpts = 17
         print(f"  keypoint format: {kp_format} ({n_kpts} keypoints)")
 
@@ -1898,9 +1980,10 @@ def assemble_multi(cam_paths, seeds_path, kp2d_multi_paths,
 
     all_errs = []
     player_data = []
-    # Only triangulate body keypoints (first 17) — extra wholebody
-    # keypoints (face/hands) are used only in the SMPL-24 mapping
-    n_tri = min(n_kpts, 23)  # body(17) + foot(6) for wholebody, or 17
+    # Triangulate body+foot (0-22) plus face landmarks needed for SMPL-28
+    tri_indices = list(range(min(n_kpts, 23)))
+    if n_kpts >= 71:
+        tri_indices += [31, 53] + list(range(59, 71))
 
     for pid in players_list:
         side = tracker.player_side(pid)
@@ -1913,7 +1996,7 @@ def assemble_multi(cam_paths, seeds_path, kp2d_multi_paths,
             world = np.zeros((n_kpts, 3), dtype=np.float64)
             wconf = np.zeros(n_kpts, dtype=np.float64)
             ok_any = False
-            for j in range(n_tri):
+            for j in tri_indices:
                 per_view = {}
                 for v in views:
                     row = kp[v][f]
@@ -1935,22 +2018,21 @@ def assemble_multi(cam_paths, seeds_path, kp2d_multi_paths,
                 continue
             prev_world = world.copy()
             world[:, 1] *= -1.0
-            j24, c24 = to_smpl24(world, wconf)
-            j24, c24 = _enforce_bone_lengths(j24, c24, schema.PARENTS)
-            local, position = world_to_bodylocal_and_position(j24)
+            j58, c58 = to_smpl58(world, wconf)
+            j58, c58 = _enforce_bone_lengths(j58, c58, schema.PARENTS)
+            local, position = world_to_bodylocal_and_position(j58)
             if abs(position[0]) > 5.0 or abs(position[1]) > 8.0:
                 if last_pos is not None:
                     position = list(last_pos)
                 else:
                     pose_frames.append({"joints_flat": None, "position": None})
                     continue
-            valid_ys = local[c24 > 0.1, 1]
-            if len(valid_ys) > 0 and (valid_ys.min() < -2.0
-                                      or valid_ys.max() > 2.0):
+            local, c58, drop = _height_gate(local, c58)
+            if drop:
                 pose_frames.append({"joints_flat": None, "position": None})
                 continue
             last_pos = position
-            pose_frames.append({"joints_flat": pack_joints_flat(local, c24),
+            pose_frames.append({"joints_flat": pack_joints_flat(local, c58),
                                 "position": position})
 
         pose_frames = _smooth_poses(pose_frames, fps=fps)
@@ -2046,10 +2128,10 @@ def assemble_multi(cam_paths, seeds_path, kp2d_multi_paths,
         doc["shuttle_legacy"] = {"frames": leg_frames}
 
     # Facing direction estimation
-    from analysis.facing import fill_facing
+    from analysis.facing import fill_facing, frames_sign
     print("  facing direction...")
-    for p in doc["players"]:
-        fill_facing(p["frames"], fps)
+    for p in doc["players"]:      # handedness from the feet (cams here are 3x4 P; fallback: real analysis world)
+        fill_facing(p["frames"], fps, sign=frames_sign(p["frames"]))
 
     errs = schema.validate_analysis(doc)
     if errs:
@@ -2087,8 +2169,8 @@ def main(argv=None):
                          help="Old shuttle files for A/B comparison (720p SG)")
     p_multi.add_argument("--score-thr", type=float, default=0.3)
     p_multi.add_argument("--video-dir", default=None,
-                         help="Directory containing source videos for "
-                              "appearance-based re-ID (HSV torso histograms)")
+                         help="unused (kept for old command lines); the HSV appearance "
+                              "re-ID it enabled was removed")
     p_multi.add_argument("--out", default=None)
 
     # Re-smooth existing analysis
@@ -2136,10 +2218,7 @@ def main(argv=None):
                              shuttle_paths=shuttle,
                              shuttle_legacy_paths=shuttle_legacy,
                              video_dir=args.video_dir)
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".",
-                    exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh)
+        _write_doc(out_path, doc)
         med = doc["meta"].get("reprojection_px_median")
         print(f"wrote {out_path}: {doc['meta']['frame_count']} frames, "
               f"{len(doc['players'])} players, median reprojection "
@@ -2153,34 +2232,34 @@ def main(argv=None):
                                                f"{suffix}.analysis.json")
         with open(in_path, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
+        # the doc's own skeleton (shipped base docs are 28-joint schema 4.0; review 2 L1)
+        parents = (doc.get("skeleton") or {}).get("parents") or schema.PARENTS
         for p in doc["players"]:
             pf = p["frames"]
-            _enforce_median_bone_lengths(pf, schema.PARENTS)
+            _enforce_median_bone_lengths(pf, parents)
             if args.mode == "sgsmooth":
                 _sg_smooth_joints(pf, window=args.sg_window,
                                   polyorder=args.sg_poly)
             elif args.mode == "bspline":
                 _bspline_smooth_joints(pf, knot_spacing=args.knot_spacing)
-                _enforce_median_bone_lengths(pf, schema.PARENTS)
+                _enforce_median_bone_lengths(pf, parents)
             elif args.mode == "physics_sg":
                 _sg_smooth_joints(pf, window=args.sg_window,
                                   polyorder=args.sg_poly)
-                _clamp_joint_angles(pf, schema.PARENTS)
+                _clamp_joint_angles(pf, parents)
                 _clamp_joint_velocities(pf)
-                _enforce_median_bone_lengths(pf, schema.PARENTS)
+                _enforce_median_bone_lengths(pf, parents)
             elif args.mode == "physics_bsp":
                 _bspline_smooth_joints(pf, knot_spacing=args.knot_spacing)
-                _clamp_joint_angles(pf, schema.PARENTS)
+                _clamp_joint_angles(pf, parents)
                 _clamp_joint_velocities(pf)
-                _enforce_median_bone_lengths(pf, schema.PARENTS)
-        from analysis.facing import fill_facing
+                _enforce_median_bone_lengths(pf, parents)
+        from analysis.facing import doc_joint_indices, fill_facing, frames_sign
         fps = doc["meta"].get("fps", 30)
+        ix = doc_joint_indices(doc)               # the doc's own face / hip / shoulder joints (28 / 24 / 58)
         for p in doc["players"]:
-            fill_facing(p["frames"], fps)
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".",
-                    exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh)
+            fill_facing(p["frames"], fps, sign=frames_sign(p["frames"]), **ix)
+        _write_doc(out_path, doc)
         labels = {
             "sgsmooth": "SG smooth (window=%d, poly=%d) + strict bones"
                         % (args.sg_window, args.sg_poly),

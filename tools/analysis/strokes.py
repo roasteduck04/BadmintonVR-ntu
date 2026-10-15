@@ -1,7 +1,7 @@
 """Strokes v2 producer — per-player stroke labels on the analysis.json v3 contract.
 
 Contract-native successor to tools/label_moves.py, which hardcoded MediaPipe-33 indices
-(the F1 bug). Here every joint is resolved by NAME from analysis.smpl24.SMPL_JOINT_NAMES,
+(the F1 bug). Here every joint is resolved by NAME from analysis.skeleton.JOINT_NAMES,
 so it reads the right joints on the SMPL-24 body-local pose. Stroke moments are wrist-speed
 peaks (pose is body-local, so wrist speed is already body-relative); each is classified with
 explainable rules and enriched with forehand/backhand from the racket face-normal.
@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from analysis import smpl24
+from analysis import skeleton
 
-JOINT_INDEX = {name: i for i, name in enumerate(smpl24.SMPL_JOINT_NAMES)}
+JOINT_INDEX = {name: i for i, name in enumerate(skeleton.JOINT_NAMES)}
 
 STROKE_LABELS = ("overhead_smash", "overhead_clear", "drop",
                  "underarm_lift", "net_shot", "drive")
@@ -75,24 +75,36 @@ def detect_peaks(speed, fps, min_peak_speed=3.0, min_gap_s=0.5):
     return peaks
 
 
+CONF_MIN = 0.1      # joints below this are dropouts (xyz zeroed to the floor point): never compared
+
+
+def _mean_y(jf, names):
+    """Mean height of the named joints that are confident, or None."""
+    ys = [joint_xyz(jf, n)[1] for n in names if joint_conf(jf, n) >= CONF_MIN]
+    return float(np.mean(ys)) if ys else None
+
+
 def stroke_features(frames, peak, hand, fps, speed):
+    """Explainable features at a wrist-speed peak. Null frames after the peak and unconfident head / hips are
+    skipped (review 2 M4): a missing comparison reads as False."""
     wname = "right_wrist" if hand == "right" else "left_wrist"
     jf = frames[peak]["joints_flat"]
     wy = joint_xyz(jf, wname)[1]
-    head_y = joint_xyz(jf, "head")[1]
-    hip_y = (joint_xyz(jf, "left_hip")[1] + joint_xyz(jf, "right_hip")[1]) / 2.0
+    head_y = _mean_y(jf, ("head",))
+    hip_y = _mean_y(jf, ("left_hip", "right_hip"))
     k = max(1, int(POST_WINDOW_S * fps))
-    hi = min(len(frames) - 1, peak + k)
-    if hi > peak:
-        post_vy = (joint_xyz(frames[hi]["joints_flat"], wname)[1] - wy) * fps / (hi - peak)
-    else:
-        post_vy = 0.0
+    post_vy = 0.0
+    for hi in range(min(len(frames) - 1, peak + k), peak, -1):     # last usable frame in the window
+        jh = frames[hi].get("joints_flat")
+        if jh is not None and joint_conf(jh, wname) >= CONF_MIN:
+            post_vy = (joint_xyz(jh, wname)[1] - wy) * fps / (hi - peak)
+            break
     pos = frames[peak].get("position")
     root_z = abs(pos[1]) if pos and len(pos) == 2 else 99.0
     lo, hi2 = max(0, peak - k), min(len(frames), peak + k + 1)
     return {"peak_speed": float(np.nanmax(speed[lo:hi2])),
-            "wrist_above_head": bool(wy > head_y),
-            "wrist_below_hip": bool(wy < hip_y),
+            "wrist_above_head": bool(head_y is not None and wy > head_y),
+            "wrist_below_hip": bool(hip_y is not None and wy < hip_y),
             "post_vy": float(post_vy), "root_z": float(root_z)}
 
 

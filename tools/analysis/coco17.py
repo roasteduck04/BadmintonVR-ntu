@@ -1,17 +1,19 @@
-"""COCO-17 (rtmlib Body default) -> SMPL-24 joint mapping.
+"""COCO-17 (rtmlib Body default) -> 58-joint skeleton mapping.
 
 COCO-17 lacks pelvis, neck, head-top, and feet (toes/heels) that Halpe-26 has.
 We synthesize them from midpoints:
   pelvis = (left_hip + right_hip) / 2
   neck   = (left_shoulder + right_shoulder) / 2
   head   = nose (best available proxy)
-  feet   = ankles (no toe data)
+  big_toe = ankles (no toe data)
+COCO-17 has no hand or heel keypoints, so those 32 joints (hands 22-51,
+heels 56-57) remain zero with zero confidence.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from analysis import smpl24
+from analysis import skeleton
 
 COCO17_NAMES = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
@@ -31,12 +33,12 @@ _DIRECT = {
 }
 
 
-def coco17_to_smpl24(joints17, conf17):
+def coco17_to_smpl58(joints17, conf17):
     joints17 = np.asarray(joints17, dtype=np.float64)
     conf17 = np.asarray(conf17, dtype=np.float64)
-    names = smpl24.SMPL_JOINT_NAMES
-    out = np.zeros((24, 3), dtype=np.float64)
-    oc = np.zeros(24, dtype=np.float64)
+    names = skeleton.JOINT_NAMES
+    out = np.zeros((58, 3), dtype=np.float64)
+    oc = np.zeros(58, dtype=np.float64)
     idx = {n: i for i, n in enumerate(names)}
 
     for name, c in _DIRECT.items():
@@ -51,10 +53,10 @@ def coco17_to_smpl24(joints17, conf17):
     out[idx["head"]] = joints17[_C["nose"]]
     oc[idx["head"]] = conf17[_C["nose"]]
 
-    out[idx["left_foot"]] = joints17[_C["left_ankle"]]
-    oc[idx["left_foot"]] = conf17[_C["left_ankle"]] * 0.5
-    out[idx["right_foot"]] = joints17[_C["right_ankle"]]
-    oc[idx["right_foot"]] = conf17[_C["right_ankle"]] * 0.5
+    out[idx["left_big_toe"]] = joints17[_C["left_ankle"]]
+    oc[idx["left_big_toe"]] = conf17[_C["left_ankle"]] * 0.5
+    out[idx["right_big_toe"]] = joints17[_C["right_ankle"]]
+    oc[idx["right_big_toe"]] = conf17[_C["right_ankle"]] * 0.5
 
     def lerp(a_idx, b_idx, u):
         a, b = joints17[a_idx], joints17[b_idx]
@@ -75,10 +77,16 @@ def coco17_to_smpl24(joints17, conf17):
     out[idx["right_collar"]] = (neck_pos + joints17[_C["right_shoulder"]]) / 2.0
     oc[idx["right_collar"]] = min(neck_conf, conf17[_C["right_shoulder"]])
 
-    for hand, elbow, wrist in (("left_hand", _C["left_elbow"], _C["left_wrist"]),
-                               ("right_hand", _C["right_elbow"], _C["right_wrist"])):
-        w, e = joints17[wrist], joints17[elbow]
-        out[idx[hand]] = w + (w - e) * 0.15
-        oc[idx[hand]] = conf17[wrist]
+    # Hands (22-51) and heels (56-57): COCO-17 has no hand or heel data,
+    # so those joints remain zero with zero confidence.
+
+    # Face: COCO-17 has nose (0), left_eye (1), right_eye (2)
+    out[idx["nose_tip"]] = joints17[_C["nose"]]
+    oc[idx["nose_tip"]] = conf17[_C["nose"]]
+    out[idx["left_eye"]] = joints17[_C["left_eye"]]
+    oc[idx["left_eye"]] = conf17[_C["left_eye"]]
+    out[idx["right_eye"]] = joints17[_C["right_eye"]]
+    oc[idx["right_eye"]] = conf17[_C["right_eye"]]
+    # jaw: no COCO-17 source -> remains zero conf
 
     return out, oc

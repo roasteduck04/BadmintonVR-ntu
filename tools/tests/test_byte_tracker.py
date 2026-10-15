@@ -100,3 +100,25 @@ def test_byte_tracker_reassociates_after_gap():
     pairs2 = tracker.update(bbox)
     assert len(pairs2) == 1
     assert pairs2[0][0] == original_id
+
+
+def test_raw_simcc_scores_are_calibrated_before_gating():
+    """RTMPose scores are raw SimCC (0-10, median ~4.3): gates of 0.1 / 0.5 were no-ops (review 4 L13)."""
+    from byte_tracker import bboxes_from_keypoints, calibrated_scores
+    from analysis.pose_v2 import norm_score
+    raw = np.array([[4.3, 1.0, 5.0]], dtype=np.float32)
+    assert np.allclose(calibrated_scores(raw), norm_score(raw))                 # same logistic as pose_v2
+    keypoints = np.array([[[100, 200, 0], [500, 500, 0], [120, 250, 0]]], dtype=np.float32)
+    b = bboxes_from_keypoints(keypoints, raw, pad_ratio=0.0)
+    assert b[0, 2] < 200                                    # raw 1.0 (p ~ 0.003) no longer stretches the box
+    assert 0.9 < b[0, 4] <= 1.0                             # box score is a probability, comparable to track_thresh
+    weak = bboxes_from_keypoints(keypoints, np.array([[2.5, 2.4, 2.6]], dtype=np.float32), pad_ratio=0.0)
+    assert weak[0, 4] < 0.5                                 # a weak detection no longer starts a track at 0.5
+
+
+def test_probability_scores_pass_through_unchanged():
+    from byte_tracker import calibrated_scores
+    p = np.array([[0.9, 0.05, 0.8]], dtype=np.float32)
+    assert np.array_equal(calibrated_scores(p), p)
+    assert np.array_equal(calibrated_scores(p, raw=False), p)
+    assert calibrated_scores(p, raw=True).max() < 0.01

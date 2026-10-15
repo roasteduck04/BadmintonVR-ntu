@@ -62,3 +62,17 @@ def test_triangulate_joint_rejects_degenerate_rays(monkeypatch):
     kp = {v: (100.0, 100.0, 0.9) for v in cams}
     X, conf, err = tri.triangulate_joint(cams, kp, score_thr=0.3)
     assert X is None and conf == 0.0 and err is None
+
+
+def test_triangulate_joint_max_reproj_gate():
+    cams = _three_cams()
+    X = np.array([0.4, 1.2, 0.3])
+    names = list(cams)
+    uv = {v: _project(cams[v], X) for v in names[:2]}
+    uv[names[0]] = uv[names[0]] + np.array([30.0, 0.0])   # one view off by 30 px
+    kp = {v: (u[0], u[1], 1.0) for v, u in uv.items()}
+    sub = {v: cams[v] for v in names[:2]}
+    Xd, _c, err = tri.triangulate_joint(sub, kp, 0.1)
+    assert Xd is not None and err > 1.0
+    Xn, _c2, _e2 = tri.triangulate_joint(sub, kp, 0.1, max_reproj_px=err / 2)
+    assert Xn is None

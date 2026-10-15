@@ -15,7 +15,7 @@ from analysis import schema
 
 STROKE_CYCLE = ["clear", "smash", "drop", "lift"]
 HIT_INTERVAL = 20            # frames between shuttle contacts
-_ARM_JOINTS = (17, 19, 21, 23)   # right shoulder/elbow/wrist/hand (SMPL-24)
+_ARM_JOINTS = (17, 19, 21, 43)   # right shoulder/elbow/wrist/right_middle1 (SMPL-X 58)
 _SHUTTLE_PEAK = 2.6          # meters
 _BASE_Z = 3.0               # near player at -_BASE_Z, far at +_BASE_Z
 
@@ -29,7 +29,7 @@ def _player_position(side_sign, frame, frames):
 
 
 def _local_pose(frame):
-    """Body-local SMPL-24 joints_flat (96 floats) = rest pose + racket-arm swing."""
+    """Body-local joints_flat (232 floats) = rest pose + racket-arm swing."""
     pose = schema.REST_POSE.copy()
     s = math.sin(2 * math.pi * frame / HIT_INTERVAL)
     dy, dz = 0.30 * max(0.0, s), 0.12 * s
@@ -100,7 +100,7 @@ def build_synth_doc(frames=120, fps=30.0):
                                "racket": None, "grip": None,
                                "stroke": "synthetic", "shuttle": "synthetic"}},
         "court": schema.court_block(),
-        "skeleton": {"type": "smpl-24",
+        "skeleton": {"type": schema.SKELETON_TYPE,
                      "joint_names": schema.JOINT_NAMES, "parents": schema.PARENTS},
         "players": players,
         "shuttle": {"frames": _shuttle_frames(players, frames, fps)},

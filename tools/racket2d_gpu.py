@@ -8,6 +8,9 @@ First-time setup (run once):
     # Clone and download checkpoints
     git clone --depth 1 https://github.com/OrcustD/RacketVision.git ~/RacketVision
     cd ~/RacketVision/source && python download_checkpoints.py --module RacketPose
+    # (record `git -C ~/RacketVision rev-parse HEAD`; tools/racket_finetune/run_runpod.sh pins it via
+    #  RACKETVISION_REF. The checkpoints' SHA-256 are printed at start; RACKET_DET_SHA256 /
+    #  RACKET_POSE_SHA256 make a run refuse a different file.)
 
     # Install OpenMMLab (in your conda env)
     pip install openmim
@@ -20,11 +23,16 @@ Usage:
     python tools/racket2d_gpu.py --src videos --clip singles_1x --out data/racket2d
     python tools/racket2d_gpu.py --src videos --clip 3-1 --out data/racket2d
 
+    # bootstrap variant: fine-tuned pose model + boxes guided by the rigid multi-view fit
+    python tools/racket2d_gpu.py --src videos --clip singles_1x --out data/racket2d_bootstrap \
+        --pose-ckpt work_dirs/rtmpose_m_racket_ft/best.pth --guides-dir data/racket_guides --pose-fullres
+
 Outputs per-view JSON with 5 keypoints per frame (or null).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
 import os
@@ -266,8 +274,34 @@ def _merge_candidates(full_cands, crop_cands, iou_thr=0.3):
     return merged
 
 
+def _iou(a, b):
+    ix1, iy1, ix2, iy2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _pose_on_boxes(poser, img, boxes, source):
+    """Run the pose model on xyxy boxes (in img pixels); returns candidate dicts."""
+    from mmpose.apis import inference_topdown
+    if len(boxes) == 0:
+        return []
+    out = []
+    results = inference_topdown(poser, img, np.asarray(boxes, dtype=np.float32), bbox_format="xyxy")
+    for ds, bb in zip(results, boxes):
+        kp = ds.pred_instances.keypoints[0].tolist()
+        ks = ds.pred_instances.keypoint_scores[0].tolist()
+        out.append({"bbox": [round(float(v), 1) for v in bb], "det_score": 0.0,
+                    "keypoints": [[round(p[0], 2), round(p[1], 2)] for p in kp],
+                    "keypoint_scores": [round(float(s), 4) for s in ks], "source": source})
+    return out
+
+
 def run_racket_view(detector, poser, video_path, view_id, kp_names,
-                    wrist_positions=None, crop_size=400, crop_target=800):
+                    wrist_positions=None, crop_size=400, crop_target=800,
+                    guides=None, pose_fullres=False, max_frames=None):
     import cv2
     from mmdet.apis import inference_detector
     from mmpose.apis import inference_topdown
@@ -293,6 +327,8 @@ def run_racket_view(detector, poser, video_path, view_id, kp_names,
     i = 0
     t0 = time.time()
     while True:
+        if max_frames is not None and i >= max_frames:
+            break
         ok, frame = cap.read()
         if not ok:
             break
@@ -311,19 +347,35 @@ def run_racket_view(detector, poser, video_path, view_id, kp_names,
 
         order = list(np.argsort(-sc)[:TOPK]) if len(sc) else []
         cands = []
-        for b in order:
-            bbox = bb[b:b + 1]
-            pr = inference_topdown(poser, img, bbox, bbox_format="xyxy")
-            ds = merge_data_samples(pr)
-            kpts = ds.pred_instances.keypoints[0].tolist()
-            kscores = ds.pred_instances.keypoint_scores[0].tolist()
-            kpts_src = [[kp[0] / scale, kp[1] / scale] for kp in kpts]
-            cands.append({
-                "bbox": [round(v / scale, 1) for v in [bb[b][0], bb[b][1], bb[b][2], bb[b][3]]],
-                "det_score": round(float(sc[b]), 4),
-                "keypoints": [[round(kp[0], 2), round(kp[1], 2)] for kp in kpts_src],
-                "keypoint_scores": [round(float(s), 4) for s in kscores],
-            })
+        if pose_fullres:
+            boxes = [[float(v) / scale for v in bb[b]] for b in order]
+            cands = _pose_on_boxes(poser, frame, boxes, "full")
+            for c, b in zip(cands, order):
+                c["det_score"] = round(float(sc[b]), 4)
+        else:
+            for b in order:
+                bbox = bb[b:b + 1]
+                pr = inference_topdown(poser, img, bbox, bbox_format="xyxy")
+                ds = merge_data_samples(pr)
+                kpts = ds.pred_instances.keypoints[0].tolist()
+                kscores = ds.pred_instances.keypoint_scores[0].tolist()
+                kpts_src = [[kp[0] / scale, kp[1] / scale] for kp in kpts]
+                cands.append({
+                    "bbox": [round(v / scale, 1) for v in [bb[b][0], bb[b][1], bb[b][2], bb[b][3]]],
+                    "det_score": round(float(sc[b]), 4),
+                    "keypoints": [[round(kp[0], 2), round(kp[1], 2)] for kp in kpts_src],
+                    "keypoint_scores": [round(float(s), 4) for s in kscores],
+                })
+
+        # Guided pass: pose at full resolution where the multi-view rigid fit puts the racket
+        if guides is not None:
+            gboxes = [g["bbox"] for g in guides.get(str(i), [])]
+            gboxes = [[max(0.0, b[0]), max(0.0, b[1]), min(src_w - 1.0, b[2]), min(src_h - 1.0, b[3])]
+                      for b in gboxes if b[2] > 0 and b[3] > 0 and b[0] < src_w and b[1] < src_h]
+            guided = _pose_on_boxes(poser, frame, gboxes, "guide")
+            if guided:
+                cands = guided + [c for c in cands if all(_iou(c["bbox"], g["bbox"]) < 0.5 for g in guided)]
+                cands = cands[:TOPK]
 
         # Pass 2: crop-based detection around wrist positions (new)
         if wrist_positions is not None and i < len(wrist_positions):
@@ -376,6 +428,20 @@ def run_racket_view(detector, poser, video_path, view_id, kp_names,
     }
 
 
+@contextlib.contextmanager
+def full_pickle_torch_load(torch):
+    """torch >= 2.6 defaults to weights_only=True, which the OpenMMLab checkpoints (pickled configs) fail.
+
+    Allow full unpickling only while the two models are built, instead of replacing torch.load for the
+    whole process (the checkpoints are hash-reported / pinnable, see main)."""
+    original = torch.load
+    torch.load = functools.partial(original, weights_only=False)
+    try:
+        yield
+    finally:
+        torch.load = original
+
+
 def main():
     ap = argparse.ArgumentParser(description="RacketVision 5-keypoint racket detection (GPU)")
     ap.add_argument("--src", required=True,
@@ -396,6 +462,13 @@ def main():
                     help="Crop region size in original-resolution pixels (default: 400)")
     ap.add_argument("--crop-target", type=int, default=800,
                     help="Resize target for crops before inference (default: 800)")
+    ap.add_argument("--pose-ckpt", default=None,
+                    help="Fine-tuned RTMPose checkpoint (default: RacketVision best_PCK_epoch_90.pth)")
+    ap.add_argument("--guides-dir", default=None,
+                    help="Per-view <view>_guides.json boxes from tools/racket_pseudolabel.py guides")
+    ap.add_argument("--pose-fullres", action="store_true",
+                    help="Detect at 1080p but run the pose model on the full-resolution frame")
+    ap.add_argument("--max-frames", type=int, default=None, help="stop early (smoke tests)")
     args = ap.parse_args()
 
     cameras = CLIP_CAMERAS[args.clip]
@@ -416,11 +489,19 @@ def main():
 
     det_cfg, pose_cfg, det_ckpt, pose_ckpt = find_racketvision(args.rv_dir)
     print(f"RacketVision: {os.path.dirname(det_cfg)}")
+    if args.pose_ckpt:
+        pose_ckpt = args.pose_ckpt
+        print(f"pose checkpoint override: {pose_ckpt}")
 
     _apply_shims()
 
+    import cv2
     import torch
-    torch.load = functools.partial(torch.load, weights_only=False)
+    # Containers often expose every host core but enforce a small CPU quota.
+    n_threads = int(os.environ.get("RACKET_THREADS", "0"))
+    if n_threads > 0:
+        torch.set_num_threads(n_threads)
+        cv2.setNumThreads(n_threads)
 
     from mmdet.apis import init_detector
     from mmpose.apis import init_model as init_pose
@@ -429,9 +510,13 @@ def main():
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"torch: {torch.__version__}, device: {dev}")
 
-    detector = init_detector(det_cfg, det_ckpt, device=dev)
-    detector.cfg = adapt_mmdet_pipeline(detector.cfg)
-    poser = init_pose(pose_cfg, pose_ckpt, device=dev)
+    from integrity import verify_sha256
+    verify_sha256(det_ckpt, os.environ.get("RACKET_DET_SHA256"), "RacketVision detector checkpoint")
+    verify_sha256(pose_ckpt, os.environ.get("RACKET_POSE_SHA256"), "racket pose checkpoint")
+    with full_pickle_torch_load(torch):
+        detector = init_detector(det_cfg, det_ckpt, device=dev)
+        detector.cfg = adapt_mmdet_pipeline(detector.cfg)
+        poser = init_pose(pose_cfg, pose_ckpt, device=dev)
 
     meta = poser.dataset_meta
     n = meta.get("num_keypoints", 0)
@@ -452,10 +537,24 @@ def main():
     for view_id, filename in cameras.items():
         video_path = os.path.join(args.src, filename)
         print(f"=== {view_id} ({filename}) ===")
+        guides = None
+        if args.guides_dir:
+            gpath = os.path.join(args.guides_dir, f"{view_id}_guides.json")
+            if os.path.isfile(gpath):
+                with open(gpath, "r", encoding="utf-8") as fh:
+                    guides = json.load(fh)["frames"]
+                print(f"  guides: {len(guides)} frames")
+            else:
+                print(f"  WARNING: no guides for {view_id}")
         doc = run_racket_view(detector, poser, video_path, view_id, kp_names,
                               wrist_positions=wrist_data.get(view_id),
                               crop_size=args.crop_size,
-                              crop_target=args.crop_target)
+                              crop_target=args.crop_target,
+                              guides=guides, pose_fullres=args.pose_fullres,
+                              max_frames=args.max_frames)
+        doc["pose_checkpoint"] = os.path.basename(pose_ckpt)
+        doc["guided"] = guides is not None
+        doc["pose_fullres"] = bool(args.pose_fullres)
 
         out_path = os.path.join(args.out, f"{view_id}_racket2d.json")
         with open(out_path, "w") as fh:

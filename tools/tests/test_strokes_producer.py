@@ -8,15 +8,15 @@ import numpy as np
 import pytest
 
 from analysis import strokes as stk
-from analysis import schema, smpl24, synth_analysis as sa
+from analysis import schema, skeleton, synth_analysis as sa
 from analysis import racket as rk
 
 
 def _rest_flat():
     flat = []
-    for j in range(smpl24.NUM_SMPL_JOINTS):
-        flat.extend([float(smpl24._REST[j, 0]), float(smpl24._REST[j, 1]),
-                     float(smpl24._REST[j, 2]), 1.0])
+    for j in range(skeleton.NUM_JOINTS):
+        flat.extend([float(skeleton._REST[j, 0]), float(skeleton._REST[j, 1]),
+                     float(skeleton._REST[j, 2]), 1.0])
     return flat
 
 
@@ -252,3 +252,28 @@ def test_cli_writes_valid_analysis_with_strokes(tmp_path):
     total = sum(1 for p in doc["players"] for pf in p["frames"]
                 if pf["stroke"] is not None)
     assert total >= 1              # gentle synth motion still yields strokes at 2.0 m/s
+
+
+def test_fill_player_strokes_survives_pose_gaps_after_the_peak():
+    """Review 2 M4: frames[peak + k] was read without a None check (TypeError on real docs with gaps)."""
+    fps = 60.0
+    frames = _swing_frames(n=120, fps=fps, peak=60, width=8)
+    for f in range(61, 75):
+        frames[f]["joints_flat"] = None
+        frames[f]["position"] = None
+    doc = {"meta": {"fps": fps}, "players": [{"id": "P1", "frames": frames}]}
+    stk.fill_player_strokes(doc, min_peak_speed=2.0)
+    assert any(fr["stroke"] for fr in frames)
+
+
+def test_stroke_features_ignore_unconfident_head_and_hips():
+    """Review 2 M4: zeroed (dropped-out) head / hips compared as if they sat on the floor."""
+    fps = 30.0
+    frames = _swing_frames(n=120, fps=fps, peak=60)
+    for fr in frames:
+        _set_joint(fr["joints_flat"], "head", x=0.0, y=0.0, z=0.0, conf=0.0)
+        for h in ("left_hip", "right_hip"):
+            _set_joint(fr["joints_flat"], h, x=0.0, y=0.0, z=0.0, conf=0.0)
+    speed = stk.wrist_speed(frames, "right", fps)
+    f = stk.stroke_features(frames, 60, "right", fps, speed)
+    assert f["wrist_above_head"] is False and f["wrist_below_hip"] is False

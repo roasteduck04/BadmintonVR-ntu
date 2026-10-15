@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from analysis import racket as rk
-from analysis import schema, smpl24, synth_analysis as sa
+from analysis import schema, skeleton, synth_analysis as sa
 
 
 def test_racket_frame_is_orthonormal():
@@ -24,23 +24,23 @@ def test_racket_frame_is_orthonormal():
 
 def _rest_flat():
     flat = []
-    for j in range(smpl24.NUM_SMPL_JOINTS):
-        flat.extend([float(smpl24._REST[j, 0]), float(smpl24._REST[j, 1]),
-                     float(smpl24._REST[j, 2]), 1.0])
+    for j in range(skeleton.NUM_JOINTS):
+        flat.extend([float(skeleton._REST[j, 0]), float(skeleton._REST[j, 1]),
+                     float(skeleton._REST[j, 2]), 1.0])
     return flat
 
 
 def test_nearest_hand_picks_right():
     flat = _rest_flat()
-    rh = smpl24.SMPL_JOINT_NAMES.index("right_hand")
-    point = smpl24._REST[rh]                    # exactly on the right hand
+    rh = skeleton.JOINT_NAMES.index("right_middle1")
+    point = skeleton._REST[rh]                    # exactly on the right hand
     assert rk.nearest_hand(flat, point) == "right"
 
 
 def test_nearest_hand_picks_left():
     flat = _rest_flat()
-    lh = smpl24.SMPL_JOINT_NAMES.index("left_hand")
-    point = smpl24._REST[lh]
+    lh = skeleton.JOINT_NAMES.index("left_middle1")
+    point = skeleton._REST[lh]
     assert rk.nearest_hand(flat, point) == "left"
 
 
@@ -91,8 +91,8 @@ def test_bad_face_normal_length_rejected():
 
 def _bodylocal_tracks(doc, length=0.66, half_width=0.10):
     """Grip at each player's right hand, shaft along wrist->hand, face width along +y."""
-    rh = smpl24.SMPL_JOINT_NAMES.index("right_hand")
-    rw = smpl24.SMPL_JOINT_NAMES.index("right_wrist")
+    rh = skeleton.JOINT_NAMES.index("right_middle1")
+    rw = skeleton.JOINT_NAMES.index("right_wrist")
     tracks = {}
     for p in doc["players"]:
         grips, heads, sides = [], [], []

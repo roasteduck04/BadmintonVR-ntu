@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from analysis import smpl24
+from analysis import skeleton
 from racket_smoothing import smooth_racket
 
-_LEFT_HAND = smpl24.SMPL_JOINT_NAMES.index("left_hand")
-_RIGHT_HAND = smpl24.SMPL_JOINT_NAMES.index("right_hand")
+_LEFT_HAND = skeleton.JOINT_NAMES.index("left_middle1")
+_RIGHT_HAND = skeleton.JOINT_NAMES.index("right_middle1")
+_LEFT_WRIST = skeleton.JOINT_NAMES.index("left_wrist")
+_RIGHT_WRIST = skeleton.JOINT_NAMES.index("right_wrist")
+_HAND_CONF_MIN = 0.1
 
 
 def _unit(v):
@@ -33,6 +36,12 @@ def _unit(v):
 def _joint_xyz(joints_flat, idx):
     base = idx * 4  # stride 4: x, y, z, confidence
     return np.array(joints_flat[base:base + 3], dtype=np.float64)
+
+
+def _joint_xyz_conf(joints_flat, idx):
+    base = idx * 4  # stride 4: x, y, z, confidence
+    xyz = np.array(joints_flat[base:base + 3], dtype=np.float64)
+    return xyz, joints_flat[base + 3]
 
 
 def racket_frame(grip, head, side):
@@ -52,10 +61,16 @@ def racket_frame(grip, head, side):
 
 def nearest_hand(joints_flat, point):
     """'left' or 'right' — whichever SMPL hand joint is closer to `point`
-    (both in the body-local frame)."""
+    (both in the body-local frame). Falls back to the wrist position when
+    the middle-finger MCP (left_middle1/right_middle1) has low confidence,
+    e.g. an occluded or untracked hand."""
     point = np.asarray(point, dtype=np.float64)
-    lh = _joint_xyz(joints_flat, _LEFT_HAND)
-    rh = _joint_xyz(joints_flat, _RIGHT_HAND)
+    lh, lh_conf = _joint_xyz_conf(joints_flat, _LEFT_HAND)
+    rh, rh_conf = _joint_xyz_conf(joints_flat, _RIGHT_HAND)
+    if lh_conf < _HAND_CONF_MIN:
+        lh = _joint_xyz(joints_flat, _LEFT_WRIST)
+    if rh_conf < _HAND_CONF_MIN:
+        rh = _joint_xyz(joints_flat, _RIGHT_WRIST)
     return "left" if np.linalg.norm(point - lh) < np.linalg.norm(point - rh) else "right"
 
 
@@ -123,8 +138,6 @@ def fill_player_rackets(doc, tracks, producer_name, smooth=True):
 
 RACKET_LENGTH_M = 0.66       # regulation shaft length
 RACKET_HALF_WIDTH_M = 0.10   # regulation head half-width
-
-_RIGHT_WRIST = smpl24.SMPL_JOINT_NAMES.index("right_wrist")
 
 
 def synthetic_racket_tracks(doc):

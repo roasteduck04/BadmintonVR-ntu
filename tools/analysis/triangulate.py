@@ -50,12 +50,13 @@ PRIOR_WEIGHT = 0.15  # blend weight toward prior 3D when available
 PRIOR_MAX_DIST = 0.3  # meters — ignore prior if triangulation is further than this
 
 
-def triangulate_joint(cams, kp2d_by_view, score_thr, prior_X=None):
+def triangulate_joint(cams, kp2d_by_view, score_thr, prior_X=None, max_reproj_px=MAX_REPROJ_PX):
     """Triangulate one joint from per-view (u, v, score).
 
     cams: {view: P(3x4)}; kp2d_by_view: {view: (u, v, score)}.
     prior_X: optional (3,) array — previous frame's 3D position for this joint.
         When provided, the result is pulled toward the prior to reduce jitter.
+    max_reproj_px: reject when the consensus mean reprojection exceeds this.
     Returns (X (3,) or None, confidence in [0,1], reproj err or None).
 
     Strategy: try every pair of views, pick the pair with the lowest
@@ -114,7 +115,7 @@ def triangulate_joint(cams, kp2d_by_view, score_thr, prior_X=None):
     use_scores = [scores[i] for i in sorted(best_set)]
 
     err = reprojection_error(use_projs, use_uvs, best_X)
-    if err > MAX_REPROJ_PX:
+    if err > max_reproj_px:
         return None, 0.0, None
 
     # temporal prior: blend toward previous frame to reduce jitter

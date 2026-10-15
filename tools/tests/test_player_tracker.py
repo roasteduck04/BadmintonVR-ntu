@@ -400,6 +400,29 @@ class TestPlayerTracker:
         for f in range(10, 20):
             assert p2[f] is not None, f"P2 frame {f} should not be None (reconnected)"
 
+    def test_lost_player_is_reacquired_after_a_long_gap(self, tmp_path):
+        """Review 2 M3: after COAST_MAX_FRAMES unmatched a player went LOST for the rest of the clip."""
+        from analysis.player_tracker import PlayerTracker
+
+        view = "cam_a"
+        frames = []
+        for f in range(60):
+            dets = [{"track_id": 1, "keypoints": _p1_near_kps()}]
+            if f < 5 or f >= 40:                              # P2 absent for 35 frames (> 30)
+                dets.append({"track_id": 2, "keypoints": _p2_near_kps()})
+            frames.append(dets)
+        tracker = PlayerTracker(
+            cam_paths={view: _make_cam_file(tmp_path, view)},
+            kp2d_multi_paths={view: _make_kp2d_multi_file(tmp_path, view, frames)},
+            seeds_path=_make_seeds_file(tmp_path, {view: {"source": f"{view}.mov", "frame_time": 0,
+                                                           "seeds": {"P1": [800, 700], "P2": [1100, 700]}}}),
+            mode="singles")
+        result = tracker.run()
+        p1, p2 = result["P1"][view], result["P2"][view]
+        assert all(p2[f] is not None for f in range(40, 60))
+        assert all(p1[f] is not None for f in range(60))           # P1 keeps its own detection
+        assert tracker.reacquired == 1
+
     def test_cross_camera_fusion_for_missing_seeds(self, tmp_path):
         """Camera B has no seed for P2. P2 gets fused from camera A's track."""
         from analysis.player_tracker import PlayerTracker

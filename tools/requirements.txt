@@ -1,3 +1,28 @@
+# Local pipeline (CPU, Python 3.12): pip install -r tools/requirements.txt
 opencv-python>=4.9
 numpy>=1.26
 scipy>=1.11
+networkx>=3.0        # analysis.people.identity (tracker3d, the pose24 default --tracker 3d)
+matplotlib>=3.8      # analysis.pose24.camsubsets report figures
+threadpoolctl>=3.1   # analysis.pose24.camsubsets oracle (BLAS thread cap in worker pools)
+pyyaml>=6.0          # analysis.pose24.priors.motionbert (model config)
+# face_scan / cosmetics / avatar web app
+mediapipe>=1.0.1
+onnxruntime>=1.30.0
+fastapi>=0.141.1
+uvicorn>=0.49.0
+python-multipart>=0.0.29
+# tests: python -m pytest tools/tests -q -p no:cacheprovider
+pytest>=8.0
+httpx>=0.28.1  # FastAPI TestClient (tests)
+
+# ---- optional (uncomment what you need) ----
+# torch>=2.2         # CPU build is enough locally: MotionBERT 1-cam priors (analysis.pose24.priors),
+#                    # OSNet re-id (analysis.people --reid osnet); install from https://pytorch.org for your platform
+# psutil>=5.9        # avatar_runs MakeHuman-lock liveness check (a ctypes fallback is used without it)
+# ezc3d              # groundtruth: reading mocap .c3d files
+#
+# GPU machines / pods have their own environments, not this file:
+#   tools/wham_runpod/setup_pod.sh, tools/racket_finetune/run_runpod.sh, the rtmlib 2D producers
+#   (_archive/phase4_gpu/, tools/cost/). tools/requirements_smplx.txt is the loose pin list of the
+#   shelved SMPLer-X lane (tools/smplx_gpu.py); kept for reference, not used by any setup script.

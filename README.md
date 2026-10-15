@@ -1,4 +1,4 @@
-# BadmintonVR (v0.3.1)
+# BadmintonVR (pose pipeline v0.7.x)
 
 Turns multi-camera phone video of a badminton rally into a **3D digital twin**: body pose,
 court position, racket, shuttle, rally segments and facing direction. It then replays the rally in Unity on a
@@ -33,6 +33,28 @@ The camera calibrations and player seeds for all five clips are included.
 any doubles 3D results. You can view the singles results in Unity straight away
 (Section 2). Re-running the pipeline from the videos needs an NVIDIA GPU for steps 2–4
 (Section 3).
+
+## 0. v0.7.x pose pipeline (current) — start here
+
+The recommended route is now **pose24** (SMPL-24 skeleton, v0.7.0–v0.7.5). The step-by-step guide for the GPU PC is
+**`START-HERE.md`**. Sections 1–6 below describe the older v0.3.1 route (`build_real`), which still works.
+
+All commands run from the repository root with `PYTHONPATH=tools`:
+
+| Version | What | Command |
+|---|---|---|
+| v0.7.0 | 3D pose build (video 2D → Unity file `<clip>_pose24.analysis.json`) | `python -m analysis.pose24 build --clip singles_05x` (subset: `--views a,b,c --out-clip singles_05x_3cam --timeline-of singles_05x`) |
+| v0.7.0 | short tests (1 frame / a few frames) | `python tools/pose24_short.py --frames-dir data/pose2d_frames --clip singles_05x` |
+| v0.7.1 | CV debug sidecar + annotated video / stills | `python -m analysis.cvdebug build --clip singles_05x --variant pose24`, `python -m analysis.overlay_video render --clip singles_05x --variant pose24 --mode still --frame 900` |
+| v0.7.2 | player / non-player tracking (`persons.json`) | built by `pose24 build` (`--tracker 3d`, default); evaluation `python -m analysis.people eval` |
+| v0.7.3 | Unity CV view (camera frusta, rays, video) | needs the cvdebug sidecar; keys J, K, Y, V, N, G, 1–5 in the viewer |
+| v0.7.4 | fewer-camera study + 1-camera priors | `python -m analysis.pose24.camsubsets build --clip singles_05x --sizes 2,3,4`, then `score` / `report` |
+| v0.7.5 | bug fixes (heading sign, loopback-only calibrator, …) | — |
+
+2D pose on the GPU PC: `python tools/pose2d_parallel.py --src data/15-08/singles/0.5 --clip singles_05x --out data/pose2d --parallel 5`
+(check the GPU first with `python tools/gpu_check.py`; keep `onnxruntime-gpu==1.22.0`).
+
+`serve_calibrator.py` now listens on this computer only; add `--host 0.0.0.0` to open it to the network.
 
 ---
 

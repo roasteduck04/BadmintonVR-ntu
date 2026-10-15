@@ -2,12 +2,13 @@
 import numpy as np
 
 
-def test_temporal_prior_reduces_jitter():
-    """triangulate_racket_multi should use temporal prior, reducing
-    frame-to-frame jitter compared to independent triangulation."""
+def test_triangulate_racket_multi_passes_temporal_prior():
+    """triangulate_racket_multi hands each keypoint's previous-frame 3D point to the triangulator as a prior.
+    (Wiring only: the triangulator is patched, so this does not measure jitter reduction.)"""
     from unittest.mock import patch
     from analysis.build_real import triangulate_racket_multi, _RACKET_KP
 
+    rng = np.random.default_rng(0)
     n_frames = 10
     n_views = 3
     cams = {f"v{i}": np.eye(3, 4) for i in range(n_views)}
@@ -21,12 +22,11 @@ def test_temporal_prior_reduces_jitter():
             cand = []
             for kp_name in _RACKET_KP:
                 bx, by = base_kps[kp_name]
-                cand.append((bx + np.random.randn() * 2, by + np.random.randn() * 2, 0.8))
+                cand.append((bx + rng.normal() * 2, by + rng.normal() * 2, 0.8))
             frames.append(cand)
         assigned["P1"][v] = frames
 
     call_log = []
-    original_tri = None
 
     def tracking_tri(cams_, per_view, score_thr, prior_X=None):
         call_log.append(prior_X)
