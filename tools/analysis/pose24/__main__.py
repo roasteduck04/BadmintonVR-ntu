@@ -71,8 +71,10 @@ def _cmd_build(a):
 
     def run(c):
         kw = {"mono": a.mono, "mono_opts": mono_opts} if a.mono else {}
+        fit_opts = {"passes": a.fit_passes, "use_contact": not a.no_contact, "use_limits": not a.no_limits}
         pb.build(c, views=views, out_clip=a.out_clip, timeline_of=a.timeline_of, skeleton=a.skeleton,
-                 analysis_dir=a.analysis_dir, registry=reg, tracker=a.tracker, reid=a.reid, **kw)
+                 analysis_dir=a.analysis_dir, registry=reg, tracker=a.tracker, reid=a.reid,
+                 fit_opts=None if a.mono else fit_opts, **kw)
     return _each(clips, run, a.all)
 
 
@@ -137,6 +139,9 @@ def main(argv=None):
     b.add_argument("--mono-lengths", choices=["oracle", "prior"], default="oracle",
                    help="--mono limb lengths: the full build's (oracle) or the 1.70 m template (prior)")
     b.add_argument("--mono-prior", default=None, help="--mono: learned depth prior .npz (data/smpl_mono/...)")
+    b.add_argument("--fit-passes", type=int, default=2, help="body-fit passes (each re-estimates limb lengths + contacts)")
+    b.add_argument("--no-contact", action="store_true", help="no foot-contact term in the fit")
+    b.add_argument("--no-limits", action="store_true", help="no joint-limit term in the fit")
     b.add_argument("--analysis-dir", default=config.DEFAULT_ANALYSIS_DIR)
     ls = sub.add_parser("list", help="registry clips and which pose24 outputs exist")
     ls.add_argument("--analysis-dir", default=config.DEFAULT_ANALYSIS_DIR)

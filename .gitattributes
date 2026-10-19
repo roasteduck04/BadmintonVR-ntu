@@ -1,0 +1,4 @@
+# Shell scripts run in WSL: keep LF (a CR byte breaks bash)
+*.sh text eol=lf
+# Windows batch files: CRLF (cmd mis-parses labels and blocks with LF endings)
+*.bat text eol=crlf

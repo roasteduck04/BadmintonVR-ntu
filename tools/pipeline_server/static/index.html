@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BadmintonVR live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">BadmintonVR <span>live</span></div>
+  <nav id="tabs">
+    <button data-tab="calibrate">1 Calibrate</button>
+    <button data-tab="stream" class="on">2 Stream</button>
+  </nav>
+  <div class="topright">
+    <div id="unity" class="pill" title="Unity's heartbeat (runs/unity_status.json)">Unity: …</div>
+    <div id="machine" class="pill" title="machine preset"></div>
+    <button id="start" class="primary big">Start streaming to Unity</button>
+    <button id="stop" class="danger" disabled>Stop</button>
+  </div>
+</header>
+
+<div id="confirm" class="banner" hidden>
+  <span id="confirm-msg"></span>
+  <button id="confirm-anyway" class="ghost">Start anyway</button>
+  <button id="confirm-cancel" class="ghost">Cancel</button>
+</div>
+
+<main>
+  <!-- ======================================================== stream -->
+  <section id="tab-stream" class="tab on">
+    <div class="cols">
+      <div class="col-settings">
+        <div class="card">
+          <div class="row">
+            <label class="lab">Clip <select id="clip"></select></label>
+            <label class="lab">Settings preset <select id="preset"></select></label>
+          </div>
+          <p id="source-line" class="source"></p>
+          <p id="clip-info" class="muted"></p>
+          <p id="preset-about" class="muted"></p>
+          <div class="row tight">
+            <button id="reset" class="ghost" title="back to the preset's values">Reset to preset</button>
+            <input id="save-name" placeholder="new preset name" maxlength="40">
+            <button id="save" class="ghost">Save as preset</button>
+            <span id="changed" class="muted"></span>
+          </div>
+        </div>
+        <div id="groups"></div>
+
+        <details class="group" id="past">
+          <summary>Past streams<span class="gh">Speed, accuracy against the offline build, swaps; compare and replay</span></summary>
+          <div class="pad">
+            <div class="row tight spread">
+              <span class="muted">Tick two or more to compare (first = baseline; budget +0.5 cm / +1°, no swaps).</span>
+              <span><button id="compare-btn" class="ghost small" disabled>Compare selected</button>
+                <button id="refresh-runs" class="ghost small">Refresh</button></span>
+            </div>
+            <div class="table-wrap"><table id="runs">
+              <thead><tr><th></th><th>Stream</th><th>Frames</th><th>fps</th><th>× real time</th><th>Late</th>
+                <th>MPJPE cm</th><th>Knee °</th><th>Swaps</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table></div>
+            <div id="compare-box" hidden>
+              <div class="row spread"><h3>Compare</h3><button id="compare-close" class="ghost small">Close</button></div>
+              <div class="table-wrap"><table id="compare"></table></div>
+            </div>
+            <div id="report-box" hidden>
+              <div class="row spread"><h3 id="report-title">Report</h3><button id="report-close" class="ghost small">Close</button></div>
+              <pre id="report"></pre>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="col-run">
+        <div class="card sticky">
+          <h2>Simulated live broadcast</h2>
+          <p class="muted">The videos are played as if the cameras were live. Every frame goes through 2D pose, 3D and the
+            body fit the moment it arrives, and its JSON file appears in the run's <code>unity_live_frames/</code> folder;
+            Unity shows each pose as soon as its file lands.</p>
+          <div id="job" class="job idle">
+            <div class="job-title" id="job-title">Idle</div>
+            <div class="bar"><div id="bar-fill"></div></div>
+            <div class="stats" id="job-stats"></div>
+            <div class="stats" id="job-folder"></div>
+            <div class="err" id="job-err"></div>
+            <details><summary>Log</summary><pre id="job-log"></pre></details>
+          </div>
+          <div class="np">
+            <div class="lab">Unity</div>
+            <div id="unity-detail" class="muted">…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================== calibrate -->
+  <section id="tab-calibrate" class="tab">
+    <div class="card">
+      <div class="row spread"><h2>Court calibration</h2>
+        <span class="muted">Pick a camera on the left, click court points on the frame (pick the point on the court
+          diagram first), <b>Auto</b> finds the field of view, <b>Save</b> writes <code>data/calib/&lt;camera&gt;_cam.json</code>
+          (the old one is archived). Below 15 px is good. Calibrate again whenever a camera moves.</span></div>
+      <iframe id="calib-frame" title="court calibrator" loading="lazy"></iframe>
+    </div>
+    <div class="card">
+      <h2>Camera sync (fixed cameras)</h2>
+      <p class="muted">The stream lines the cameras up in time. With <b>sync file</b> (best_live) it uses offsets measured
+        once from the clip's offline build; with <b>auto</b> it estimates them in the first 2 s (1–2 frames off).</p>
+      <div class="table-wrap"><table id="sync">
+        <thead><tr><th>Clip</th><th>Cameras calibrated</th><th>Sync file</th><th>Offsets (frames)</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

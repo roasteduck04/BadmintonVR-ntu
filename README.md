@@ -56,6 +56,15 @@ All commands run from the repository root with `PYTHONPATH=tools`:
 
 `serve_calibrator.py` now listens on this computer only; add `--host 0.0.0.0` to open it to the network.
 
+## Live server (v0.8.2): videos → one button → Unity
+
+**Step by step for the lab PC: [`START-LIVE.md`](START-LIVE.md).** A page in the browser with two tabs, **1 Calibrate**
+(court calibration of each camera, camera sync file) and **2 Stream** (every live setting, presets). **Start streaming
+to Unity** plays the clip's videos as if the cameras were live and writes one JSON file per frame; Unity (in Play mode)
+shows each pose as soon as its file appears, with a red **● LIVE** line. Start it with `start-pipeline-server.bat wsl`
+from the Unity project folder (server in WSL, Unity on Windows) or `python tools/pipeline_server/server.py
+--unity-project <folder>` → http://localhost:8770.
+
 ## Live mode (v0.8.x)
 
 Live mode plays a recorded clip as if the cameras were live. It reads the videos in time order, runs 2D pose on the
@@ -77,8 +86,8 @@ python tools/live_run.py run --clip singles_05x --preset rtx5090 --set sync.offs
 
 - `pace=asfast` runs as fast as the computer can, not at video speed. Use it to measure throughput.
 - `configs/live/presets/rtx5090.yaml` is a copy of the RTX 3060 preset. It still needs tuning on the 5090.
-- In Unity, press Play, then click "connect" next to "+ Live run" in the viewer. The run folder box starts with the
-  newest run under `runs/`. This also works while the run is still writing.
+- In Unity, press Play: it follows whatever the live server starts (`runs/now_playing.json`). Without the server, the
+  viewer's "standalone" button shows "+ Live run" → "connect" for any run folder (also while it is still writing).
 - RTX 50xx cards need CUDA 12.8 kernels. If `gpu_check.py` fails with `onnxruntime-gpu==1.22.0`, pin a newer
   `onnxruntime-gpu` in `tools/requirements-pc.txt`. That is the fix.
 

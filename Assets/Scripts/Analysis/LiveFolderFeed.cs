@@ -25,10 +25,16 @@ namespace BadmintonVR.Analysis
         public int Received { get; private set; }
         public float IncomingFps { get; private set; }
         public float FileAgeMs { get; private set; }
+        /// <summary>The newest frame's delay inside the pipeline (camera capture -> file written), ms.</summary>
+        public float LatencyMs { get; private set; }
+        /// <summary>How far the shown pose is behind the (simulated) cameras: pipeline delay + file age, s.</summary>
+        public float BehindS => (LatencyMs + FileAgeMs) / 1000f;
+        /// <summary>Frames arrive and the run is not over: Unity is broadcasting.</summary>
+        public bool Broadcasting => Connected && !Finished;
         public string Status { get; private set; } = "not connected";
 
         [Serializable] class LivePlayerEntry { public string id; public bool valid; public int quality; public bool warmup, late, interpolated; public PlayerFrame frame; }
-        [Serializable] class LiveFrameFile { public int step, ref_frame, frame_id, quality; public float time; public LivePlayerEntry[] players; }
+        [Serializable] class LiveFrameFile { public int step, ref_frame, frame_id, quality; public float time, latency_ms; public LivePlayerEntry[] players; }
         struct Item { public LiveFrameFile f; public DateTime written; }
 
         readonly ConcurrentQueue<Item> _q = new ConcurrentQueue<Item>();
@@ -98,7 +104,7 @@ namespace BadmintonVR.Analysis
             if (!player.AttachLive(header, $"live:{runName}")) { Status = "manifest not usable"; return false; }
             liveDir = dir;
             _lastFrame = Enumerable.Repeat(-1, header.players.Length).ToArray();
-            Received = 0; Finished = false; _idleEnd = false; _stop = false;
+            Received = 0; Finished = false; _idleEnd = false; _stop = false; LatencyMs = 0f; FileAgeMs = 0f;
             _rateT0 = Time.unscaledTime; _rateN = 0;
             _thread = new Thread(Poll) { IsBackground = true, Name = "live-folder-feed" };
             _thread.Start();
@@ -167,6 +173,7 @@ namespace BadmintonVR.Analysis
                         _lastFrame[pi] = f.frame_id;
                     }
                 FileAgeMs = (float)(DateTime.UtcNow - it.written).TotalMilliseconds;
+                LatencyMs = Mathf.Max(0f, f.latency_ms);
                 Received++; n++; _rateN++;
             }
             float dt = Time.unscaledTime - _rateT0;

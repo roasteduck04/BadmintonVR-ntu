@@ -138,6 +138,7 @@ namespace BadmintonVR.Analysis
             if (GetComponent<NonPlayerMarkers>() == null) gameObject.AddComponent<NonPlayerMarkers>();
             if (GetComponent<VariantGhosts>() == null) gameObject.AddComponent<VariantGhosts>();
             if (useNewViewer && GetComponent<AnalysisViewerUITK>() == null) gameObject.AddComponent<AnalysisViewerUITK>();
+            if (GetComponent<ServerFollower>() == null) gameObject.AddComponent<ServerFollower>().player = this;   // v0.8.2
         }
 
         public AnalysisDoc Doc => _doc;

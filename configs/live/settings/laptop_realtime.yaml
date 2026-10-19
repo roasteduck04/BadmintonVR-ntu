@@ -1,0 +1,7 @@
+_about: "Real time on the laptop (no GPU, v0.8.1): stored 2D, 30 fps, sync file, fast fit. 0.93-0.95x real time, 3.2 cm / 6.3 deg."
+backend: cached
+output_fps: 30
+pace: realtime
+sync.offsets: file
+stream.solver_tol: 1.0e-4
+stream.lsmr_maxiter: 20

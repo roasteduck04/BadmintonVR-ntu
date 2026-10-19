@@ -1,0 +1,12 @@
+_about: "Best live broadcast on a GPU PC (v0.8.1, docs/reports/v0.8.1-speed.md): 2D from the video, 60 fps, sync file, fast 2D, fast fit. RTX 3060 PC: 3.0 cm / 6.1 deg, 0 swaps."
+backend: live
+output_fps: 60
+pace: realtime
+sync.offsets: file
+rtmpose.engine: fast
+rtmpose.decoder: pyav
+rtmpose.decode_short_side: 1080
+rtmpose.court_filter_m: 1.0
+rtmpose.det_every: 5
+stream.solver_tol: 1.0e-4
+stream.lsmr_maxiter: 20

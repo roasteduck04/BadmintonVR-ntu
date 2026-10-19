@@ -924,6 +924,8 @@ document.getElementById('bSeedReExtract').addEventListener('click',async()=>{
 window.addEventListener('resize',()=>render());
 resizeIcv();drawImg();drawCourt();renderPS();
 loadCameras().then(()=>loadSeeds());
+// v0.8.2: inside the live server's Calibrate tab the stream is seedless, so only the calibration mode is shown
+if(window.EMBED_LIVE_SERVER){document.querySelector('.mode-toggle').style.display='none';}
 </script>
 </body>
 </html>

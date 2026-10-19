@@ -12,3 +12,6 @@ threadpoolctl>=3.1
 tqdm>=4.0
 psutil>=5.9                           # live-frames CPU / RAM sampler
 pyyaml>=6.0                           # live-frames configs
+av>=12.0                              # PyAV: the fast live 2D video reader (rtmpose.decoder pyav, best_live / GPU presets)
+fastapi>=0.110                        # v0.8.2 pipeline server (tools/pipeline_server)
+uvicorn>=0.29

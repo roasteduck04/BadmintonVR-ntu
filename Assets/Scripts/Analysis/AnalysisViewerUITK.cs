@@ -57,6 +57,14 @@ namespace BadmintonVR.Analysis
         Button _jumpLive, _showPanels, _liveHead;
         VisualElement _liveBody;
         LiveFolderFeed _feed;
+        VisualElement _transport, _legend;
+        bool _broadcastShown;
+        ServerFollower _follower;
+        Button _serverBtn;
+        bool _standalone, _serverShown;
+        /// <summary>v0.8.2: the pipeline server decides what plays (runs/now_playing.json exists): no clip browser, no
+        /// live box; the user moves the camera and toggles the display. "standalone" brings the panels back.</summary>
+        bool ServerMode => _follower != null && _follower.Active && !_standalone;
         ScrollView _clipList, _rightScroll;
         Button _playBtn, _loopBtn, _rangeBtn;
         readonly List<(Button b, float s)> _speedBtns = new List<(Button, float)>();
@@ -203,6 +211,10 @@ namespace BadmintonVR.Analysis
             _loadBox.Add(_loading);
             topRow.Add(top); topRow.Add(_loadBox); topRow.Add(Spacer());
             _showPanels = Btn("show panels (P)", () => SetPanels(true)); _showPanels.style.display = DisplayStyle.None;
+            _serverBtn = Btn("server", () => { _standalone = !_standalone; _serverShown = !ServerMode; },
+                             "the pipeline server picks what plays; click for standalone (clip browser + live box)");
+            _serverBtn.style.display = DisplayStyle.None;
+            topRow.Add(_serverBtn);
             topRow.Add(_showPanels);
             _root.Add(topRow);
 
@@ -310,6 +322,7 @@ namespace BadmintonVR.Analysis
             _bottom.Add(_liveRow);
 
             var tr = Row(); tr.style.flexWrap = Wrap.Wrap;                 // wraps on a narrow window instead of overflowing
+            _transport = tr;
             tr.Add(Btn("|<", () => player.SeekFrame(player.RangeStart), "to the start (Home)"));
             tr.Add(Btn("-1s", () => Jump(-1f), "back 1 s (Shift+Left)"));
             tr.Add(Btn("<", () => player.StepFrame(-1), "previous frame (Left)"));
@@ -339,6 +352,7 @@ namespace BadmintonVR.Analysis
             _bottom.Add(tr);
             _timeline = new TimelineBar(this); _bottom.Add(_timeline);
             var legend = Row(); legend.style.marginTop = 3; legend.style.flexWrap = Wrap.Wrap;
+            _legend = legend;
             foreach (var (c, t) in new[] { (QFitted, "fitted"), (QWarm, "warm-up"), (QLate, "late / fallback"),
                                            (QInterp, "interpolated"), (QMissing, "no pose") })
             {
@@ -367,6 +381,8 @@ namespace BadmintonVR.Analysis
             if (!_built || _root != _ui.rootVisualElement || _root.childCount == 0) Build();
             if (!_built) return;
             if (player.analysisFile != _lastFile) { _lastFile = player.analysisFile; _dirtySections = true; MarkCurrentClip(); }
+            if (_feed == null) _feed = player.GetComponent<LiveFolderFeed>();     // the server follower may have added it
+            UpdateServerMode();
             BlurOnOutsideClick();
             HandleKeys();
             UpdateLiveInfo();
@@ -378,7 +394,8 @@ namespace BadmintonVR.Analysis
             if (player.focusPlayer != _builtFocus) _dirtySections = true;    // focus changed elsewhere (keys, scene, code)
             if (_dirtySections) { RebuildSections(); _dirtySections = false; _builtFocus = player.focusPlayer; }
             SyncToggles();
-            _title.text = Path.GetFileName(player.analysisFile ?? "").Replace(".analysis.json", "");
+            _title.text = ServerMode && !string.IsNullOrEmpty(_follower.Title) ? _follower.Title
+                        : Path.GetFileName(player.analysisFile ?? "").Replace(".analysis.json", "");
             _subtitle.text = player.Doc.ShortLabel(90);
             UpdateBanner();
             float fps = Mathf.Max(player.Fps, 1f);
@@ -476,19 +493,46 @@ namespace BadmintonVR.Analysis
             Application.OpenURL("file:///" + fd.Replace('\\', '/'));
         }
 
+        /// <summary>v0.8.2 broadcast: while frames arrive the viewer is a live broadcast, not a playback: no transport, no
+        /// timeline of the whole clip, just the LIVE line; the pose follows each frame file as it lands. When the run ends
+        /// the transport and timeline come back to scrub through it.</summary>
+        void UpdateBroadcast()
+        {
+            bool b = player.IsLive && _feed != null && _feed.Broadcasting;
+            if (b != _broadcastShown)
+            {
+                _broadcastShown = b;
+                var d = b ? DisplayStyle.None : DisplayStyle.Flex;
+                if (_transport != null) _transport.style.display = d;
+                if (_timeline != null) _timeline.style.display = d;
+                if (_legend != null) _legend.style.display = d;
+                _liveBadge.style.fontSize = b ? 16 : 13;
+                if (b) player.followLive = true;
+            }
+        }
+
         void UpdateLive()
         {
             bool live = player.IsLive && _feed != null && _feed.Connected;
             _liveRow.style.display = live ? DisplayStyle.Flex : DisplayStyle.None;
-            _jumpLive.style.display = live && !player.followLive ? DisplayStyle.Flex : DisplayStyle.None;
+            _jumpLive.style.display = live && !player.followLive && !_feed.Broadcasting ? DisplayStyle.Flex : DisplayStyle.None;
             if (_feed != null) _liveStatus.text = _feed.Status;
+            UpdateBroadcast();
             if (!live) return;
+            if (_feed.Broadcasting)
+            {
+                _liveBadge.style.color = Warn;
+                _liveBadge.text = _feed.Received == 0
+                    ? "\u25CF LIVE    Broadcasting: waiting for the first frames from the cameras..."
+                    : $"\u25CF LIVE    Broadcasting: processing the game in real time    {_feed.Received} frames    " +
+                      $"{_feed.IncomingFps:0.0} frames/s in    {_feed.BehindS:0.0} s behind the cameras";
+                return;
+            }
             float fps = Mathf.Max(player.Fps, 1f);
             float behind = Mathf.Max(0, player.LiveHead - player.CurrentFrame) / fps;
             string follow = player.followLive ? $"buffer {player.liveDelayS * 1000f:0} ms" : $"{behind:0.0} s behind live";
-            _liveBadge.text = _feed.Finished
-                ? $"RUN FINISHED    {_feed.Received} frames    files written {Age(_feed.FileAgeMs)} ago    {follow}"
-                : $"LIVE    {_feed.Received} frames    {_feed.IncomingFps:0.0} fps in    newest file {Age(_feed.FileAgeMs)} old    {follow}";
+            _liveBadge.style.color = Dim;
+            _liveBadge.text = $"BROADCAST ENDED    {_feed.Received} frames    scrub back with the timeline    {follow}";
         }
 
         /// <summary>A file age in readable units (ms, s, min, h, d).</summary>
@@ -533,6 +577,24 @@ namespace BadmintonVR.Analysis
         void SetA() { player.rangeStart = player.CurrentFrame; if (player.rangeEnd >= 0 && player.rangeEnd < player.rangeStart) player.rangeEnd = -1; }
         void SetB() { player.rangeEnd = player.CurrentFrame; if (player.rangeStart > player.rangeEnd) player.rangeStart = -1; }
         void ToggleHelp() => _help.style.display = _help.style.display == DisplayStyle.None ? DisplayStyle.Flex : DisplayStyle.None;
+
+        /// <summary>Server mode hides the left dock (clip browser + live run box); the button shows server / standalone.</summary>
+        void UpdateServerMode()
+        {
+            if (_follower == null) _follower = player.GetComponent<ServerFollower>();
+            bool active = _follower != null && _follower.Active;
+            if (_serverBtn != null)
+            {
+                _serverBtn.style.display = active ? DisplayStyle.Flex : DisplayStyle.None;
+                _serverBtn.text = ServerMode ? "server mode" : "standalone";
+                SetOn(_serverBtn, ServerMode);
+            }
+            bool server = ServerMode;
+            if (server == _serverShown || _left == null) return;
+            _serverShown = server;
+            _left.style.display = server ? DisplayStyle.None : DisplayStyle.Flex;
+            if (server && !string.IsNullOrEmpty(_follower.LastError)) Toast(_follower.LastError);
+        }
 
         void SetPanels(bool on)
         {
