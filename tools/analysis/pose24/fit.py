@@ -263,10 +263,17 @@ class WindowProblem24:
         return sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
                              shape=(r0, self.nv))
 
-    def solve(self, max_nfev=40):
+    def solve(self, max_nfev=40, tol=None, lsmr_maxiter=None, info=None):
+        """tol: ftol = xtol = gtol of least_squares (None = SciPy's 1e-8, the offline fit); lsmr_maxiter: cap on the
+        inner LSMR iterations per step (None = LSMR's default). `info` (dict) receives nfev / status / cost."""
         x0 = self.X0[self.free].ravel()
+        kw = {} if tol is None else {"ftol": float(tol), "xtol": float(tol), "gtol": float(tol)}
+        if lsmr_maxiter:
+            kw["tr_options"] = {"maxiter": int(lsmr_maxiter)}
         res = least_squares(self.residuals, x0, jac=self.jacobian, method="trf", loss="soft_l1",
-                            f_scale=F_SCALE, tr_solver="lsmr", max_nfev=max_nfev, x_scale=1.0)
+                            f_scale=F_SCALE, tr_solver="lsmr", max_nfev=max_nfev, x_scale=1.0, **kw)
+        if info is not None:
+            info.update(nfev=int(res.nfev), status=int(res.status), cost=float(res.cost))
         return self.unpack(res.x)
 
 

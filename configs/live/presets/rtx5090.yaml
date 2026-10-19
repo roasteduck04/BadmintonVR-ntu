@@ -1,0 +1,11 @@
+# Lab RTX 5090 PC: WSL Ubuntu (repo ~/BadmintonVR-ntu, venv ~/venv-pc).
+backend: live
+device: cuda
+stream:
+  workers: 2
+rtmpose:                        # v0.8.1 fast 2D (runs/v081z): 4.2 fps at 30 fps, 6.9 at 60 (v0.8.0: 0.6 / 1.0)
+  engine: fast                  # batched pose crops of all persons of a frame
+  decoder: pyav
+  decode_short_side: 1080       # shrink the 4K frames while decoding (body error ~1 px)
+  court_filter_m: 1.0           # only persons whose feet are on the court (+1 m) go to the pose model
+  det_every: 5                  # person detector every 5th frame, boxes from the last poses in between

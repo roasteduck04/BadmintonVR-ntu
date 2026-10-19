@@ -41,6 +41,7 @@
       "timeline_of": "doubles_2sides_4angle"},
     "singles_05x_2cam_bl_br": {"base": "singles_05x", "views": ["backleft_051", "backright_051"], "timeline_of": "singles_05x"},
     "doubles_2sides_2cam_br_fr": {"base": "doubles_2sides", "views": ["backright_31", "frontright_31"], "timeline_of": "doubles_2sides"},
-    "singles_05x_1cam_b": {"base": "singles_05x", "views": ["back_051"], "timeline_of": "singles_05x", "mono": true, "mono_lengths": "oracle"}
+    "singles_05x_1cam_b": {"base": "singles_05x", "views": ["back_051"], "timeline_of": "singles_05x", "mono": true, "mono_lengths": "oracle"},
+    "singles_05x_3cam": {"base": "singles_05x", "views": ["back_051", "backright_051", "frontleft_051"], "timeline_of": "singles_05x"}
   }
 }

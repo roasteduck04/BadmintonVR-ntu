@@ -13,6 +13,8 @@ namespace BadmintonVR.Analysis
         public bool master = true;
         public bool showStats = true, showProvenance = true, showStatus = true;
         public bool showWarnings = true, colorByConfidence = true, showAxes = true, showLog = false;
+        [Tooltip("Draw the stats and toggle boxes in the screen corners (IMGUI). Off while the UI Toolkit viewer is up: it shows the same text and toggles in its Debug section")]
+        public bool drawPanels = true;
 
         [Header("Stroke Bubble")]
         public float bubbleDuration = 1.0f;
@@ -51,6 +53,9 @@ namespace BadmintonVR.Analysis
             foreach (var m in _axisMats) RendererUtil.DestroySafe(m);
             RendererUtil.DestroySafe(_whiteTex);
         }
+
+        /// <summary>The last log messages (newest last), for the viewer's Debug section.</summary>
+        public IReadOnlyList<string> RecentLog => _log;
 
         void OnLog(string msg, string stack, LogType t)
         {
@@ -214,6 +219,8 @@ namespace BadmintonVR.Analysis
 
             DrawStrokeBubbles(doc);
 
+            if (!drawPanels || UiPointerGuard.ViewerOwnsScreen) { UiPointerGuard.Clear(this); return; }
+
             var tp = new Rect(Screen.width - 190, 8, 182, 176);
             UiPointerGuard.Set(this, tp);        // the toggle box (the stats box is read-only)
             GUI.Box(tp, "debug [H]");
@@ -227,6 +234,32 @@ namespace BadmintonVR.Analysis
             showLog        = GUILayout.Toggle(showLog, " log console");
             GUILayout.EndArea();
 
+            string stats = StatsText();
+
+            if (_statsStyle == null)
+            {
+                _statsStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, fontSize = 18, richText = false };
+                _statsStyle.normal.textColor = Color.white;
+            }
+            GUI.Box(new Rect(8, 8, 540, 260), stats, _statsStyle);
+
+            if (showLog && _log.Count > 0)
+            {
+                if (_logStyle == null)
+                {
+                    _logStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.LowerLeft, fontSize = 14 };
+                    _logStyle.normal.textColor = new Color(0.8f, 0.9f, 1f);
+                }
+                GUI.Box(new Rect(8, 276, 560, 140), string.Join("\n", _log), _logStyle);
+            }
+        }
+
+        /// <summary>The stats text (one line per item) for the toggles that are on: fps, clip, skins, cv state, producers,
+        /// shuttle / stroke, contract warnings.</summary>
+        public string StatsText()
+        {
+            var doc = player != null ? player.Doc : null;
+            if (doc == null) return "";
             var sb = new StringBuilder();
             int f = player.CurrentFrame;
             if (showStats)
@@ -268,22 +301,7 @@ namespace BadmintonVR.Analysis
                 sb.AppendLine(_warnings == null || _warnings.Count == 0
                     ? "contract: OK" : "contract WARN: " + string.Join("; ", _warnings));
 
-            if (_statsStyle == null)
-            {
-                _statsStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, fontSize = 18, richText = false };
-                _statsStyle.normal.textColor = Color.white;
-            }
-            GUI.Box(new Rect(8, 8, 540, 260), sb.ToString(), _statsStyle);
-
-            if (showLog && _log.Count > 0)
-            {
-                if (_logStyle == null)
-                {
-                    _logStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.LowerLeft, fontSize = 14 };
-                    _logStyle.normal.textColor = new Color(0.8f, 0.9f, 1f);
-                }
-                GUI.Box(new Rect(8, 276, 560, 140), string.Join("\n", _log), _logStyle);
-            }
+            return sb.ToString().TrimEnd();
         }
 
         void DrawStrokeBubbles(AnalysisDoc doc)
@@ -312,7 +330,7 @@ namespace BadmintonVR.Analysis
 
                 Vector3 worldPos = root.position + Vector3.up * bubbleYOffset;
                 Vector3 screen = cam.WorldToScreenPoint(worldPos);
-                if (screen.z < 0f) continue;
+                if (screen.z < 0f || UiPointerGuard.UnderPanel(screen)) continue;
 
                 float screenY = Screen.height - screen.y;
 
@@ -340,7 +358,7 @@ namespace BadmintonVR.Analysis
         bool TogglePressed()
         {
 #if ENABLE_INPUT_SYSTEM
-            var kb = Keyboard.current; return kb != null && kb.hKey.wasPressedThisFrame;
+            var kb = Keyboard.current; return kb != null && !UiPointerGuard.Typing && kb.hKey.wasPressedThisFrame;
 #else
             return false;
 #endif

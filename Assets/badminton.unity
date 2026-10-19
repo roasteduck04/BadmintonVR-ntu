@@ -215,7 +215,6 @@ GameObject:
   m_Component:
   - component: {fileID: 170096014}
   - component: {fileID: 170096013}
-  - component: {fileID: 170096016}
   - component: {fileID: 170096015}
   m_Layer: 0
   m_Name: AnalysisPlayer
@@ -236,7 +235,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 0b2774fa3b6802548936ba56884c095b, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  analysisFile: analysis/singles_05x.analysis.json
+  analysisFile: analysis/singles_05x_pose24.analysis.json
   play: 0
   jointRadius: 0.045
   boneRadius: 0.028
@@ -246,12 +245,18 @@ MonoBehaviour:
   - {r: 0.2, g: 0.7, b: 1, a: 1}
   - {r: 1, g: 0.5, b: 0.2, a: 1}
   speed: 1
-  focusPlayer: 0
+  loop: 1
+  rangeStart: -1
+  rangeEnd: -1
+  useNewViewer: 1
+  focusPlayer: -1
   mixamoPrefab: {fileID: 919132149155446097, guid: 2cef52dcda48b3541955810d84f9f8ee, type: 3}
   makeHumanPrefab: {fileID: 919132149155446097, guid: 932e362c74ca43845b23ab1ad3a5df39, type: 3}
   showPose: 1
   showRacket: 1
   showShuttle: 1
+  liveDelayS: 0.15
+  followLive: 1
 --- !u!4 &170096014
 Transform:
   m_ObjectHideFlags: 0
@@ -290,20 +295,6 @@ MonoBehaviour:
   showLog: 0
   bubbleDuration: 1
   bubbleYOffset: 2
---- !u!114 &170096016
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 170096012}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 1d5ced1385790284e83f93f86a4089ea, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  player: {fileID: 170096013}
-  visible: 1
 --- !u!21 &311919455
 Material:
   serializedVersion: 8

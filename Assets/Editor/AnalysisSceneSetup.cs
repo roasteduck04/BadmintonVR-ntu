@@ -20,10 +20,8 @@ namespace BadmintonVR.EditorTools
             var ap = existing != null ? existing : go.AddComponent<AnalysisPlayer>();
             go.transform.position = Vector3.zero;
 
-            // viewer UI + debug HUD live on the same object, drive the same player
+            // debug HUD on the same object, drives the same player (the UI Toolkit viewer is added by AnalysisPlayer at runtime)
             // explicit null checks: GetComponent returns a fake-null object in the editor, so `??` would never add
-            var ui = go.GetComponent<AnalysisViewerUI>(); if (ui == null) ui = go.AddComponent<AnalysisViewerUI>();
-            ui.player = ap;
             var hud = go.GetComponent<AnalysisDebugHUD>(); if (hud == null) hud = go.AddComponent<AnalysisDebugHUD>();
             hud.player = ap;
             // SP4 cv visualisation (AnalysisPlayer also adds them at runtime when missing)
@@ -43,7 +41,7 @@ namespace BadmintonVR.EditorTools
             var orbit = cam.GetComponent<OrbitCamera>(); if (orbit == null) orbit = cam.gameObject.AddComponent<OrbitCamera>();
             orbit.Frame();
 
-            Debug.Log("[Analysis] scene assembled: court + AnalysisPlayer + UI + HUD + cv components + orbit camera");
+            Debug.Log("[Analysis] scene assembled: court + AnalysisPlayer + HUD + cv components + orbit camera");
             return go;
         }
     }

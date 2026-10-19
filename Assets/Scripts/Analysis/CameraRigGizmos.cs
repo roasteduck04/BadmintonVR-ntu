@@ -21,13 +21,28 @@ namespace BadmintonVR.Analysis
         int _look = -1;
         Vector3 _savedPos; Quaternion _savedRot; float _savedFov; Rect _savedRect; bool _savedLift, _orbitWasEnabled;
         GUIStyle _label;
+        Camera _bars;      // clears the whole screen behind the letterboxed view (else old frames smear in the bars)
 
         public int LookingThrough => _look;
 
         void Awake() { if (player == null) player = GetComponent<AnalysisPlayer>(); }
         void OnEnable() { if (player != null) { player.ClipLoaded += Rebuild; if (player.Doc != null) Rebuild(); } }
         void OnDisable() { if (player != null) player.ClipLoaded -= Rebuild; ExitLookThrough(); }
-        void OnDestroy() { _lines?.Dispose(); if (_root != null) Destroy(_root.gameObject); }
+        void OnDestroy() { _lines?.Dispose(); if (_root != null) Destroy(_root.gameObject); if (_bars != null) Destroy(_bars.gameObject); }
+
+        /// <summary>A camera that renders nothing and clears the full screen to black, one depth below the main camera.</summary>
+        void ShowBars(Camera main, bool on)
+        {
+            if (on && _bars == null)
+            {
+                _bars = new GameObject("cv_letterbox_bars").AddComponent<Camera>();
+                _bars.clearFlags = CameraClearFlags.SolidColor; _bars.backgroundColor = Color.black;
+                _bars.cullingMask = 0; _bars.rect = new Rect(0, 0, 1, 1);
+            }
+            if (_bars == null) return;
+            if (main != null) _bars.depth = main.depth - 1;
+            _bars.enabled = on;
+        }
 
         void Rebuild()
         {
@@ -68,7 +83,7 @@ namespace BadmintonVR.Analysis
             }
 #if ENABLE_INPUT_SYSTEM
             var kb = UnityEngine.InputSystem.Keyboard.current;
-            if (_look >= 0 && kb != null && kb.escapeKey.wasPressedThisFrame) ExitLookThrough();
+            if (_look >= 0 && kb != null && !UiPointerGuard.Typing && kb.escapeKey.wasPressedThisFrame) ExitLookThrough();
 #endif
         }
 
@@ -89,6 +104,7 @@ namespace BadmintonVR.Analysis
             cam.transform.SetPositionAndRotation(CameraWorld(v), CameraRotWorld(v));
             cam.fieldOfView = cv.cameras[v].vfov_deg;        // centred principal point, so no lens shift (SP2 F6)
             cam.rect = CvMath.LetterboxRect((float)Screen.width / Mathf.Max(Screen.height, 1), cv.cameras[v].Aspect);
+            ShowBars(cam, true);
             player.LiftToFloor = false;
             return true;
         }
@@ -98,6 +114,7 @@ namespace BadmintonVR.Analysis
             if (_look < 0) return;
             _look = -1;
             var cam = Camera.main;
+            ShowBars(cam, false);
             if (cam != null)
             {
                 cam.transform.SetPositionAndRotation(_savedPos, _savedRot);
@@ -116,6 +133,7 @@ namespace BadmintonVR.Analysis
             if (_label == null) { _label = new GUIStyle(GUI.skin.label) { fontSize = 13 }; }
             if (_look >= 0)
             {
+                if (UiPointerGuard.ViewerOwnsScreen) return;     // the viewer's top bar shows the look-through banner
                 var c = cv.cameras[_look];
                 GUI.Label(new Rect(12, 8, 700, 22), $"looking through {c.name}  ({c.width}×{c.height}, vfov {c.vfov_deg:F1}°)  —  Esc to return", _label);
                 return;
@@ -126,7 +144,7 @@ namespace BadmintonVR.Analysis
                 var c = cv.cameras[v];
                 if (!c.HasPose) continue;
                 Vector3 s = cam.WorldToScreenPoint(CameraWorld(v));
-                if (s.z <= 0f) continue;
+                if (s.z <= 0f || UiPointerGuard.UnderPanel(s)) continue;
                 float used = UsedFrac(cv, c.name);
                 string tag = c.excluded ? " EXCLUDED" : c.held_out ? " HELD OUT" : "";
                 string h = c.health_px >= 0 ? $" · {c.health_px:F0} px" : "";

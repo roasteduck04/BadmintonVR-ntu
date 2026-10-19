@@ -24,9 +24,41 @@ namespace BadmintonVR.Analysis
             return false;
         }
 
+        /// <summary>Extra hit tests (screen position -> over UI?), e.g. the UI Toolkit viewer's panel.Pick.</summary>
+        static readonly System.Collections.Generic.Dictionary<object, System.Func<Vector2, bool>> _pickers =
+            new System.Collections.Generic.Dictionary<object, System.Func<Vector2, bool>>();
+        public static void SetPicker(object owner, System.Func<Vector2, bool> overUi) => _pickers[owner] = overUi;
+        public static void ClearPicker(object owner) => _pickers.Remove(owner);
+
         /// <summary>Is the pointer (screen coordinates) over a registered panel, or is an IMGUI control being dragged?</summary>
         public static bool PointerOverUi(Vector2 screenPos)
-            => GUIUtility.hotControl != 0 || Contains(_rects.Values, ScreenToGui(screenPos, Screen.height));
+        {
+            if (GUIUtility.hotControl != 0 || Contains(_rects.Values, ScreenToGui(screenPos, Screen.height))) return true;
+            foreach (var p in _pickers.Values) if (p(screenPos)) return true;
+            return false;
+        }
+
+        /// <summary>A world-anchored IMGUI label (screen point) that would sit under a UI Toolkit panel: skip drawing it.</summary>
+        public static bool UnderPanel(Vector2 screenPos)
+        {
+            foreach (var p in _pickers.Values) if (p(screenPos)) return true;
+            return false;
+        }
+
+        /// <summary>A UI Toolkit viewer is up: it shows the screen-fixed texts (look-through banner, ghost legend, debug
+        /// stats) inside its own panels, so the IMGUI versions in the corners stay off and never overlap it.</summary>
+        public static bool ViewerOwnsScreen => _pickers.Count > 0;
+
+        /// <summary>Keyboard owners (a text field being typed in): while one is busy, key shortcuts and fly-mode WASD
+        /// must not act, so typed letters go to the field only.</summary>
+        static readonly System.Collections.Generic.Dictionary<object, System.Func<bool>> _typing =
+            new System.Collections.Generic.Dictionary<object, System.Func<bool>>();
+        public static void SetTyping(object owner, System.Func<bool> typing) => _typing[owner] = typing;
+        public static void ClearTyping(object owner) => _typing.Remove(owner);
+        public static bool Typing
+        {
+            get { foreach (var t in _typing.Values) if (t()) return true; return false; }
+        }
     }
 
     /// <summary>
@@ -86,7 +118,8 @@ namespace BadmintonVR.Analysis
 #if ENABLE_INPUT_SYSTEM
         void HandleInput()
         {
-            var kb = Keyboard.current;
+            // typing in a viewer text field (run folder): the letters belong to the field, not the camera
+            var kb = UiPointerGuard.Typing ? null : Keyboard.current;
             if (kb != null && kb.cKey.wasPressedThisFrame)
             {
                 flyMode = !flyMode;
@@ -118,7 +151,7 @@ namespace BadmintonVR.Analysis
 
         void HandleOrbitInput()
         {
-            var m = Mouse.current; var kb = Keyboard.current;
+            var m = Mouse.current; var kb = UiPointerGuard.Typing ? null : Keyboard.current;
             if (m != null)
             {
                 Vector2 d = m.delta.ReadValue();
@@ -145,8 +178,8 @@ namespace BadmintonVR.Analysis
 
         void HandleFlyInput()
         {
-            var m = Mouse.current; var kb = Keyboard.current;
-            if (m == null || kb == null) return;
+            var m = Mouse.current;
+            if (m == null) return;
 
             if (m.rightButton.isPressed && !DragBelongsToUi(m))
             {
@@ -163,6 +196,8 @@ namespace BadmintonVR.Analysis
             Quaternion rot = Quaternion.Euler(_flyPitch, _flyYaw, 0f);
             transform.rotation = rot;
 
+            var kb = UiPointerGuard.Typing ? null : Keyboard.current;
+            if (kb == null) return;
             Vector3 move = Vector3.zero;
             if (kb.wKey.isPressed) move += Vector3.forward;
             if (kb.sKey.isPressed) move += Vector3.back;

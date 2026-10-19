@@ -99,6 +99,48 @@ namespace BadmintonVR.Analysis
         public static CvDebugDoc Parse(string json, AnalysisDoc analysis, out string why)
         {
             if (!JsonLoad.TryParse(json, out CvDebugDoc d, out why)) return null;
+            return Check(d, analysis, out why);
+        }
+
+        /// <summary>Holder for a cvdebug block embedded in the analysis doc itself (tools/analysis/bundle.py: one file
+        /// per playback). JsonUtility ignores every other field of the doc.</summary>
+        [Serializable] class Embedded { public CvDebugDoc cvdebug; }
+
+        /// <summary>The cvdebug block embedded in the analysis doc's JSON, checked like a sidecar; null when absent.</summary>
+        public static CvDebugDoc FromEmbedded(string analysisJson, AnalysisDoc analysis, out string why)
+        {
+            why = "not embedded";
+            if (string.IsNullOrEmpty(analysisJson) || analysisJson.IndexOf("\"cvdebug\":", StringComparison.Ordinal) < 0)
+                return null;
+            if (!JsonLoad.TryParse(analysisJson, out Embedded h, out why) || h.cvdebug == null || h.cvdebug.format == null)
+            { why = "not embedded"; return null; }
+            return Check(h.cvdebug, analysis, out why);
+        }
+
+        public static CvDebugDoc TryLoadEmbedded(string streamingAssetsRelativePath, AnalysisDoc analysis)
+        {
+            if (!JsonLoad.TryRead(streamingAssetsRelativePath, out string json, out string path, out _)) return null;
+            return TryEmbedded(json, path, analysis, null);
+        }
+
+        /// <summary>The embedded block of an analysis doc's JSON that is already in memory (the clip loader reads the file
+        /// once); messages go to `log` when given (worker thread), else to the console.</summary>
+        public static CvDebugDoc TryEmbedded(string analysisJson, string path, AnalysisDoc analysis, LoadLog log)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var d = FromEmbedded(analysisJson, analysis, out string why);
+            if (d == null)
+            {
+                if (why != "not embedded") JsonLoad.Warn(log, $"[Analysis] embedded cvdebug ignored ({why}): {path}");
+                return null;
+            }
+            JsonLoad.Info(log, $"[Analysis] cvdebug (embedded): {d.V} cameras, {d.players.Length} players ({sw.ElapsedMilliseconds} ms)");
+            return d;
+        }
+
+        static CvDebugDoc Check(CvDebugDoc d, AnalysisDoc analysis, out string why)
+        {
+            why = "";
             if (d.format != Format) { why = $"format {d.format} != {Format}"; return null; }
             if (d.V == 0 || d.V > MaxViews) { why = $"{d.V} cameras"; return null; }
             if (d.J == 0) { why = "no joint_names"; return null; }
@@ -129,18 +171,19 @@ namespace BadmintonVR.Analysis
         static int Len(int[] a) => a != null ? a.Length : -1;
         static bool EmptyOr(int[] a, int n) => a == null || a.Length == 0 || a.Length == n;
 
-        public static CvDebugDoc TryLoad(string streamingAssetsRelativePath, AnalysisDoc analysis)
+        /// <summary>Loads the cvdebug sidecar; null when absent or mismatched. Messages go to `log` when given (worker thread).</summary>
+        public static CvDebugDoc TryLoad(string streamingAssetsRelativePath, AnalysisDoc analysis, LoadLog log = null)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             if (!JsonLoad.TryRead(streamingAssetsRelativePath, out string json, out string path, out string why))
             {
-                if (why != "not found") Debug.LogWarning($"[Analysis] cvdebug sidecar {why}, ignored: {path}");
+                if (why != "not found") JsonLoad.Warn(log, $"[Analysis] cvdebug sidecar {why}, ignored: {path}");
                 return null;
             }
             var d = Parse(json, analysis, out why);
-            if (d == null) { Debug.LogWarning($"[Analysis] cvdebug sidecar ignored ({why}): {path}"); return null; }
-            Debug.Log($"[Analysis] cvdebug: {d.V} cameras, {d.players.Length} players, {d.persons.Length} persons " +
-                      $"({sw.ElapsedMilliseconds} ms)");
+            if (d == null) { JsonLoad.Warn(log, $"[Analysis] cvdebug sidecar ignored ({why}): {path}"); return null; }
+            JsonLoad.Info(log, $"[Analysis] cvdebug: {d.V} cameras, {d.players.Length} players, {d.persons.Length} persons " +
+                               $"({sw.ElapsedMilliseconds} ms)");
             return d;
         }
     }

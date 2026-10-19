@@ -1,0 +1,111 @@
+# v0.8.0 live-frames: every parameter of a simulated-live run, with its default.
+# Merge order: this file <- clip file (configs/live/<clip>.yaml) <- preset (configs/live/presets/<name>.yaml)
+#              <- command line (--set key.sub=value). The resolved result is saved in every run folder.
+# Lengths are in SECONDS (converted to steps for the chosen output_fps); distances in court metres.
+# Nothing here names a clip or a camera: those come from the clip file and the pose24 registry.
+
+clip: null                      # pose24 registry entry (tools/analysis/pose24/clips.json): views, videos, mode
+views: null                     # camera subset (default: every view of the registry entry)
+time_ref: null                  # reference view (default: registry time_ref if in views, else the first view)
+section_s: [0.0, null]          # [start, end] in seconds of the reference view; null end = to the end of the video
+output_fps: 30                  # output frames per second; must divide the source fps (30 or 60 for 60 fps video)
+out_clip: "{clip}_{nviews}cam_live{fps}"   # final analysis file name: <out_clip>_pose24.analysis.json
+
+backend: cached                 # cached = replay data/pose2d/<view>_kp2d.json frame by frame | live = video -> rtmlib
+device: cuda                    # live backend: cuda | cpu
+pace: realtime                  # realtime = steps arrive on the wall clock | asfast = as fast as the pipeline runs
+skeleton: smpl-28
+
+sync:
+  narrow_after_warmup: true     # v0.8.1, offsets auto: once the warm-up sync is known, the 2D workers skip every
+                                # source frame the remaining steps do not need (auto sync asks for all of them before)
+  mode: interp                  # interp = 2 source frames per non-reference view, 2D interpolated | nearest
+  offsets: auto                 # auto = estimate online after warm-up | file = data/calib/<clip>_sync.json
+                                # | zero | {view: frames}
+  estimate: {max_offset_s: 0.25, step_frames: 2, min_samples: 10}
+  partner_max_px: 150.0         # interp: the other source frame's detection must be this close (body centre)
+
+rtmpose:                        # live backend only (same model + settings as the offline 2D by default)
+  mode: performance             # performance | balanced | lightweight
+  det_every: 1                  # run the person detector every N frames (tracking in between)
+  downscale: 1.0                # resize factor before the model (1.0 = full resolution)
+  model: wholebody              # wholebody (133 keypoints) | body (17 keypoints, faster; feet/hands missing)
+                                # | body_feet (Halpe-26: body + 6 foot points; engine fast only)
+  engine: rtmlib                # rtmlib = v0.8.0 (rtmlib PoseTracker, one pose call per person) | fast = batched
+                                # crops (all persons of a frame / of all cameras in one pose call), v0.8.1
+  decoder: cv2                  # engine fast: cv2 | pyav | ffmpeg | nvdec (ffmpeg + CUDA) | nvcodec (PyNvVideoCodec)
+  decode_short_side: null       # engine fast: shrink frames while decoding to this shorter side (px); null = full size
+  decode_threads: 0             # engine fast, pyav / ffmpeg: decoder threads (0 = library default)
+  batch_views: false            # engine fast: true = one process for every camera (frames of one output step batched)
+  pose_batch: 32                # engine fast: max crops per pose-model call
+  prefetch: 2                   # engine fast: decoded frames kept ready per camera
+  det: null                     # engine fast: detector model URL / path (null = the model's default for this mode)
+  court_filter_m: null          # engine fast: pose only persons whose feet are on the court (+ this margin, m); null = all
+  pad_batch: true               # engine fast: pad each pose call to 1/2/4/8/16/32 crops (a new input size is ~6x slower)
+  warmup: true                  # engine fast: run every padded size once before the clock starts
+  cudnn_search: null            # engine fast: cuDNN algorithm search (null = ORT default EXHAUSTIVE | heuristic | default)
+  queue_depth: 8                # frames a camera worker may run ahead of the scheduler
+  drop_behind_s: null           # realtime: skip a frame already this late when the worker reaches it (null = never)
+
+warmup:
+  seconds: 2.0                  # buffered before the body model is fixed; warm-up frames are output flagged
+  player_height_m: [1.0, 2.3]   # plausible candidate height (head top -> floor; players crouch to ~1.2 m in the
+                                # ready stance) - rejects kids / ghosts / half-detected people
+  min_support_views: 2          # a candidate must be seen by at least this many cameras to be picked
+  min_time_in_court_frac: 0.5   # of the warm-up steps
+  ankle_h: auto                 # auto = estimate from warm-up candidates | a number in metres
+  refresh_body_s: null          # re-estimate the body model every N seconds (null = never)
+
+tracker:                        # online singles tracker (P1 = near half, P2 = far half)
+  net_band_m: 0.5               # a player may lean / step this far past the net line
+  court_margin_m: 0.0           # candidates outside the court + margin are ignored
+  gate_m: 1.5                   # max floor jump between steps
+  gate_growth_mps: 6.0          # the gate grows while a player is lost
+  first_support_weight: 10.0    # first sighting: prefer many views ...
+  first_depth_weight: 0.01      # ... and players near the baseline
+  support_weight: 0.2           # later: distance minus this x support
+
+stream:
+  min_body_kp: 6                # a step counts as "seen" when >= this many of the 17 body keypoints triangulate
+  window_s: 1.0                 # fit window (offline: 60 frames at 60 fps)
+  overlap_s: 0.1667             # window overlap (offline: 10 frames at 60 fps)
+  history_s: 1.0                # L/R swap look-back
+  fit_budget_s: auto            # auto = (window - overlap) seconds; a window solved later is "late" (fallback)
+  workers: 2                    # fit worker processes (0 = inline)
+  fit_every: 1                  # solve every Nth window, fallback in between (speed knob)
+  max_iter: null                # solver iteration cap (null = the offline default, 40)
+  solver_tol: 1.0e-4            # v0.8.1: least_squares ftol = xtol = gtol (null = SciPy 1e-8, the offline fit). With
+  lsmr_maxiter: 20              # the LSMR cap (null = LSMR default) the fit is 4.1x cheaper per frame, +0.1 cm / -0.1 deg
+  late_policy: drop             # a window solved after its budget: drop = output the fallback (latency bounded)
+                                # | use = wait and output the fit (latency grows when the fit is slower than real time)
+  good_conf: {multi: 0.7, two_view: 0.45}   # body-length samples: triangulation confidence ...
+  good_inliers: {multi: 3, two_view: 2}     # ... and inlier views
+  min_hip_frames: 5             # warm-up frames with a hip needed for a body model
+
+fallback:
+  alpha: 0.5                    # causal EMA weight of the newest raw triangulation
+  max_hold_s: 0.1667            # a keypoint missing longer than this is dropped
+
+facing:
+  window_s: 0.25                # causal (past-only) smoothing of the heading
+
+output:
+  frames: true                  # write live/frames/<step>.json
+  final_doc: true               # write <out_clip>_pose24.analysis.json at the end
+  copy_to_analysis_dir: false   # also copy the final doc into paths.analysis_dir (Unity)
+  round_decimals: 5
+  background_writer: true       # write frame files on a separate thread (the loop does not wait for the disk)
+
+report:
+  reference_clips: []           # offline builds to compare against (first = primary); default set by the clip file
+  plots: true
+
+samplers:
+  gpu_ms: 250
+  cpu_ms: 500
+
+paths:
+  data_dir: data
+  runs_dir: runs
+  analysis_dir: Assets/StreamingAssets/analysis
+  sync_file: "{data_dir}/calib/{clip}_sync.json"

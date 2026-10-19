@@ -1,0 +1,13 @@
+{
+ "clip": "singles_05x",
+ "time_ref": "back_051",
+ "offsets": {
+  "back_051": 0.0,
+  "backleft_051": 0.5,
+  "backright_051": -0.7,
+  "frontleft_051": -0.4,
+  "frontright_051": -1.7
+ },
+ "source": "singles_05x_pose24.analysis.json",
+ "made": "2026-10-15 16:07"
+}

@@ -1,0 +1,6 @@
+# singles_05x (15-08 session, 0.5x ultra-wide lens), simulated live on 3 cameras, rally 2.
+clip: singles_05x
+views: [back_051, backright_051, frontleft_051]
+section_s: [6.5, 16.5]          # 10 s
+report:
+  reference_clips: [singles_05x, singles_05x_3cam]   # 5-camera offline build (primary), 3-camera offline build

@@ -111,7 +111,7 @@ namespace BadmintonVR.Analysis
             foreach (var (id, pos) in _labels)
             {
                 Vector3 s = Camera.main.WorldToScreenPoint(pos);
-                if (s.z > 0f) GUI.Label(new Rect(s.x - 20, Screen.height - s.y - 10, 60, 20), $"#{id}");
+                if (s.z > 0f && !UiPointerGuard.UnderPanel(s)) GUI.Label(new Rect(s.x - 20, Screen.height - s.y - 10, 60, 20), $"#{id}");
             }
         }
     }

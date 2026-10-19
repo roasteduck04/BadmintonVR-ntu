@@ -36,6 +36,12 @@ namespace BadmintonVR.Analysis
             new Color(0.9f, 0.3f, 0.7f),  // P4 pink
         };
         [Range(0.1f, 3f)] public float speed = 1f;
+        [Tooltip("Wrap to the start (or the A-B range start) at the end; off = stop at the end")]
+        public bool loop = true;
+        [Tooltip("A-B playback range in frames (-1 = clip start / end)")]
+        public int rangeStart = -1, rangeEnd = -1;
+        [Tooltip("v0.8.0: the UI Toolkit viewer (AnalysisViewerUITK) replaces the IMGUI panel")]
+        public bool useNewViewer = true;
         [Tooltip("-1 = all players; otherwise the only player index shown")]
         public int focusPlayer = -1;
         [Tooltip("Humanoid FBX for the Mixamo character skin")]
@@ -131,6 +137,7 @@ namespace BadmintonVR.Analysis
             if (GetComponent<VideoBillboard>() == null) gameObject.AddComponent<VideoBillboard>();
             if (GetComponent<NonPlayerMarkers>() == null) gameObject.AddComponent<NonPlayerMarkers>();
             if (GetComponent<VariantGhosts>() == null) gameObject.AddComponent<VariantGhosts>();
+            if (useNewViewer && GetComponent<AnalysisViewerUITK>() == null) gameObject.AddComponent<AnalysisViewerUITK>();
         }
 
         public AnalysisDoc Doc => _doc;
@@ -240,34 +247,99 @@ namespace BadmintonVR.Analysis
             => _shuttleVis != null ? _shuttleVis.Describe(frame) : "shuttle (none)";
 
         /// <summary>Shuttle sidecars of a clip that is about to load (parsed + validated, nothing attached yet).</summary>
-        static System.Collections.Generic.Dictionary<string, ShuttleVariantDoc> LoadShuttleVariants(string file, AnalysisDoc doc)
+        static System.Collections.Generic.Dictionary<string, ShuttleVariantDoc> LoadShuttleVariants(string file, AnalysisDoc doc, LoadLog log)
         {
             var found = new System.Collections.Generic.Dictionary<string, ShuttleVariantDoc>();
             foreach (var v in ShuttleVariantNames)
             {
-                var sc = ShuttleVariantDoc.TryLoad(ShuttleSidecarPath(file, v), doc);
+                var sc = ShuttleVariantDoc.TryLoad(ShuttleSidecarPath(file, v), doc, log);
                 if (sc != null) found[v] = sc;
             }
             if (found.Count > 0)
-                Debug.Log($"[Analysis] shuttle variants: {string.Join(", ", found.Keys)}");
+                JsonLoad.Info(log, $"[Analysis] shuttle variants: {string.Join(", ", found.Keys)}");
             return found;
         }
 
         void Refresh() { if (_doc != null && _roots != null) ShowFrame(_frame); }
 
         /// <summary>Racket sidecars of a clip that is about to load (parsed + validated, nothing attached yet).</summary>
-        static System.Collections.Generic.Dictionary<string, RacketVariantDoc> LoadRacketVariants(string file, AnalysisDoc doc)
+        static System.Collections.Generic.Dictionary<string, RacketVariantDoc> LoadRacketVariants(string file, AnalysisDoc doc, LoadLog log)
         {
             var found = new System.Collections.Generic.Dictionary<string, RacketVariantDoc>();
             foreach (var v in RacketVariantNames)
             {
-                var sc = RacketVariantDoc.TryLoad(RacketSidecarPath(file, v), doc);
+                var sc = RacketVariantDoc.TryLoad(RacketSidecarPath(file, v), doc, log);
                 if (sc != null) found[v] = sc;
             }
             if (found.Count > 0)
-                Debug.Log($"[Analysis] racket variants: {string.Join(", ", found.Keys)}");
+                JsonLoad.Info(log, $"[Analysis] racket variants: {string.Join(", ", found.Keys)}");
             return found;
         }
+
+        /// <summary>First / last frame played (the A-B range when set, else the whole clip).</summary>
+        public int RangeStart => FrameCount == 0 ? 0 : Mathf.Clamp(rangeStart < 0 ? 0 : rangeStart, 0, FrameCount - 1);
+        public int RangeEnd => FrameCount == 0 ? 0 : Mathf.Clamp(rangeEnd < 0 ? FrameCount - 1 : rangeEnd, RangeStart, FrameCount - 1);
+        public void ClearRange() { rangeStart = -1; rangeEnd = -1; }
+
+        // ---- live folder (v0.8.0 live-frames): frames arrive one by one (LiveFolderFeed) ----
+        /// <summary>A live run is attached: the doc fills up as frame files arrive; the clock follows the newest frame.</summary>
+        public bool IsLive { get; private set; }
+        /// <summary>Newest frame index received (-1: none yet).</summary>
+        public int LiveHead { get; private set; } = -1;
+        /// <summary>Per timeline frame: the live quality (0 fitted, 1 warm-up, 2 late / fallback, 3 none), -1 not received.</summary>
+        public int[] LiveQuality { get; private set; }
+        [Tooltip("Live: show this far behind the newest frame (jitter buffer, s)")]
+        public float liveDelayS = 0.15f;
+        [Tooltip("Live: keep the clock at the newest frame minus the delay (off after a seek; Jump to live turns it on)")]
+        public bool followLive = true;
+
+        /// <summary>Attach a live run: header = the run's unity_live_frames/manifest.json (players with no frames, meta.frame_count = the
+        /// timeline length). Every frame starts empty (no pose) until PushLiveFrame fills it.</summary>
+        public bool AttachLive(AnalysisDoc header, string label)
+        {
+            if (header?.players == null || header.players.Length == 0 || header.skeleton?.parents == null
+                || header.meta == null || header.meta.frame_count <= 0)
+            { Debug.LogError($"[Analysis] live manifest not usable: {label}"); return false; }
+            CancelLoad();                                        // the live run is the newer request
+            int F = header.meta.frame_count;
+            float fps = Mathf.Max(header.meta.fps, 1f);
+            foreach (var p in header.players)
+            {
+                p.frames = new PlayerFrame[F];
+                for (int f = 0; f < F; f++) p.frames[f] = new PlayerFrame { frame_id = f, time = f / fps };
+            }
+            LiveQuality = new int[F];
+            for (int f = 0; f < F; f++) LiveQuality[f] = -1;
+            LiveHead = -1; followLive = true; IsLive = true;
+            analysisFile = label;
+            _doc = header; _t = 0f; _frame = 0;
+            Build(new System.Collections.Generic.Dictionary<string, RacketVariantDoc>(),
+                  new System.Collections.Generic.Dictionary<string, ShuttleVariantDoc>(), null);
+            Debug.Log($"[Analysis] live: attached {label} ({header.players.Length} players, {F}-frame timeline)");
+            return true;
+        }
+
+        /// <summary>One player's frame of a live frame file. Frames between the previous received one and this one
+        /// (output fps below the timeline fps) hold the previous pose.</summary>
+        public void PushLiveFrame(int frameId, int playerIndex, PlayerFrame fr, int quality, int holdFrom)
+        {
+            if (!IsLive || _doc == null || frameId < 0 || frameId >= FrameCount) return;
+            if (playerIndex < 0 || playerIndex >= _doc.players.Length || fr == null) return;
+            int nj = fr.joints_flat != null ? fr.joints_flat.Length : 0;
+            if (nj != 0 && nj != AnalysisDoc.Stride * _doc.JointCount) return;     // wrong skeleton: never index it
+            var frames = _doc.players[playerIndex].frames;
+            fr.frame_id = frameId;
+            frames[frameId] = fr;
+            if (holdFrom >= 0 && holdFrom < frameId)
+                for (int f = holdFrom + 1; f < frameId; f++) frames[f] = frames[holdFrom];
+            LiveQuality[frameId] = Mathf.Max(LiveQuality[frameId], quality);
+            if (holdFrom >= 0) for (int f = holdFrom + 1; f < frameId; f++) LiveQuality[f] = LiveQuality[frameId];
+            if (frameId > LiveHead) LiveHead = frameId;
+        }
+
+        public void DetachLive() { IsLive = false; followLive = false; }
+
+        public void JumpToLive() { if (IsLive) { followLive = true; play = true; } }
 
         public void TogglePlay() => play = !play;
         public void Play() => play = true;
@@ -279,6 +351,7 @@ namespace BadmintonVR.Analysis
         void Seek(int f, bool snapFacing)
         {
             if (_doc == null || FrameCount == 0) return;
+            if (IsLive) { followLive = false; f = Mathf.Min(f, Mathf.Max(LiveHead, 0)); }
             _frame = Mathf.Clamp(f, 0, FrameCount - 1);
             _t = _frame / Mathf.Max(_doc.Fps, 1f);   // keep clock in sync so play resumes here
             if (snapFacing && _facingFrame != null)
@@ -294,46 +367,158 @@ namespace BadmintonVR.Analysis
 
         void Start() => LoadClip(analysisFile);
 
-        /// <summary>Load a different clip at runtime (StreamingAssets-relative path). Transactional: the doc and every sidecar
-        /// are read, parsed and validated into locals first (each loader contains its own exceptions); only then are
-        /// analysisFile and the state swapped. On failure the previous clip keeps playing, analysisFile unchanged.</summary>
-        public bool LoadClip(string streamingAssetsRelativePath)
-        {
-            string file = streamingAssetsRelativePath;
-            var doc = AnalysisDoc.Load(file);
-            if (doc == null)
-            {
-                Debug.LogError($"[Analysis] load failed, keeping {(_doc != null ? analysisFile : "nothing")}: {file}");
-                return false;
-            }
-            var rackets = LoadRacketVariants(file, doc);
-            var shuttles = LoadShuttleVariants(file, doc);
-            var cv = CvDebugDoc.TryLoad(CvDebugSidecarPath(file), doc);
+        void OnDestroy() => CancelLoad();
 
-            analysisFile = file;
-            _doc = doc;
-            _t = 0f; _frame = 0;
-            Build(rackets, shuttles, cv);
-            Debug.Log($"[Analysis] loaded {_doc.clip_id}: {_doc.FrameCount} frames, " +
-                      $"{_doc.players.Length} players");
-            return true;
+        // ---- clip loading (v0.8.1): read + parse + validate on a worker thread, apply on the main thread ----
+        /// <summary>Everything one clip load reads, parsed and validated off the main thread: plain data only (no
+        /// UnityEngine.Object, no main-thread-only API). doc is null when the load failed or was cancelled.</summary>
+        public sealed class ClipData
+        {
+            public string file;
+            public AnalysisDoc doc;
+            public string error;             // why doc is null ("cancelled" for a superseded load)
+            public System.Collections.Generic.Dictionary<string, RacketVariantDoc> rackets;
+            public System.Collections.Generic.Dictionary<string, ShuttleVariantDoc> shuttles;
+            public CvDebugDoc cv;
+            public float lift;               // AnalysisDoc.GroundLift: a pass over every frame, so done here too
+            public long bytes, readMs, parseMs, totalMs;
+            public readonly LoadLog log = new LoadLog();   // replayed on the main thread when the result is applied
         }
+
+        /// <summary>Read, parse and validate a clip and its sidecars (cvdebug embedded or sidecar, racket, shuttle). Safe on a
+        /// worker thread once JsonLoad.Root has been read on the main thread; contains every exception. A cancelled token
+        /// stops it between stages (a JsonUtility parse already running finishes first).</summary>
+        public static ClipData ReadClip(string file, System.Threading.CancellationToken cancel = default,
+                                        System.Action<string> stage = null)
+        {
+            var d = new ClipData { file = file };
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                stage?.Invoke("reading");
+                if (!JsonLoad.TryRead(file, out string json, out string path, out string why))
+                { d.error = $"file {why}: {path}"; d.log.Add(LogType.Error, $"[Analysis] {d.error}"); return d; }
+                d.bytes = json.Length;
+                try { d.bytes = new System.IO.FileInfo(path).Length; } catch (System.Exception) { }
+                d.readMs = sw.ElapsedMilliseconds;
+                if (cancel.IsCancellationRequested) { d.error = "cancelled"; return d; }
+                stage?.Invoke("parsing");
+                var doc = AnalysisDoc.Parse(json, out why);
+                d.parseMs = sw.ElapsedMilliseconds - d.readMs;
+                if (doc == null)
+                { d.error = $"failed to load ({why}): {path}"; d.log.Add(LogType.Error, $"[Analysis] {d.error}"); return d; }
+                if (cancel.IsCancellationRequested) { d.error = "cancelled"; return d; }
+                stage?.Invoke("sidecars");
+                d.cv = CvDebugDoc.TryEmbedded(json, path, doc, d.log) ?? CvDebugDoc.TryLoad(CvDebugSidecarPath(file), doc, d.log);
+                json = null;
+                d.rackets = LoadRacketVariants(file, doc, d.log);
+                d.shuttles = LoadShuttleVariants(file, doc, d.log);
+                d.lift = doc.GroundLift();
+                if (cancel.IsCancellationRequested) { d.error = "cancelled"; return d; }
+                d.doc = doc;
+            }
+            catch (System.Exception e)
+            {
+                d.doc = null; d.error = $"{e.GetType().Name}: {e.Message}";
+                d.log.Add(LogType.Error, $"[Analysis] reading {file} threw {d.error}");
+            }
+            d.totalMs = sw.ElapsedMilliseconds;
+            return d;
+        }
+
+        System.Threading.Tasks.Task<ClipData> _load;              // the newest request; older ones are cancelled + dropped
+        System.Threading.CancellationTokenSource _loadCancel;
+        bool _loadKeepInstant;
+        float _loadStartedAt;
+        volatile string _loadStage;
+
+        /// <summary>A clip is being read on a worker thread (the current clip keeps playing until it is applied).</summary>
+        public bool IsLoading => _load != null;
+        /// <summary>The clip being read (StreamingAssets-relative), null when idle.</summary>
+        public string LoadingFile { get; private set; }
+        /// <summary>Its size on disk (bytes, 0 when unknown).</summary>
+        public long LoadingBytes { get; private set; }
+        /// <summary>"reading", "parsing" or "sidecars" while loading.</summary>
+        public string LoadingStage => _loadStage;
+        public float LoadingSeconds => IsLoading ? Time.realtimeSinceStartup - _loadStartedAt : 0f;
+
+        /// <summary>Load a different clip at runtime (StreamingAssets-relative path) without freezing: the doc and every
+        /// sidecar are read, parsed and validated on a worker thread (ReadClip) while the current clip keeps playing; the
+        /// result is applied on the main thread (Update). A newer request (LoadClip, AttachLive) cancels this one. On
+        /// failure the previous clip keeps playing, analysisFile unchanged, and the reason is logged (the viewer's toast).</summary>
+        public void LoadClip(string streamingAssetsRelativePath) => StartLoad(streamingAssetsRelativePath, false);
 
         /// <summary>Load another build of the same scene keeping the instant, not the frame index: builds sit on different
         /// timelines, so the frame is re-timed by their sync offsets (CvMath.GhostFrameShift, as VariantGhosts does);
-        /// kept as is when the offsets share no view. False (nothing changed) when the load fails.</summary>
-        public bool LoadClipKeepingInstant(string streamingAssetsRelativePath)
+        /// kept as is when the offsets share no view. The instant is the one shown when the new build is applied.</summary>
+        public void LoadClipKeepingInstant(string streamingAssetsRelativePath) => StartLoad(streamingAssetsRelativePath, true);
+
+        void StartLoad(string file, bool keepInstant)
         {
+            CancelLoad();
+            _ = JsonLoad.Root;                                   // main thread: the worker uses the cached path
+            long bytes = 0;
+            try { bytes = new System.IO.FileInfo(JsonLoad.FullPath(file)).Length; } catch (System.Exception) { }
+            LoadingFile = file; LoadingBytes = bytes; _loadStartedAt = Time.realtimeSinceStartup;
+            _loadKeepInstant = keepInstant; _loadStage = "queued";
+            var cts = new System.Threading.CancellationTokenSource();
+            _loadCancel = cts;
+            _load = System.Threading.Tasks.Task.Run(() => ReadClip(file, cts.Token,
+                                                                   s => { if (!cts.IsCancellationRequested) _loadStage = s; }));
+        }
+
+        /// <summary>Drop the running load: its worker stops at the next stage and its result is never applied.</summary>
+        void CancelLoad()
+        {
+            _loadCancel?.Cancel();
+            _loadCancel = null; _load = null; LoadingFile = null; LoadingBytes = 0; _loadStage = null;
+        }
+
+        /// <summary>Main thread, every frame: apply the newest load once its worker is done.</summary>
+        void PollLoad()
+        {
+            if (_load == null || !_load.IsCompleted) return;
+            var task = _load;
+            string file = LoadingFile;
+            bool keep = _loadKeepInstant;
+            _load = null; _loadCancel = null; LoadingFile = null; LoadingBytes = 0; _loadStage = null;
+            var d = task.Status == System.Threading.Tasks.TaskStatus.RanToCompletion ? task.Result
+                  : new ClipData { file = file, error = task.Exception?.GetBaseException().Message ?? "cancelled" };
+            ApplyClip(d, keep);
+        }
+
+        bool ApplyClip(ClipData d, bool keepInstant)
+        {
+            d.log.Replay();
+            if (d.doc == null)
+            {
+                if (d.error != "cancelled")
+                    Debug.LogError($"[Analysis] load failed, keeping {(_doc != null ? analysisFile : "nothing")}: {d.file}");
+                return false;
+            }
             int frame = _frame;
             var an = new System.Collections.Generic.List<string>(); var ao = new System.Collections.Generic.List<float>();
-            CvMath.TimelineOffsets(CvDebug, _doc, an, ao);
-            if (!LoadClip(streamingAssetsRelativePath)) return false;
-            var bn = new System.Collections.Generic.List<string>(); var bo = new System.Collections.Generic.List<float>();
-            CvMath.TimelineOffsets(CvDebug, _doc, bn, bo);
-            float shift = CvMath.GhostFrameShift(an, ao, bn, bo, out bool known);
-            int target = CvMath.SameInstantFrame(frame, shift, known, FrameCount);
-            if (target != frame) Debug.Log($"[Analysis] kept the instant: frame {frame} -> {target} (shift {shift:+0.0;-0.0} f)");
-            SeekFrame(target);
+            keepInstant &= _doc != null;
+            if (keepInstant) CvMath.TimelineOffsets(CvDebug, _doc, an, ao);
+            if (IsLive) { var feed = GetComponent<LiveFolderFeed>(); if (feed != null) feed.Disconnect(); IsLive = false; }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            analysisFile = d.file;
+            _doc = d.doc;
+            _t = 0f; _frame = 0;
+            Build(d.rackets, d.shuttles, d.cv, d.lift);
+            Debug.Log($"[Analysis] loaded {_doc.clip_id}: {_doc.FrameCount} frames, {_doc.players.Length} players " +
+                      $"({d.bytes / 1048576f:0.0} MB; worker: read {d.readMs} ms, parse {d.parseMs} ms, total {d.totalMs} ms; " +
+                      $"main thread: build {sw.ElapsedMilliseconds} ms)");
+            if (keepInstant)
+            {
+                var bn = new System.Collections.Generic.List<string>(); var bo = new System.Collections.Generic.List<float>();
+                CvMath.TimelineOffsets(CvDebug, _doc, bn, bo);
+                float shift = CvMath.GhostFrameShift(an, ao, bn, bo, out bool known);
+                int target = CvMath.SameInstantFrame(frame, shift, known, FrameCount);
+                if (target != frame) Debug.Log($"[Analysis] kept the instant: frame {frame} -> {target} (shift {shift:+0.0;-0.0} f)");
+                SeekFrame(target);
+            }
             return true;
         }
 
@@ -401,8 +586,9 @@ namespace BadmintonVR.Analysis
             new Color(0.9f, 0.3f, 0.7f),
         };
 
+        /// <summary>lift: the clip's GroundLift when the loader already computed it (else computed here).</summary>
         void Build(System.Collections.Generic.Dictionary<string, RacketVariantDoc> rackets,
-                   System.Collections.Generic.Dictionary<string, ShuttleVariantDoc> shuttles, CvDebugDoc cv)
+                   System.Collections.Generic.Dictionary<string, ShuttleVariantDoc> shuttles, CvDebugDoc cv, float? lift = null)
         {
             Clear();
             int np = _doc.players.Length;
@@ -411,7 +597,7 @@ namespace BadmintonVR.Analysis
                 playerColors = _defaultColors;
             _roots = new Transform[np];
             _renderers = new IPoseRenderer[np];
-            _clipLift = _doc.GroundLift();
+            _clipLift = lift ?? _doc.GroundLift();
             _jointBuf = new Vector3[_doc.JointCount];
             _confBuf = new float[_doc.JointCount];
             if (_skins == null || _skins.Length != np)
@@ -452,12 +638,33 @@ namespace BadmintonVR.Analysis
 
         void Update()
         {
+            PollLoad();
             if (_doc == null || _roots == null) return;
+            if (IsLive && _doc.FrameCount > 0 && LiveHead >= 0)
+            {
+                int target = Mathf.Max(0, LiveHead - Mathf.RoundToInt(liveDelayS * _doc.Fps));
+                if (followLive) { _frame = target; _t = _frame / Mathf.Max(_doc.Fps, 1f); }
+                else if (play)
+                {
+                    _t += Time.deltaTime * Mathf.Max(speed, 0f);
+                    _frame = Mathf.Clamp(Mathf.FloorToInt(_t * _doc.Fps), 0, LiveHead);
+                    if (_frame >= target) followLive = true;            // caught up
+                }
+                ShowFrame(_frame);
+                return;
+            }
             if (play && _doc.FrameCount > 0)
             {
                 _t += Time.deltaTime * Mathf.Max(speed, 0f);
-                float duration = _doc.FrameCount / Mathf.Max(_doc.Fps, 1f);
-                if (_t >= duration) _t -= duration;
+                float fps = Mathf.Max(_doc.Fps, 1f);
+                int a = RangeStart, b = RangeEnd;
+                float t0 = a / fps, t1 = (b + 1) / fps;
+                if (_t < t0) _t = t0;
+                if (_t >= t1)
+                {
+                    if (loop) _t = t0 + Mathf.Repeat(_t - t1, Mathf.Max(t1 - t0, 1f / fps));
+                    else { _t = b / fps; play = false; }
+                }
                 _frame = Mathf.Clamp(Mathf.FloorToInt(_t * _doc.Fps), 0, _doc.FrameCount - 1);
             }
             ShowFrame(_frame);

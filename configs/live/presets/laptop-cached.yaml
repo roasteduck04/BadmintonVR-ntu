@@ -1,0 +1,4 @@
+# Laptop (Intel Iris Xe, no NVIDIA GPU): cached 2D only, 3D on the CPU.
+backend: cached
+stream:
+  workers: 2

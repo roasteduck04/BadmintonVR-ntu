@@ -56,6 +56,32 @@ All commands run from the repository root with `PYTHONPATH=tools`:
 
 `serve_calibrator.py` now listens on this computer only; add `--host 0.0.0.0` to open it to the network.
 
+## Live mode (v0.8.x)
+
+Live mode plays a recorded clip as if the cameras were live. It reads the videos in time order, runs 2D pose on the
+GPU, builds the 3D pose and writes one small JSON file per output frame. Unity can follow those files while they
+arrive. It needs no player seeds.
+
+Each run gets its own folder: `runs/live_<clip>_<fps>fps_<stored2d|live2d>_<pace>_<date>_<time>/`.
+The frames are in `unity_live_frames/frame_NNNNNN.json` inside it. The folder also holds the config, the timing
+log and a report.
+
+Run from the repository root:
+
+```
+python tools/gpu_check.py                    # 2D model really on the GPU? (exit 0 = yes)
+python tools/live_run.py machine             # what this computer has (GPU, CPU, RAM)
+python tools/live_run.py run --clip singles_05x --preset rtx5090 --set sync.offsets=file --set output_fps=60
+python tools/live_run.py run --clip singles_05x --preset rtx5090 --set sync.offsets=file --set output_fps=60 --set pace=asfast
+```
+
+- `pace=asfast` runs as fast as the computer can, not at video speed. Use it to measure throughput.
+- `configs/live/presets/rtx5090.yaml` is a copy of the RTX 3060 preset. It still needs tuning on the 5090.
+- In Unity, press Play, then click "connect" next to "+ Live run" in the viewer. The run folder box starts with the
+  newest run under `runs/`. This also works while the run is still writing.
+- RTX 50xx cards need CUDA 12.8 kernels. If `gpu_check.py` fails with `onnxruntime-gpu==1.22.0`, pin a newer
+  `onnxruntime-gpu` in `tools/requirements-pc.txt`. That is the fix.
+
 ---
 
 ## 1. Folder guide

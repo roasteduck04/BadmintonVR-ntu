@@ -14,8 +14,19 @@ namespace BadmintonVR.Analysis
     /// into a reason string. Each loader parses + validates into a local and only returns a doc that fits.</summary>
     public static class JsonLoad
     {
+        static string _root;
+
+        /// <summary>Application.streamingAssetsPath, cached: Unity answers it only on the main thread, and clip loads read
+        /// on a worker (AnalysisPlayer.ReadClip). Touch it once on the main thread before a worker needs it.</summary>
+        public static string Root => _root ?? (_root = Application.streamingAssetsPath);
+
+        /// <summary>An absolute path stays as it is (Path.Combine), so tests can read files outside StreamingAssets.</summary>
         public static string FullPath(string streamingAssetsRelativePath)
-            => Path.Combine(Application.streamingAssetsPath, streamingAssetsRelativePath);
+            => Path.Combine(Root, streamingAssetsRelativePath);
+
+        /// <summary>A warning to the load's log when it has one (a worker-thread load), else straight to the console.</summary>
+        public static void Warn(LoadLog log, string msg) { if (log != null) log.Add(LogType.Warning, msg); else Debug.LogWarning(msg); }
+        public static void Info(LoadLog log, string msg) { if (log != null) log.Add(LogType.Log, msg); else Debug.Log(msg); }
 
         /// <summary>Parse json into T; false with the reason on empty input, malformed JSON or a null result.</summary>
         public static bool TryParse<T>(string json, out T doc, out string why) where T : class
@@ -34,8 +45,53 @@ namespace BadmintonVR.Analysis
             text = null; why = "";
             path = FullPath(streamingAssetsRelativePath);
             if (!File.Exists(path)) { why = "not found"; return false; }
-            try { text = File.ReadAllText(path); return true; }
+            try { text = ReadUtf8(path); return true; }
             catch (Exception e) { why = $"unreadable ({e.Message})"; return false; }
+        }
+
+        static byte[] _readBuf;                     // one reusable read buffer (the largest file read so far)
+        static readonly object _readLock = new object();
+
+        /// <summary>The file as UTF-8 text (a BOM is skipped). File.ReadAllText allocated ~4x the file size (StringBuilder
+        /// chunks + the string): 45 MB for the 11 MB singles_05x doc, and in the editor's ~1.8 GB heap every collection that
+        /// garbage triggers stalls the main thread for 70-230 ms even when the read runs on a worker. With a reused byte
+        /// buffer only the string itself (2x the file, needed by JsonUtility) is new. Thread-safe: a second reader while the
+        /// buffer is out gets a fresh one.</summary>
+        static string ReadUtf8(string path)
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16))
+            {
+                long len = fs.Length;
+                if (len > int.MaxValue) throw new IOException($"{len} bytes is too large");
+                byte[] buf = null;
+                lock (_readLock) if (_readBuf != null && _readBuf.Length >= len) { buf = _readBuf; _readBuf = null; }
+                if (buf == null) buf = new byte[Math.Max(len, 1)];
+                try
+                {
+                    int n = 0;
+                    while (n < len) { int r = fs.Read(buf, n, (int)len - n); if (r <= 0) break; n += r; }
+                    int start = n >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF ? 3 : 0;
+                    return System.Text.Encoding.UTF8.GetString(buf, start, n - start);
+                }
+                finally { lock (_readLock) if (_readBuf == null || _readBuf.Length < buf.Length) _readBuf = buf; }
+            }
+        }
+    }
+
+    /// <summary>The console messages of a load that ran on a worker thread, replayed on the main thread when its result is
+    /// applied: Application.logMessageReceived (the viewer's toast) only reports main-thread logs.</summary>
+    public sealed class LoadLog
+    {
+        readonly System.Collections.Generic.List<(LogType type, string msg)> _items = new System.Collections.Generic.List<(LogType, string)>();
+        public System.Collections.Generic.IReadOnlyList<(LogType type, string msg)> Items => _items;
+        public void Add(LogType type, string msg) => _items.Add((type, msg));
+
+        public void Replay()
+        {
+            foreach (var (type, msg) in _items)
+                if (type == LogType.Error) Debug.LogError(msg);
+                else if (type == LogType.Warning) Debug.LogWarning(msg);
+                else Debug.Log(msg);
         }
     }
 
@@ -45,7 +101,10 @@ namespace BadmintonVR.Analysis
     [Serializable] public class PoseVariantMeta { public string time_ref_view; public ViewOffset[] offsets_list; }
     /// <summary>meta.pose24: only the build id (pairs the doc with its cvdebug sidecar / debug cache).</summary>
     [Serializable] public class Pose24Meta { public string build_id; }
-    [Serializable] public class AnalysisMeta { public float fps; public int frame_count; public string source_clip; public Producers producers; public string label; public PoseVariantMeta pose_variant; public Pose24Meta pose24; }
+    [Serializable] public class AnalysisMeta { public float fps; public int frame_count; public string source_clip; public Producers producers; public string label; public PoseVariantMeta pose_variant; public Pose24Meta pose24; public LiveMeta live; }
+    /// <summary>meta.live (v0.8.0 live-frames docs): the frames the live run produced and their quality
+    /// (0 fitted, 1 warm-up, 2 late / fallback, 3 none); the per-player quality dict is Python-only.</summary>
+    [Serializable] public class LiveMeta { public int[] ref_frames; public float fps_pipeline; public int[] frame_quality; }
     [Serializable] public class AnalysisCourt { public float length_z, width_x, singles_half_width_x, baseline_z, short_service_z, net_z; }
     [Serializable] public class AnalysisSkeleton { public string type; public string family; public string label; public string[] joint_names; public int[] parents; public string[] aux_names; }
     [Serializable] public class Stroke { public string label; public float confidence; }
@@ -115,16 +174,17 @@ namespace BadmintonVR.Analysis
             return doc;
         }
 
-        /// <summary>Loads the sidecar if it exists, parses and matches the analysis doc's players/frames; else null.</summary>
-        public static RacketVariantDoc TryLoad(string streamingAssetsRelativePath, AnalysisDoc analysis)
+        /// <summary>Loads the sidecar if it exists, parses and matches the analysis doc's players/frames; else null.
+        /// Warnings go to `log` when given (worker thread), else to the console.</summary>
+        public static RacketVariantDoc TryLoad(string streamingAssetsRelativePath, AnalysisDoc analysis, LoadLog log = null)
         {
             if (!JsonLoad.TryRead(streamingAssetsRelativePath, out string json, out string path, out string why))
             {
-                if (why != "not found") Debug.LogWarning($"[Analysis] racket sidecar {why}, ignored: {path}");
+                if (why != "not found") JsonLoad.Warn(log, $"[Analysis] racket sidecar {why}, ignored: {path}");
                 return null;
             }
             var doc = Parse(json, analysis, out why);
-            if (doc == null) Debug.LogWarning($"[Analysis] racket sidecar {why}, ignored: {path}");
+            if (doc == null) JsonLoad.Warn(log, $"[Analysis] racket sidecar {why}, ignored: {path}");
             return doc;
         }
     }
@@ -310,16 +370,17 @@ namespace BadmintonVR.Analysis
             return doc;
         }
 
-        /// <summary>Loads the sidecar if it exists, parses and matches the analysis doc's frame count; else null.</summary>
-        public static ShuttleVariantDoc TryLoad(string streamingAssetsRelativePath, AnalysisDoc analysis)
+        /// <summary>Loads the sidecar if it exists, parses and matches the analysis doc's frame count; else null.
+        /// Warnings go to `log` when given (worker thread), else to the console.</summary>
+        public static ShuttleVariantDoc TryLoad(string streamingAssetsRelativePath, AnalysisDoc analysis, LoadLog log = null)
         {
             if (!JsonLoad.TryRead(streamingAssetsRelativePath, out string json, out string path, out string why))
             {
-                if (why != "not found") Debug.LogWarning($"[Analysis] shuttle sidecar {why}, ignored: {path}");
+                if (why != "not found") JsonLoad.Warn(log, $"[Analysis] shuttle sidecar {why}, ignored: {path}");
                 return null;
             }
             var doc = Parse(json, analysis, out why);
-            if (doc == null) Debug.LogWarning($"[Analysis] shuttle sidecar {why}, ignored: {path}");
+            if (doc == null) JsonLoad.Warn(log, $"[Analysis] shuttle sidecar {why}, ignored: {path}");
             return doc;
         }
     }
