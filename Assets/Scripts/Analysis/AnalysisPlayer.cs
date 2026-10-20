@@ -137,6 +137,13 @@ namespace BadmintonVR.Analysis
             if (GetComponent<VideoBillboard>() == null) gameObject.AddComponent<VideoBillboard>();
             if (GetComponent<NonPlayerMarkers>() == null) gameObject.AddComponent<NonPlayerMarkers>();
             if (GetComponent<VariantGhosts>() == null) gameObject.AddComponent<VariantGhosts>();
+            EnsureViewer();
+        }
+
+        /// <summary>The viewer and the server follower (Unity heartbeat) do not need a clip: added at Start, so a machine
+        /// without any offline build (lab PC, purely live) still shows the UI and is seen as in Play mode.</summary>
+        void EnsureViewer()
+        {
             if (useNewViewer && GetComponent<AnalysisViewerUITK>() == null) gameObject.AddComponent<AnalysisViewerUITK>();
             if (GetComponent<ServerFollower>() == null) gameObject.AddComponent<ServerFollower>().player = this;   // v0.8.2
         }
@@ -366,7 +373,11 @@ namespace BadmintonVR.Analysis
         /// <summary>Step like playback: one frame forward keeps the per-data-frame facing smoothing (backward snaps).</summary>
         public void StepFrame(int delta) { Pause(); Seek(_frame + delta, snapFacing: false); }
 
-        void Start() => LoadClip(analysisFile);
+        void Start()
+        {
+            EnsureViewer();
+            LoadClip(analysisFile);
+        }
 
         void OnDestroy() => CancelLoad();
 
