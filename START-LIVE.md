@@ -5,7 +5,8 @@ Unity**; the PC plays the singles 0.5x videos as if the cameras were live, build
 frame, writes one JSON file per frame, and Unity (in Play mode) shows each pose as soon as its file appears, with a red
 **● LIVE** line.
 
-Set-up on the lab PC: the code in WSL Ubuntu (`~/BadmintonVR-ntu`, venv `~/venv-pc`) and the Unity project on the
+Set-up on the lab PC: the code in WSL Ubuntu (`~/BadmintonVR`, a clone of the GitHub repo BadmintonVR-ntu; venv
+`~/venv-pc`) and the Unity project on the
 Windows side (below: `C:\Users\<you>\BadmintonVR-unity`). The server runs in WSL (it needs the GPU); Unity reads the
 frame files from the Unity project's `runs\` folder. Time: about 30 min the first time.
 
@@ -16,7 +17,7 @@ frame files from the Unity project's `runs\` folder. Time: about 30 min the firs
 Start → **Ubuntu** (or PowerShell: `wsl`). Then:
 
 ```bash
-cd ~/BadmintonVR-ntu
+cd ~/BadmintonVR
 git pull
 source ~/venv-pc/bin/activate
 pip install -r tools/requirements-pc.txt
@@ -44,11 +45,24 @@ python tools/live_run.py machine
 ls "data/15-08/singles/0.5"
 ```
 
-Five `.mov` files must be listed. If the folder is missing but the videos are on the Windows side (e.g. in
-`C:\BadmintonVR\data\15-08`), link them instead of copying:
+Five `.mov` files must be listed, each about 150 MB (several minutes of 4K at 60 fps). Check their length:
 
 ```bash
-mkdir -p data && ln -s "/mnt/c/BadmintonVR/data/15-08" data/15-08
+python -c "
+import cv2, glob
+for p in sorted(glob.glob('data/15-08/singles/0.5/*.mov')):
+    c = cv2.VideoCapture(p); n, f = c.get(cv2.CAP_PROP_FRAME_COUNT), c.get(cv2.CAP_PROP_FPS)
+    print(f'{p}: {n:.0f} frames = {n / f:.1f} s')
+"
+```
+
+Thousands of frames each. A 30-frame (0.5 s, ~3 MB) file is an old short test clip: the stream needs seconds
+6.5–16.5 and stops with "section_s ... outside the 0.50 s video". Copy the full videos from the Windows side (lab PC:
+`C:\Users\<you>\BadmintonVR\data\15-08\singles\0.5\`), keeping the short clips aside:
+
+```bash
+mkdir -p data/15-08/singles/0.5_first30 && mv data/15-08/singles/0.5/* data/15-08/singles/0.5_first30/
+cp "/mnt/c/Users/<you>/BadmintonVR/data/15-08/singles/0.5/"*.mov data/15-08/singles/0.5/
 ```
 
 ## 4. Update the Unity project (Windows)
@@ -61,7 +75,7 @@ The Unity project needs the new viewer scripts (server follower, live broadcast 
   `wsl -l -v` lists it; `<wsluser>` = your Ubuntu user name):
 
   ```powershell
-  $src = "\\wsl$\Ubuntu\home\<wsluser>\BadmintonVR-ntu"
+  $src = "\\wsl$\Ubuntu\home\<wsluser>\BadmintonVR"
   $dst = "C:\Users\<you>\BadmintonVR-unity"
   robocopy "$src\Assets\Scripts\Analysis" "$dst\Assets\Scripts\Analysis" /E
   robocopy "$src\Assets\Editor\Tests" "$dst\Assets\Editor\Tests" /E

@@ -11,7 +11,7 @@ setlocal
 
 if not defined PORT set PORT=8770
 set WSL_DISTRO=Ubuntu
-set WSL_REPO=~/BadmintonVR-ntu
+set WSL_REPO=~/BadmintonVR
 set WSL_VENV=~/venv-pc
 
 cd /d "%~dp0"

@@ -1,4 +1,4 @@
-# Lab RTX 5090 PC: WSL Ubuntu (repo ~/BadmintonVR-ntu, venv ~/venv-pc).
+# Lab RTX 5090 PC: WSL Ubuntu (repo ~/BadmintonVR, venv ~/venv-pc).
 backend: live
 device: cuda
 stream:
