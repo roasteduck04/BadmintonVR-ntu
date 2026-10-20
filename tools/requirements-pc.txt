@@ -1,7 +1,9 @@
 # GPU PC (2D pose on the NVIDIA GPU + the pose24 3D build), Python 3.10-3.12, in a fresh env / venv:
 #   pip install -r tools/requirements-pc.txt
 # Not tools/requirements.txt: that one installs the CPU-only `onnxruntime`, which hides the GPU build.
-onnxruntime-gpu[cuda,cudnn]==1.22.0   # CUDA 12 + cuDNN 9 from pip wheels (no CUDA install needed); RTX 20xx-40xx
+onnxruntime-gpu[cuda,cudnn]>=1.22.0   # CUDA + cuDNN from pip wheels (no CUDA install needed). 1.22 = RTX 20xx-40xx;
+                                      # RTX 50xx needs newer (lab RTX 5090: 1.31 via pip install -U). Never pinned
+                                      # exactly: pip install -r must not downgrade a newer GPU build
 rtmlib==0.0.13                        # RTMPose Wholebody (the 2D model); weights download on first use (~300 MB)
 opencv-python>=4.9                    # video reading (HEVC .mov)
 numpy>=1.26,<2.0
