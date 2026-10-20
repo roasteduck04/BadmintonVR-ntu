@@ -109,7 +109,7 @@ def missing_requirement(req, plan, test) -> str | None:
     if req == "tensorrt":
         if not (has_module("tensorrt_libs") or has_module("tensorrt")):
             return "TensorRT is not installed (pip install tensorrt-cu13)"
-        return None
+        return trt_check()
     if req == "PyNvVideoCodec":
         return None if has_module("PyNvVideoCodec") else "PyNvVideoCodec is not installed"
     if req.startswith("video:"):
@@ -120,6 +120,24 @@ def missing_requirement(req, plan, test) -> str | None:
             return f"no {tag} videos ({str(e).splitlines()[0][:160]})"
         return None
     return f"unknown requirement {req!r}"
+
+
+_TRT = {}
+
+
+def trt_check() -> str | None:
+    """Installed is not enough: onnxruntime must really start TensorRT (else it would quietly run on the CPU). Runs
+    `gpu_check.py --trt` once per campaign; None = usable, else the reason."""
+    if "result" not in _TRT:
+        try:
+            r = subprocess.run([sys.executable, os.path.join(TOOLS, "gpu_check.py"), "--trt"], capture_output=True,
+                               text=True, timeout=3600, env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+            ok = r.returncode == 0
+            last = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.startswith(("FAIL", "gpu-check"))]
+            _TRT["result"] = None if ok else f"TensorRT not usable: {(last[0] if last else 'gpu_check --trt failed')[:200]}"
+        except (OSError, subprocess.SubprocessError) as e:
+            _TRT["result"] = f"TensorRT check failed: {type(e).__name__}"
+    return _TRT["result"]
 
 
 def unity_status(unity_dir) -> dict:

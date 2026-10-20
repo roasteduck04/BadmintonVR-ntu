@@ -337,13 +337,12 @@ def kp_map(model):
 TRT_CACHE = os.path.join("~", ".cache", "badmintonvr", "trt")
 
 
-def preload_tensorrt():
-    """Load TensorRT's shared libraries from its pip wheel (tensorrt_libs, the tensorrt-cu1x packages) with global
-    symbols, so onnxruntime's TensorRT provider finds them without LD_LIBRARY_PATH. Returns the TensorRT version
-    (None if the wheel says nothing); raises RuntimeError when TensorRT is not installed."""
-    import ctypes
+def tensorrt_lib_dirs():
+    """Folders holding TensorRT's shared libraries from its pip wheels (tensorrt_libs and friends, any tensorrt*
+    package folder in site-packages), plus the TensorRT version the wheel reports (None if unknown)."""
     import glob
     import importlib
+    import site
     version, dirs = None, []
     for mod in ("tensorrt_libs", "tensorrt", "tensorrt_bindings"):
         try:
@@ -353,6 +352,41 @@ def preload_tensorrt():
         version = version or getattr(m, "__version__", None)
         if getattr(m, "__file__", None):
             dirs.append(os.path.dirname(m.__file__))
+    roots = list(getattr(site, "getsitepackages", lambda: [])()) + [site.getusersitepackages()]
+    for r in roots:
+        dirs += glob.glob(os.path.join(r, "tensorrt*"))
+    out = []
+    for d in dirs:
+        if os.path.isdir(d) and (glob.glob(os.path.join(d, "libnvinfer*.so*")) or glob.glob(os.path.join(d, "nvinfer*.dll"))):
+            if os.path.realpath(d) not in [os.path.realpath(x) for x in out]:
+                out.append(d)
+    return out, version
+
+
+def ensure_trt_library_path():
+    """Linux: onnxruntime's TensorRT provider resolves libnvinfer* through the dynamic loader, which reads
+    LD_LIBRARY_PATH only when a process starts. If the TensorRT wheel's folders are not on it, restart this same
+    command once with them added (BVR_TRT_REEXEC guards against a loop). No-op elsewhere / when already set."""
+    if os.name == "nt" or os.environ.get("BVR_TRT_REEXEC"):
+        return
+    dirs, _ = tensorrt_lib_dirs()
+    have = [x for x in os.environ.get("LD_LIBRARY_PATH", "").split(":") if x]
+    missing = [d for d in dirs if d not in have]
+    if not missing:
+        return
+    import sys
+    env = dict(os.environ, LD_LIBRARY_PATH=":".join(missing + have), BVR_TRT_REEXEC="1")
+    sys.stdout.flush()
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+
+def preload_tensorrt():
+    """Load TensorRT's shared libraries from its pip wheel with global symbols (a second line of defence next to
+    ensure_trt_library_path). Returns the TensorRT version (None if the wheel says nothing); raises RuntimeError when
+    TensorRT is not installed."""
+    import ctypes
+    import glob
+    dirs, version = tensorrt_lib_dirs()
     libs = []
     for d in dirs:
         for pat in ("libnvinfer.so*", "libnvinfer_plugin.so*", "libnvonnxparser.so*", "nvinfer*.dll", "nvonnxparser*.dll"):
@@ -375,6 +409,10 @@ def preload_tensorrt():
     return version
 
 
+class TensorRTUnavailable(RuntimeError):
+    pass
+
+
 def _shape_str(name, shape):
     return f"{name}:" + "x".join(str(int(d)) for d in shape)
 
@@ -394,7 +432,13 @@ def trt_session(onnx_path, rcfg, shapes=None):
         opts["trt_profile_opt_shapes"] = ",".join(_shape_str(n, s[1]) for n, s in shapes.items())
         opts["trt_profile_max_shapes"] = ",".join(_shape_str(n, s[2]) for n, s in shapes.items())
     prov = [("TensorrtExecutionProvider", opts), "CUDAExecutionProvider", "CPUExecutionProvider"]
-    return ort.InferenceSession(onnx_path, providers=prov)
+    sess = ort.InferenceSession(onnx_path, providers=prov)
+    got = sess.get_providers()
+    if got[:1] != ["TensorrtExecutionProvider"]:
+        # onnxruntime retries a failed TensorRT start on the CPU alone: never let a TensorRT run quietly use the CPU
+        raise TensorRTUnavailable(f"onnxruntime could not use TensorRT for {os.path.basename(onnx_path)} (it fell back to "
+                                  f"{got}); run python tools/gpu_check.py --trt and see docs/setup/lab-tests.md")
+    return sess
 
 
 class trt_lock:

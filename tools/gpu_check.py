@@ -28,6 +28,31 @@ def _timed_module():
     return m
 
 
+def trt_diagnostics(pf):
+    """What onnxruntime's TensorRT provider needs vs what the TensorRT wheel installed (for the FAIL report)."""
+    import glob
+    import subprocess
+    import onnxruntime as ort
+    dirs, ver = pf.tensorrt_lib_dirs()
+    print(f"--- diagnostics: onnxruntime {ort.__version__}, TensorRT wheel {ver}")
+    print(f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '')}")
+    for d in dirs:
+        print(f"TensorRT libs in {d}: {sorted(os.path.basename(x) for x in glob.glob(os.path.join(d, 'lib*.so*')))}")
+    prov = glob.glob(os.path.join(os.path.dirname(ort.__file__), "capi", "libonnxruntime_providers_tensorrt*"))
+    for pth in prov:
+        try:
+            out = subprocess.run(["ldd", pth], capture_output=True, text=True, timeout=20).stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"ldd failed: {e}")
+            continue
+        need = [ln.strip() for ln in out.splitlines() if any(k in ln for k in ("nvinfer", "nvonnx", "not found"))]
+        print(f"{os.path.basename(pth)} needs:")
+        for ln in need:
+            print(f"  {ln}")
+    if not prov:
+        print("this onnxruntime build has no TensorRT provider library")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--video", help="time a few frames of this video (optional)")
@@ -35,6 +60,10 @@ def main(argv=None):
     ap.add_argument("--trt", action="store_true", help="put both models on onnxruntime's TensorRT provider")
     ap.add_argument("--fp32", action="store_true", help="with --trt: TensorRT in FP32 (default FP16)")
     a = ap.parse_args(argv)
+    if a.trt:                                   # TensorRT's folders on LD_LIBRARY_PATH (restarts this command once)
+        sys.path.insert(0, HERE)
+        from analysis.live import pose2d_fast as pf
+        pf.ensure_trt_library_path()
     print(f"python {sys.version.split()[0]} on {platform.system()} ({sys.executable})")
     try:
         import onnxruntime as ort
@@ -63,12 +92,18 @@ def main(argv=None):
               f"({'FP32' if a.fp32 else 'FP16'}, cache {os.path.expanduser(pf.TRT_CACHE)})...")
         rc = {"trt_fp16": not a.fp32}
         t = time.perf_counter()
-        for name in ("det_model", "pose_model"):
-            m = getattr(pose, name)
-            i = m.session.get_inputs()[0]
-            w, h = (int(x) for x in m.model_input_size)
-            shp = pf._fixed(i.shape, (1, 3, h, w))
-            m.session = pf.trt_session(m.onnx_model, rc, {i.name: (shp, shp, shp)})
+        try:
+            for name in ("det_model", "pose_model"):
+                m = getattr(pose, name)
+                i = m.session.get_inputs()[0]
+                w, h = (int(x) for x in m.model_input_size)
+                shp = pf._fixed(i.shape, (1, 3, h, w))
+                m.session = pf.trt_session(m.onnx_model, rc, {i.name: (shp, shp, shp)})
+        except pf.TensorRTUnavailable as e:
+            print(f"FAIL: {e}")
+            trt_diagnostics(pf)
+            print("gpu-check: FAIL (TensorRT not usable; paste everything above)")
+            return 1
         print(f"sessions ready in {time.perf_counter() - t:.1f} s")
         want = "TensorrtExecutionProvider"
     ok = True
@@ -98,7 +133,7 @@ def main(argv=None):
             times.sort()
             print(f"next {len(times)} frames: median {times[len(times) // 2]:.0f} ms per frame (model only)")
     if a.trt:
-        print("gpu-check:", "OK (TensorRT)" if ok else "FAIL (TensorRT is not the first provider: it fell back to CUDA)")
+        print("gpu-check:", "OK (TensorRT)" if ok else "FAIL (TensorRT is not the first provider)")
         return 0 if ok else 1
     print("gpu-check:", "OK (CUDA)" if ok else "FAIL (a sub-model runs without CUDAExecutionProvider)")
     return 0 if ok else 1

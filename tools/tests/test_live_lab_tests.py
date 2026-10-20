@@ -202,3 +202,17 @@ def test_campaign_report_summarises_runs_and_benches(tmp_path, monkeypatch):
     assert "| A1 | trt | 120.0 | 2.00 |" in md and "1.50" in md
     assert "| B1 | best |" in md and "59.5 / 60" in md and "1.50 / 2.10" in md and "2.40" in md
     assert "B2" in md and "no TensorRT" in md
+
+
+def test_tensorrt_session_never_falls_back_to_the_cpu_quietly(tmp_path, monkeypatch):
+    ort = pytest.importorskip("onnxruntime")
+
+    class FakeSession:
+        def __init__(self, path, providers):
+            self.providers = providers
+
+        def get_providers(self):
+            return ["CPUExecutionProvider"]                 # what onnxruntime does when TensorRT cannot start
+    monkeypatch.setattr(ort, "InferenceSession", FakeSession)
+    with pytest.raises(pf.TensorRTUnavailable, match="fell back"):
+        pf.trt_session("model.onnx", {"trt_cache": str(tmp_path)}, {"input": ((1, 3, 4, 4),) * 3})

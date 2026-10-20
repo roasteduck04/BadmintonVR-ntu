@@ -225,6 +225,9 @@ def cmd_campaign(a):
 
 
 def main(argv=None):
+    if argv is None and any(x.replace(" ", "") == "rtmpose.ep=trt" for x in sys.argv[1:]):
+        from analysis.live import pose2d_fast            # TensorRT's folders on LD_LIBRARY_PATH (restarts once)
+        pose2d_fast.ensure_trt_library_path()
     ap = argparse.ArgumentParser(prog="python tools/live_run.py", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
