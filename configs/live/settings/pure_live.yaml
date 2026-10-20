@@ -1,0 +1,12 @@
+_about: "Purely live on a GPU PC: like best_live (2D from the video, 60 fps, fast 2D, fast fit) but the camera offsets are estimated in the warm-up, so nothing comes from an offline build. v0.8.1: auto sync is 1-2 frames off (+0.4 cm)."
+backend: live
+output_fps: 60
+pace: realtime
+sync.offsets: auto
+rtmpose.engine: fast
+rtmpose.decoder: pyav
+rtmpose.decode_short_side: 1080
+rtmpose.court_filter_m: 1.0
+rtmpose.det_every: 5
+stream.solver_tol: 1.0e-4
+stream.lsmr_maxiter: 20

@@ -6,8 +6,8 @@ pose24 clip registry instead of serve_calibrator.py's hard-coded camera table, p
     /calib/api/clips            {group: {clip, mode}}         /calib/api/court-points   {name: [x, z]}
     /calib/frames/<file>        a frame image (grabbed with OpenCV at t = 1 s the first time; WSL has no ffmpeg)
     POST /calib/api/auto-fov    best field of view for the clicked points
-    POST /calib/api/calibrate   PnP -> data/calib/<view>_cam.json (the previous one is archived first, never lost)
-    POST /calib/api/extract-frame, /calib/api/re-extract     another time / a new primary frame
+    POST /calib/api/calibrate   best field of view + PnP -> data/calib/<view>_cam.json (the previous one is archived first)
+    POST /calib/api/extract-frame, /calib/api/re-extract     another frame number (or time) / a new primary frame
     GET|POST /calib/api/seeds   offline-build seeds (the live stream needs none)
     /api/sync, POST /api/sync   camera offsets of a clip: data/calib/<clip>_sync.json, made from its offline build
 """
@@ -64,11 +64,27 @@ class Calib:
                         with open(calib, "r", encoding="utf-8") as fh:
                             cd = json.load(fh)
                         cam.update(rms=cd.get("rms_px"), saved_fov=cd.get("fov_deg"), fov_deg=cd.get("fov_deg") or DEFAULT_FOV,
-                                   saved_points={n: i["px"] for n, i in (cd.get("court_points") or {}).items()})
-                    except (OSError, ValueError):
+                                   saved_points={n: i["px"] for n, i in (cd.get("court_points") or {}).items()},
+                                   saved_proj=self.reprojected(cd))
+                    except (OSError, ValueError, KeyError, TypeError):
                         cam["calibrated"] = False
                 out.append(cam)
         return out
+
+    @staticmethod
+    def reprojected(cd):
+        """{point: [x, y, err_px]} where each clicked court point lands with a saved calibration (shown on the frame)."""
+        pts = cd.get("court_points") or {}
+        if not pts or "K" not in cd:
+            return {}
+        names = list(pts)
+        world = np.array([[pts[n]["court_xz"][0], 0.0, pts[n]["court_xz"][1]] for n in names], dtype=np.float64)
+        P = mv.projection_matrix(np.array(cd["K"]), np.array(cd["R"]), np.array(cd["t"]))
+        hom = (P @ np.hstack([world, np.ones((len(world), 1))]).T).T
+        uv = hom[:, :2] / hom[:, 2:3]
+        clicks = np.array([pts[n]["px"] for n in names], dtype=np.float64)
+        err = np.linalg.norm(uv - clicks, axis=1)
+        return {n: [round(float(a), 1), round(float(b), 1), round(float(e), 2)] for n, (a, b), e in zip(names, uv, err)}
 
     def camera(self, view):
         cam = next((c for c in self.cameras() if c["view"] == view), None)
@@ -77,19 +93,24 @@ class Calib:
         return cam
 
     # ------------------------------------------------------------------ frames
-    def grab(self, cam, t_s, name):
-        """One video frame at t_s seconds -> data/calib/frames/<name> (JPEG). OpenCV, so no ffmpeg is needed."""
+    def grab(self, cam, t_s, name, frame=None):
+        """One video frame (at t_s seconds, or frame number `frame` of this camera's video) -> data/calib/frames/<name>
+        (JPEG). OpenCV, so no ffmpeg is needed."""
         if not cam.get("has_video"):
             raise HTTPException(404, f"video of {cam['view']} not found ({cam.get('video')})")
         os.makedirs(self.frames_dir, exist_ok=True)
         cap = cv2.VideoCapture(os.path.join(self.repo, cam["video"]))
         try:
-            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t_s)) * 1000.0)
+            if frame is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame)))
+            else:
+                cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t_s)) * 1000.0)
             ok, img = cap.read()
         finally:
             cap.release()
         if not ok or img is None:
-            raise HTTPException(500, f"could not read {cam['view']} at {t_s} s")
+            at = f"frame {frame}" if frame is not None else f"{t_s} s"
+            raise HTTPException(500, f"could not read {cam['view']} at {at}")
         cv2.imwrite(os.path.join(self.frames_dir, name), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
         return name
 
@@ -134,30 +155,40 @@ class Calib:
         return {"fov_deg": float(fov), "rms_px": float(rms)}
 
     def calibrate(self, body):
+        """Save a calibration. Without fov_deg (the page's Save) the best field of view is found first."""
         cam = self.camera(body.get("view"))
         view = cam["view"]
         fov_on = body.get("fov_on", "long")
-        try:
-            fov = float(body["fov_deg"])
-        except (KeyError, TypeError, ValueError):
-            raise HTTPException(400, "fov_deg must be a number")
+        fov = body.get("fov_deg")
+        if fov is not None:
+            try:
+                fov = float(fov)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "fov_deg must be a number")
         names, image_px, court_xz = self.points(body)
         w, h = self.frame_size(view)
-        K = mv.intrinsics_from_fov(w, h, fov, on=fov_on)
-        R, t = mv.solve_extrinsics(court_xz, image_px, K)
-        rms = float(mv.reprojection_rms(court_xz, image_px, K, R, t))
+        try:
+            s = mv.solve_camera(w, h, court_xz, image_px, fov_deg=fov, on=fov_on)
+        except (RuntimeError, ValueError, cv2.error) as e:
+            raise HTTPException(400, f"calibration failed: {e}")
+        K, R, t, rms = s["K"], s["R"], s["t"], s["rms_px"]
         cp = _court_points()
         out = {"view": view, "source": os.path.basename(cam["video"] or ""), "width": w, "height": h,
-               "fov_deg": fov, "fov_on": fov_on, "focal_px": float(K[0, 0]), "K": K.tolist(), "R": R.tolist(),
-               "t": t.tolist(), "rms_px": rms,
-               "court_points": {n: {"px": [float(x), float(y)], "court_xz": list(cp[n])} for n, (x, y) in zip(names, image_px)},
+               "fov_deg": s["fov_deg"], "fov_on": fov_on, "fov_auto": fov is None, "focal_px": float(K[0, 0]),
+               "K": K.tolist(), "R": R.tolist(), "t": t.tolist(), "rms_px": rms,
+               "court_points": {n: {"px": [float(x), float(y)], "court_xz": list(cp[n]), "err_px": round(float(e), 2)}
+                                for n, (x, y), e in zip(names, image_px, s["err_px"])},
                "made": time.strftime("%Y-%m-%d %H:%M"), "tool": "pipeline_server calibrate"}
         path = os.path.join(self.calib_dir, f"{view}_cam.json")
         archived = self.archive(path)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(out, fh, indent=2)
-        return {"rms_px": rms, "path": os.path.relpath(path, self.repo), "warning": rms > RMS_WARN_PX,
-                "archived": archived}
+        worst = int(np.argmax(s["err_px"]))
+        return {"rms_px": rms, "fov_deg": s["fov_deg"], "path": os.path.relpath(path, self.repo),
+                "warning": rms > RMS_WARN_PX, "archived": archived, "notes": s["notes"],
+                "points": [{"name": n, "proj": [float(a), float(b)], "err_px": float(e)}
+                           for n, (a, b), e in zip(names, s["proj"], s["err_px"])],
+                "worst": {"name": names[worst], "err_px": float(s["err_px"][worst])}}
 
     def archive(self, path):
         """Copy a file about to be replaced into the housekeeping archive (gitignored); returns its new path."""
@@ -214,6 +245,16 @@ class Calib:
         return {**out, "archived": archived}
 
 
+def _frame_no(v):
+    try:
+        f = int(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "frame must be a whole number")
+    if f < 0:
+        raise HTTPException(400, "frame must be 0 or more")
+    return f
+
+
 def router(calib: Calib, tools_dir) -> APIRouter:
     r = APIRouter()
     page = os.path.join(str(tools_dir), "calibrator.html")
@@ -254,6 +295,9 @@ def router(calib: Calib, tools_dir) -> APIRouter:
     async def extract_frame(request: Request):
         b = await request.json()
         cam = calib.camera(b.get("view"))
+        if b.get("frame") is not None:
+            f = _frame_no(b["frame"])
+            return {"ok": True, "filename": calib.grab(cam, None, f"{cam['view']}_add_f{f}.jpg", frame=f)}
         t = float(b.get("time", 1.0))
         name = f"{cam['view']}_add_{str(t).replace('.', '_').replace('-', 'neg')}.jpg"
         return {"ok": True, "filename": calib.grab(cam, t, name)}
@@ -262,7 +306,10 @@ def router(calib: Calib, tools_dir) -> APIRouter:
     async def re_extract(request: Request):
         b = await request.json()
         cam = calib.camera(b.get("view"))
-        calib.grab(cam, float(b.get("time", 1.0)), f"{cam['view']}.jpg")
+        if b.get("frame") is not None:
+            calib.grab(cam, None, f"{cam['view']}.jpg", frame=_frame_no(b["frame"]))
+        else:
+            calib.grab(cam, float(b.get("time", 1.0)), f"{cam['view']}.jpg")
         return {"ok": True}
 
     @r.get("/calib/api/seeds/{clip}")

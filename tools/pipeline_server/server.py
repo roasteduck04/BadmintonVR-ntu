@@ -91,6 +91,8 @@ def run_summary(run_dir) -> dict:
     out["achieved_fps"] = t.get("achieved_output_fps")
     out["realtime_factor"] = t.get("realtime_factor")
     out["late_after_warmup"] = r.get("late_fraction_after_warmup")
+    out["setup_s"] = t.get("setup_s")
+    out["delay_p50_ms"] = ((t.get("stages") or {}).get("e2e") or {}).get("p50")
     q = r.get("quality") or {}
     if q:
         ref = next(iter(q))
@@ -103,6 +105,91 @@ def run_summary(run_dir) -> dict:
                     "knee_mae_deg": sum(knees) / len(knees) if knees else None,
                     "swaps": sum(int(v.get("swap_transitions", 0)) for v in ident.values())})
     return out
+
+
+LOG_TS = re.compile(r"^(\d\d):(\d\d):(\d\d) ")
+STAGE_LABELS = [("decode", "2D: decode (slowest camera)"), ("infer", "2D: model (slowest camera)"),
+                ("wait_2d", "captured -> all cameras' 2D in"), ("calib", "3D: score calibration"), ("track", "3D: tracker"),
+                ("tri", "3D: triangulate + smoothing"), ("fit_share", "3D: body fit (per frame)"),
+                ("hold", "waiting for the fit window"), ("write", "write the frame file"),
+                ("e2e", "total delay: captured -> frame file")]
+
+
+def _log_span(run_dir):
+    """(seconds from the first line of run.log to its 'report' line or last line, report seconds): the whole job
+    including setup and the report (run.log stamps are HH:MM:SS; a run past midnight wraps)."""
+    try:
+        with open(os.path.join(run_dir, "run.log"), "r", encoding="utf-8", errors="replace") as fh:
+            lines = [ln for ln in fh.read().splitlines() if LOG_TS.match(ln)]
+    except OSError:
+        return None, None
+
+    def t(ln):
+        h, m, s_ = (int(x) for x in LOG_TS.match(ln).groups())
+        return h * 3600 + m * 60 + s_
+    if len(lines) < 2:
+        return None, None
+    span = lambda a, b: (t(b) - t(a)) % 86400                     # noqa: E731
+    done = next((ln for ln in lines if " run done in " in ln), None)
+    rep_ = next((ln for ln in reversed(lines) if re.search(r"^\S+ report \S", ln)), None)
+    total = span(lines[0], rep_ or lines[-1])
+    return total, (span(done, rep_) if done and rep_ else None)
+
+
+def run_timing(run_dir) -> dict:
+    """The time report of a run for the page: whole job, setup, streaming speed, delay, per-stage table."""
+    out = {"name": os.path.basename(run_dir), "has_report": False}
+    total, report_s = _log_span(run_dir)
+    out["job_s"], out["report_s"] = total, report_s
+    rp = os.path.join(run_dir, "report.json")
+    try:
+        with open(rp, "r", encoding="utf-8") as fh:
+            r = json.load(fh)
+    except (OSError, ValueError):
+        return out
+    t = r.get("timing") or {}
+    cfg = r.get("config") or {}
+    st_ = t.get("stages") or {}
+    out.update(has_report=True, steps=t.get("steps"), written=t.get("written"), section_s=t.get("section_s"),
+               target_fps=t.get("target_fps"), achieved_fps=t.get("achieved_output_fps"),
+               realtime_factor=t.get("realtime_factor"), wall_s=t.get("wall_s"), loop_s=t.get("loop_s"),
+               setup_s=t.get("setup_s"), source_ready_s=t.get("source_ready_s"), first_frame_s=t.get("first_frame_s"),
+               first_2d_call_ms=t.get("first_2d_call_ms"), dropped_2d_frames=t.get("dropped_2d_frames"),
+               late_after_warmup=r.get("late_fraction_after_warmup"), pace=cfg.get("pace"),
+               backend=cfg.get("backend"), solve_ms=t.get("solve_ms"),
+               e2e=st_.get("e2e"),
+               stages=[{"key": k, "label": lab, **{q: (st_.get(k) or {}).get(q) for q in ("p50", "p90", "p99", "max", "mean")}}
+                       for k, lab in STAGE_LABELS
+                       if st_.get(k) and not (cfg.get("backend") == "cached" and k in ("decode", "infer"))])
+    return out
+
+
+def win_path(p) -> str:
+    """The path as Windows Explorer shows it (in WSL converted with wslpath -w)."""
+    p = str(p)
+    if os.name == "nt" or not shutil.which("wslpath"):
+        return p
+    try:
+        return subprocess.run(["wslpath", "-w", p], capture_output=True, text=True, timeout=5).stdout.strip() or p
+    except (OSError, subprocess.SubprocessError):
+        return p
+
+
+def open_in_explorer(p) -> bool:
+    p = str(p)
+    try:
+        if os.name == "nt":
+            os.startfile(p)                     # noqa: S606 - a local folder of this server's own runs
+            return True
+        if shutil.which("explorer.exe"):        # WSL
+            subprocess.Popen(["explorer.exe", win_path(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        if shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def flat_settings(run_dir) -> dict:
@@ -263,10 +350,12 @@ class Server:
                                       "message": "Unity is not in Play mode. Press Play in Unity, or start anyway "
                                                  "(the frames are still written and Unity can join later)."})
         cfg = self.merged(clip, preset)
-        vals = st.values_from(cfg)
+        # settings the request leaves out keep their seconds at the requested frame rate (frames are per output frame)
+        base = dict(cfg, output_fps=(values or {}).get("output_fps", cfg.get("output_fps")))
+        vals = st.values_from(base)
         vals.update(values or {})
         try:
-            over = st.overrides(vals, vals.get("backend") or "cached")
+            over = st.overrides(vals, vals.get("backend") or "cached", base_cfg=base)
         except ValueError as e:
             raise HTTPException(400, str(e))
         fps = over.get("output_fps", cfg.get("output_fps"))
@@ -278,9 +367,14 @@ class Server:
                                  "--preset", self.machine, "--run-dir", str(run_dir))
         for s in st.as_set_args(over):
             argv += ["--set", s]
+        wu_s = over.get("warmup.seconds", st.get_key(cfg, "warmup.seconds")) or 0
         job = jobmod.Job("stream", argv, cwd=str(self.repo), run_dir=str(run_dir),
                          title=f"{clip} · {int(fps)} fps · {'2D from video' if src == 'live2d' else 'stored 2D'} · "
-                               f"{over.get('pace', 'realtime')}")
+                               f"{over.get('pace', 'realtime')}",
+                         meta={"views": len(cfg.get("views") or []), "warmup_steps": int(round(float(wu_s) * float(fps))),
+                               "backend": over.get("backend", cfg.get("backend")), "fps": float(fps),
+                               "pace": over.get("pace", cfg.get("pace")), "run": name,
+                               "frames_dir": win_path(run_dir / fw.FRAMES_DIR)})
         try:
             self.jobs.start(job)
         except RuntimeError as e:
@@ -315,7 +409,7 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
     @app.middleware("http")
     async def no_cache(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path == "/" or request.url.path.startswith("/static/"):
+        if request.url.path in ("/", "/calibrate") or request.url.path.startswith("/static/"):
             response.headers["Cache-Control"] = "no-cache"
         return response
 
@@ -350,7 +444,7 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
                     about = (yaml.safe_load(fh) or {}).get("_about", "")
             except OSError:
                 pass
-            out.append({"name": n, "about": about, "builtin": n in ("best_live", "laptop_realtime")})
+            out.append({"name": n, "about": about, "builtin": n in st.BUILTIN})
         return out
 
     @app.post("/api/presets")
@@ -388,6 +482,21 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
     @app.get("/api/runs")
     def runs():
         return server.runs_list()
+
+    @app.get("/api/runs/{name}/timing")
+    def run_timing_ep(name: str):
+        d = server.run_path(name)
+        out = run_timing(str(d))
+        fd = fw.frames_dir(str(d))
+        out["frames_dir"] = win_path(fd) if fd else None
+        return out
+
+    @app.post("/api/open_folder")
+    async def open_folder(request: Request):
+        b = await request.json()
+        d = server.run_path(b.get("run", ""))
+        fd = fw.frames_dir(str(d)) or str(d)
+        return {"opened": open_in_explorer(fd), "path": win_path(fd)}
 
     @app.get("/api/runs/{name}/report", response_class=PlainTextResponse)
     def run_report(name: str):

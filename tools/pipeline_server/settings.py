@@ -4,6 +4,11 @@ The page renders FIELDS by group; a value the user changes becomes a `--set key=
 Defaults shown on the page come from the merged config (defaults <- clip <- machine preset <- settings preset), so
 nothing here repeats a default value. Settings presets (configs/live/settings/<name>.yaml) are flat {key: value} maps;
 `best_live` is the v0.8.1 result (docs/reports/v0.8.1-speed.md).
+
+Lengths of time are shown in FRAMES of the stream (fields with "frames": True; output_fps frames = 1 s) while the config
+keeps seconds: values_from() converts seconds -> frames for the page, overrides() / save_preset() convert back. A frames
+value equal to the preset's own (rounded) value passes the preset's exact seconds through, so 0.25 s at 30 fps stays
+0.25 s instead of becoming 8 frames = 0.267 s.
 """
 from __future__ import annotations
 
@@ -16,15 +21,17 @@ from analysis.live import config as live_config
 
 SETTINGS_DIR = os.path.join(live_config.CONFIG_DIR, "settings")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+BUILTIN = ("best_live", "pure_live", "laptop_realtime")     # shipped presets: Save as preset never overwrites them
 
 # group, key, label, kind, extra. kinds: choice (options), int, float, bool, optfloat (a number or off = null),
-# range (two floats). "live_only": only sent when the 2D comes from the video (backend live).
+# range (two floats). "live_only": only sent when the 2D comes from the video (backend live). "frames": the config value
+# is in seconds, the page shows / sends frames of the stream (see the module docstring).
 GROUPS = [
     ("source", "2D source and output", "Where the 2D keypoints come from, the output frame rate and the clock."),
     ("bystanders", "Bystander removal", "Only people standing on the court are posed (v0.8.1: 531 → 13 extra persons)."),
     ("speed2d", "2D speed", "Live 2D from the video only. Fewer detector calls and smaller frames are faster."),
     ("sync", "Camera sync", "Lines the cameras up in time. File = offsets measured once for fixed cameras."),
-    ("warmup", "Player pick (warm-up)", "The first seconds pick P1 (near half) and P2 (far half) without seeds."),
+    ("warmup", "Player pick (warm-up)", "The first frames pick P1 (near half) and P2 (far half) without seeds."),
     ("tracker", "Tracker", "Follows each player from step to step on the court floor."),
     ("lrswap", "Left / right swap fix", "Fixes 2D models that mix up a person's left and right side."),
     ("fit", "Body fit", "Fits the SMPL body to the 3D points in short windows (the main accuracy step)."),
@@ -42,8 +49,9 @@ FIELDS = [
     {"group": "source", "key": "pace", "label": "Clock", "kind": "choice",
      "options": [["realtime", "real time (live broadcast)"], ["asfast", "as fast as possible"]],
      "help": "Real time = frames arrive on the camera clock; late fits fall back to smoothing."},
-    {"group": "source", "key": "section_s", "label": "Part of the video (s)", "kind": "range", "unit": "s",
-     "help": "Start and end in seconds of the reference camera (empty end = to the end)."},
+    {"group": "source", "key": "section_s", "label": "Part of the video", "kind": "range", "unit": "frames", "frames": True,
+     "help": "Start and end frame, counted at the output frame rate from the start of the reference camera's video "
+             "(6.5 s = frame 390 at 60 fps). Empty end = to the end."},
     # bystanders
     {"group": "bystanders", "key": "rtmpose.court_filter_m", "label": "Court filter margin", "kind": "optfloat", "unit": "m",
      "live_only": True, "help": "Keep a person only if their feet are on the court plus this margin. Off = pose everyone."},
@@ -70,15 +78,15 @@ FIELDS = [
     {"group": "sync", "key": "sync.offsets", "label": "Camera offsets", "kind": "choice",
      "options": [["file", "sync file (fixed cameras)"], ["auto", "estimate in the warm-up"], ["zero", "none"]],
      "help": "Auto from 2 s is 1-2 frames off (+0.4 cm at 60 fps). Make the file once per camera set-up."},
-    {"group": "sync", "key": "sync.estimate.max_offset_s", "label": "Auto search range", "kind": "float", "unit": "s",
-     "help": "Auto sync looks for offsets up to this far."},
+    {"group": "sync", "key": "sync.estimate.max_offset_s", "label": "Auto search range", "kind": "int", "unit": "frames",
+     "frames": True, "help": "Auto sync looks for offsets up to this many frames."},
     {"group": "sync", "key": "sync.mode", "label": "Between source frames", "kind": "choice",
      "options": [["interp", "interpolate 2D"], ["nearest", "nearest frame"]],
      "help": "Interpolate = the 2D of the two source frames around the exact time is blended."},
     {"group": "sync", "key": "sync.partner_max_px", "label": "Interpolation partner within", "kind": "float", "unit": "px",
      "help": "The other source frame's detection must be this close, else the single detection is used."},
     # warm-up
-    {"group": "warmup", "key": "warmup.seconds", "label": "Warm-up length", "kind": "float", "unit": "s",
+    {"group": "warmup", "key": "warmup.seconds", "label": "Warm-up length", "kind": "int", "unit": "frames", "frames": True,
      "help": "Buffered before the body model is fixed; these frames are output too, flagged warm-up."},
     {"group": "warmup", "key": "warmup.player_height_m", "label": "Plausible standing height", "kind": "range", "unit": "m",
      "help": "Rejects children, ghosts and half-detected people."},
@@ -96,10 +104,10 @@ FIELDS = [
     {"group": "tracker", "key": "tracker.court_margin_m", "label": "Court margin", "kind": "float", "unit": "m",
      "help": "Candidates outside the court plus this margin are ignored."},
     # left / right swap
-    {"group": "lrswap", "key": "stream.history_s", "label": "Look-back", "kind": "float", "unit": "s",
-     "help": "How much history the swap fix uses (it runs with a fixed lag)."},
+    {"group": "lrswap", "key": "stream.history_s", "label": "Look-back", "kind": "int", "unit": "frames", "frames": True,
+     "help": "How many frames of history the swap fix uses (it runs with a fixed lag)."},
     # body fit
-    {"group": "fit", "key": "stream.window_s", "label": "Fit window", "kind": "float", "unit": "s",
+    {"group": "fit", "key": "stream.window_s", "label": "Fit window", "kind": "int", "unit": "frames", "frames": True,
      "help": "Frames fitted together. The delay is about this long."},
     {"group": "fit", "key": "stream.solver_tol", "label": "Solver tolerance", "kind": "optfloat",
      "help": "1e-4 (v0.8.1) is 4x cheaper than the offline 1e-8 with the same accuracy. Off = offline solver."},
@@ -115,13 +123,15 @@ FIELDS = [
     # fallback
     {"group": "fallback", "key": "fallback.alpha", "label": "Smoothing (EMA alpha)", "kind": "float",
      "help": "Higher follows faster, lower is smoother."},
-    {"group": "fallback", "key": "fallback.max_hold_s", "label": "Hold a missing joint up to", "kind": "float", "unit": "s",
-     "help": "A joint missing longer than this is left out."},
+    {"group": "fallback", "key": "fallback.max_hold_s", "label": "Hold a missing joint up to", "kind": "int",
+     "unit": "frames", "frames": True, "help": "A joint missing longer than this is left out."},
     # facing
-    {"group": "facing", "key": "facing.window_s", "label": "Facing window", "kind": "float", "unit": "s",
-     "help": "Past-only smoothing of the heading."},
+    {"group": "facing", "key": "facing.window_s", "label": "Facing window", "kind": "int", "unit": "frames", "frames": True,
+     "help": "Past-only smoothing of the heading over this many frames."},
 ]
 KEYS = {f["key"] for f in FIELDS}
+BYKEY = {f["key"]: f for f in FIELDS}
+FRAME_KEYS = {f["key"] for f in FIELDS if f.get("frames")}
 
 
 def get_key(cfg: dict, key: str):
@@ -133,9 +143,49 @@ def get_key(cfg: dict, key: str):
     return node
 
 
+def _fps(d: dict) -> float:
+    try:
+        fps = float(d.get("output_fps"))
+    except (TypeError, ValueError):
+        raise ValueError("output_fps is needed to convert frames to seconds")
+    if fps <= 0:
+        raise ValueError("output_fps must be positive")
+    return fps
+
+
+def _sec_to_frames(v, fps):
+    if v is None or v == "":
+        return None
+    return int(round(float(v) * fps))
+
+
+def to_frames(key: str, v, fps: float):
+    """A config value (seconds) of a frames field -> frames of the stream."""
+    if BYKEY[key]["kind"] == "range":
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            return v
+        return [_sec_to_frames(v[0], fps) or 0, _sec_to_frames(v[1], fps)]
+    return _sec_to_frames(v, fps)
+
+
+def to_seconds(key: str, v, fps: float):
+    """A page value (frames) of a frames field -> seconds for the config."""
+    if BYKEY[key]["kind"] == "range":
+        a, b = v
+        return [round(a / fps, 6), None if b is None else round(b / fps, 6)]
+    return None if v is None else round(v / fps, 6)
+
+
 def values_from(cfg: dict) -> dict:
-    """{key: value} of every field in a merged config."""
-    return {f["key"]: get_key(cfg, f["key"]) for f in FIELDS}
+    """{key: value} of every field in a merged config, lengths of time in frames of its output_fps."""
+    out = {f["key"]: get_key(cfg, f["key"]) for f in FIELDS}
+    try:
+        fps = _fps(cfg)
+    except ValueError:
+        return out
+    for k in FRAME_KEYS:
+        out[k] = to_frames(k, out[k], fps)
+    return out
 
 
 def coerce(field: dict, v):
@@ -151,6 +201,8 @@ def coerce(field: dict, v):
     if k == "optfloat":
         return None if v is None or v == "" else float(v)
     if k == "int":
+        if isinstance(v, float) and not v.is_integer():
+            raise ValueError(f"{field['key']}: {v!r} is not a whole number")
         return int(v)
     if k == "float":
         return float(v)
@@ -158,21 +210,33 @@ def coerce(field: dict, v):
         if not isinstance(v, (list, tuple)) or len(v) != 2:
             raise ValueError(f"{field['key']}: needs [start, end]")
         a, b = v
-        return [float(a), None if b is None or b == "" else float(b)]
+        num = int if field.get("frames") else float
+        return [num(a or 0), None if b is None or b == "" else num(b)]
     raise ValueError(f"unknown field kind {k}")
 
 
-def overrides(values: dict, backend: str) -> dict:
-    """Page values -> {key: value} overrides; unknown keys refused, 2D-speed keys dropped for stored 2D."""
-    byk = {f["key"]: f for f in FIELDS}
+def overrides(values: dict, backend: str, base_cfg: dict | None = None) -> dict:
+    """Page values -> {key: value} config overrides; unknown keys refused, 2D-speed keys dropped for stored 2D, frames
+    converted to seconds at the page's output_fps. base_cfg (the merged config the page started from): a frames value
+    left at its value there keeps the config's exact seconds."""
     out = {}
     for k, v in (values or {}).items():
-        if k not in byk:
+        if k not in BYKEY:
             raise ValueError(f"unknown setting {k!r}")
-        f = byk[k]
+        f = BYKEY[k]
         if f.get("live_only") and backend != "live":
             continue
         out[k] = coerce(f, v)
+    frame_keys = [k for k in out if k in FRAME_KEYS]
+    if frame_keys:
+        fps = _fps({"output_fps": out.get("output_fps", (base_cfg or {}).get("output_fps"))})
+        base = values_from(base_cfg) if base_cfg else {}
+        same_fps = base_cfg is not None and float(base_cfg.get("output_fps") or 0) == fps
+        for k in frame_keys:
+            if same_fps and out[k] == base.get(k):
+                out[k] = get_key(base_cfg, k)
+            else:
+                out[k] = to_seconds(k, out[k], fps)
     return out
 
 
@@ -207,10 +271,12 @@ def load_preset(name: str) -> dict:
 
 
 def save_preset(name: str, values: dict, about: str = "") -> str:
-    if not NAME_RE.match(name or "") or name == "best_live":
-        raise ValueError(f"bad preset name {name!r} (lowercase letters, digits, - and _; best_live is built in)")
-    byk = {f["key"]: f for f in FIELDS}
-    clean = {k: coerce(byk[k], v) for k, v in values.items() if k in byk}
+    if not NAME_RE.match(name or "") or name in BUILTIN:
+        raise ValueError(f"bad preset name {name!r} (lowercase letters, digits, - and _; {', '.join(BUILTIN)} are built in)")
+    clean = {k: coerce(BYKEY[k], v) for k, v in values.items() if k in BYKEY}
+    if any(k in FRAME_KEYS for k in clean):               # the page sends frames; presets store seconds
+        fps = _fps(clean)
+        clean = {k: to_seconds(k, v, fps) if k in FRAME_KEYS else v for k, v in clean.items()}
     os.makedirs(SETTINGS_DIR, exist_ok=True)
     p = os.path.join(SETTINGS_DIR, f"{name}.yaml")
     with open(p, "w", encoding="utf-8") as fh:

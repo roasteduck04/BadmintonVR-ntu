@@ -76,7 +76,7 @@ function fieldInput(f, v) {
     wrap.appendChild(el);
   } else if (f.kind === "range") {
     const a = document.createElement("input"), b = document.createElement("input");
-    [a, b].forEach((x) => { x.type = "number"; x.step = "any"; x.style.width = "90px"; });
+    [a, b].forEach((x) => { x.type = "number"; x.step = f.frames ? "1" : "any"; x.style.width = "90px"; });
     a.value = v && v[0] !== null ? v[0] : ""; b.value = v && v[1] !== null && v[1] !== undefined ? v[1] : "";
     b.placeholder = "end";
     const upd = () => setValue(f.key, [a.value === "" ? 0 : Number(a.value), b.value === "" ? null : Number(b.value)]);
@@ -96,7 +96,19 @@ function fieldInput(f, v) {
     el.addEventListener("change", () => setValue(f.key, el.value === "" ? null : Number(el.value))); wrap.appendChild(el);
   }
   if (f.unit) { const u = document.createElement("span"); u.className = "unit"; u.textContent = f.unit; wrap.appendChild(u); }
+  if (f.frames) { const sx = document.createElement("span"); sx.className = "secs"; sx.dataset.secs = f.key; wrap.appendChild(sx); }
   return wrap;
+}
+
+// frames fields: the same length in seconds at the chosen output frame rate, greyed next to the input
+function updateSecs() {
+  const fps = Number(state.values.output_fps) || 0;
+  document.querySelectorAll("#groups .secs").forEach((el) => {
+    const v = state.values[el.dataset.secs];
+    const s = (x) => (x === null || x === undefined || !fps ? null : (x / fps).toFixed(x % fps ? 2 : 1));
+    if (Array.isArray(v)) el.textContent = fps ? `= ${s(v[0]) ?? 0} – ${s(v[1]) ?? "end"} s` : "";
+    else el.textContent = s(v) !== null ? `= ${s(v)} s` : "";
+  });
 }
 
 function renderForm() {
@@ -131,7 +143,14 @@ function sourceLine() {
 }
 
 function setValue(key, v) {
+  const oldFps = Number(state.values.output_fps);
   state.values[key] = v;
+  if (key === "output_fps" && oldFps && Array.isArray(state.values.section_s)) {
+    // the part of the video stays the same; the other frame counts stay frames (so their seconds change)
+    const r = Number(v) / oldFps;
+    state.values.section_s = state.values.section_s.map((x) => (x === null ? null : Math.round(x * r)));
+    renderForm(); return;
+  }
   if (key === "backend") { renderForm(); return; }
   markChanged(); sourceLine();
 }
@@ -147,6 +166,7 @@ function markChanged() {
     g.querySelector(".badge").textContent = k ? `${k} changed` : "";
   });
   $("#changed").textContent = n ? `${n} setting${n > 1 ? "s" : ""} changed from the preset` : "";
+  updateSecs();
 }
 
 async function loadSettings() {
@@ -206,25 +226,97 @@ $("#confirm-anyway").addEventListener("click", () => start(true));
 $("#confirm-cancel").addEventListener("click", () => ($("#confirm").hidden = true));
 $("#stop").addEventListener("click", async () => { try { showJob(await api("/api/stream/stop", {})); } catch (e) { toast(e.message); } });
 
+const mmss = (s) => (s == null || !isFinite(s) ? "–" : s < 60 ? `${Math.round(s)} s` : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`);
+const ICON = { pending: "○", done: "✓", failed: "✗", stopped: "■" };
+
 function showJob(j) {
   const box = $("#job");
   box.className = "job " + (j ? j.state : "idle");
   const running = !!(j && (j.state === "running" || j.state === "starting"));
   $("#start").disabled = running; $("#stop").disabled = !running;
   $("#start").textContent = running ? "Streaming…" : "Start streaming to Unity";
-  if (!j) { $("#job-title").textContent = "Idle"; $("#job-stats").textContent = ""; $("#job-folder").textContent = ""; return; }
+  if (!j) {
+    $("#job-title").textContent = "Idle"; $("#job-stats").textContent = ""; $("#job-folder").textContent = "";
+    $("#phases").innerHTML = ""; $("#bar").className = "bar"; $("#bar-fill").style.width = "0"; $("#bar-text").textContent = "";
+    $("#open-folder").hidden = true; return;
+  }
   const words = { starting: "Starting", running: "Streaming", done: "Stream finished", failed: "Failed", stopped: "Stopped" };
   $("#job-title").textContent = `${words[j.state] || j.state}: ${j.title}`;
-  const p = j.progress || {};
-  $("#bar-fill").style.width = `${p.steps ? Math.round((p.written / p.steps) * 100) : 0}%`;
-  const fps = j.elapsed_s > 0 && p.written ? p.written / j.elapsed_s : null;
-  $("#job-stats").textContent = p.steps ? `${p.written} / ${p.steps} frame files written · ${fmt(j.elapsed_s, 0)} s · ${fmt(fps)} frames/s`
-    : `${fmt(j.elapsed_s, 0)} s · loading the models and opening the videos…`;
-  $("#job-folder").textContent = j.run_dir ? `folder: ${j.run_dir.split(/[\\/]/).slice(-2).join("/")}/unity_live_frames/` : "";
+  const p = j.progress || {}, ph = j.phases || [], now = j.now || Date.now() / 1000, meta = j.meta || {};
+  // phases: ✓ done (how long it took), spinner = now (how long so far), ○ still to come
+  $("#phases").innerHTML = ph.map((x) => {
+    const ic = x.state === "active" ? (running ? '<span class="spin"></span>' : "■") : ICON[x.state] || "○";
+    const dur = x.t0 ? mmss((x.t1 || (running ? now : j.ended || now)) - x.t0) : "";
+    return `<li class="${x.state}"><span class="ic">${ic}</span><span class="pl">${x.label}</span>
+      <span class="pd">${x.detail || ""}</span><span class="pt">${dur}</span></li>`;
+  }).join("");
+  // bar: frames while streaming; moving stripes while loading / saving / writing the report
+  const act = ph.find((x) => x.state === "active");
+  const counting = act && (act.id === "warmup" || act.id === "stream") && p.steps;
+  const pct = p.steps ? Math.min(100, Math.round((p.written / p.steps) * 100)) : 0;
+  $("#bar").className = "bar" + (running && !counting ? " indet" : "");
+  $("#bar-fill").style.width = `${j.state === "done" ? 100 : pct}%`;
+  $("#bar-text").textContent = running ? (counting ? `${pct}% · frame ${p.written} / ${p.steps}` : act ? act.label + "…" : "starting…")
+    : j.state === "done" ? "done" : words[j.state] || "";
+  // speed since the first frame step (warm-up start) and time left at that speed
+  const t0 = (ph.find((x) => x.id === "warmup" && x.t0) || ph.find((x) => x.id === "stream" && x.t0) || {}).t0;
+  const t1 = (ph.find((x) => x.id === "stream") || {}).t1 || (running ? now : j.ended);
+  const rate = t0 && p.written ? p.written / Math.max(0.1, t1 - t0) : null;
+  const left = rate && p.steps && running && counting ? (p.steps - p.written) / rate : null;
+  const bits = [`elapsed ${mmss(j.elapsed_s)}`];
+  if (p.steps) bits.unshift(`${p.written} / ${p.steps} frame files`);
+  if (rate) bits.push(`${fmt(rate)} frames/s${meta.fps ? ` (${fmt(rate / meta.fps, 2)}× real time)` : ""}`);
+  if (left != null) bits.push(`about ${mmss(left)} left`);
+  if (state.unity && state.unity.mode === "broadcast" && running) bits.push(`Unity ${fmt(state.unity.behind_s)} s behind the cameras`);
+  $("#job-stats").textContent = bits.join(" · ");
+  const folder = meta.frames_dir || (j.run_dir ? `${j.run_dir}/unity_live_frames` : "");
+  $("#job-folder").textContent = folder ? `frames: ${folder}` : "";
+  $("#open-folder").hidden = !meta.run; $("#open-folder").dataset.run = meta.run || "";
   $("#job-err").textContent = j.error || "";
   $("#job-log").textContent = (j.log || []).join("\n");
-  if (state.lastState === "running" && j.state !== "running") loadRuns();
+  if (state.lastState === "running" && j.state !== "running") { loadRuns(); if (meta.run) loadTiming(meta.run); }
+  if (!state.lastState && !running && meta.run && j.state === "done") loadTiming(meta.run);
   state.lastState = j.state;
+}
+
+$("#open-folder").addEventListener("click", async (ev) => {
+  try { const d = await api("/api/open_folder", { run: ev.target.dataset.run }); toast(d.opened ? `Opened ${d.path}` : `Open it yourself: ${d.path}`, 6000); }
+  catch (e) { toast(e.message, 6000); }
+});
+
+// ------------------------------------------------------------------ time report
+async function loadTiming(name) {
+  try { showTiming(await api(`/api/runs/${encodeURIComponent(name)}/timing`)); }
+  catch (e) { toast("time report: " + e.message); }
+}
+
+function showTiming(t) {
+  $("#timebox").hidden = false;
+  $("#time-name").textContent = t.name;
+  if (!t.has_report) {
+    $("#time-body").innerHTML = `<p class="muted">No report yet${t.job_s ? ` (job ran ${mmss(t.job_s)})` : ""}: the numbers appear when the stream has finished.</p>`;
+    return;
+  }
+  const ms = (v) => (v == null ? "–" : v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${v.toFixed(v < 10 ? 1 : 0)} ms`);
+  const e = t.e2e || {};
+  const rows = [
+    ["Whole job", `${mmss(t.job_s)} (setup + streaming + report)`],
+    ["Setup", `${fmt(t.setup_s)} s: ${t.backend === "live" ? "2D models + opening the videos" : "loading the stored 2D"}${t.source_ready_s >= 0.05 ? ` (videos open after ${fmt(t.source_ready_s)} s)` : ""} — not counted as delay`],
+    ["Streaming", `${t.written} / ${t.steps} frames in ${fmt(t.wall_s)} s for ${fmt(t.section_s)} s of video`],
+    ["Speed", `${fmt(t.achieved_fps)} frames/s of ${fmt(t.target_fps, 0)} → ${fmt(t.realtime_factor, 2)}× real time`],
+    ["Delay (capture → file)", `median ${ms(e.p50)}, p90 ${ms(e.p90)}, worst ${ms(e.max)}`],
+    ["First frame file", `${fmt(t.first_frame_s, 2)} s after the clock started${t.first_2d_call_ms != null ? ` (first 2D call ${ms(t.first_2d_call_ms)})` : ""}`],
+    ["Late fits after warm-up", t.late_after_warmup == null ? "–" : `${Math.round(t.late_after_warmup * 100)} %`],
+    ["Dropped 2D frames", t.dropped_2d_frames ?? "–"],
+    ["Report", t.report_s == null ? "–" : `${t.report_s} s`],
+  ];
+  let h = `<div class="tgrid">${rows.map(([k, v]) => `<div class="k">${k}</div><div class="v">${v}</div>`).join("")}</div>`;
+  if (t.stages && t.stages.length) {
+    h += `<table class="qt"><thead><tr><th>per frame</th><th>median</th><th>p90</th><th>worst</th></tr></thead><tbody>` +
+      t.stages.map((s) => `<tr${s.key === "e2e" ? ' class="tot"' : ""}><td>${s.label}</td><td>${ms(s.p50)}</td><td>${ms(s.p90)}</td><td>${ms(s.max)}</td></tr>`).join("") +
+      `</tbody></table>`;
+  }
+  $("#time-body").innerHTML = h;
 }
 
 function showUnity(u) {
@@ -260,7 +352,7 @@ async function loadRuns() {
   try {
     const runs = await api("/api/runs");
     const tb = $("#runs tbody"); tb.innerHTML = "";
-    if (!runs.length) tb.innerHTML = `<tr><td colspan="10" class="muted">No streams yet.</td></tr>`;
+    if (!runs.length) tb.innerHTML = `<tr><td colspan="12" class="muted">No streams yet.</td></tr>`;
     runs.forEach((r) => {
       const s = r.summary || {};
       const tr = document.createElement("tr");
@@ -271,7 +363,9 @@ async function loadRuns() {
         <td class="${cls(s.mpjpe_cm, 3.2, 3.5)}">${fmt(s.mpjpe_cm)}</td>
         <td class="${cls(s.knee_mae_deg, 6.5, 7.3)}">${fmt(s.knee_mae_deg)}</td>
         <td class="${s.swaps ? "badc" : s.swaps === 0 ? "good" : ""}">${s.swaps ?? "–"}</td>
+        <td>${fmt(s.setup_s)}</td><td>${s.delay_p50_ms == null ? "–" : fmt(s.delay_p50_ms / 1000, 2)}</td>
         <td><div class="acts"><button class="small" data-play="${r.name}" title="replay this stream in Unity">Replay</button>
+          ${r.has_report ? `<button class="small ghost" data-time="${r.name}" title="time report of this stream">Time</button>` : ""}
           ${r.has_report ? `<button class="small ghost" data-report="${r.name}">Report</button>` : ""}</div></td>`;
       tb.appendChild(tr);
     });
@@ -292,6 +386,7 @@ $("#compare-btn").addEventListener("click", async () => {
     const d = await api(`/api/compare?runs=${names.map(encodeURIComponent).join(",")}`);
     const rows = d.rows, base = rows[0].summary || {};
     const metric = [["Output fps", "achieved_fps", 1, null], ["× real time", "realtime_factor", 2, null],
+      ["Setup s", "setup_s", 1, null], ["Delay median ms", "delay_p50_ms", 0, null],
       ["Late after warm-up", "late_after_warmup", 0, null], ["MPJPE cm", "mpjpe_cm", 2, 0.5], ["PA-MPJPE cm", "pa_mpjpe_cm", 2, 0.5],
       ["Knee error °", "knee_mae_deg", 1, 1.0], ["Swaps", "swaps", 0, 0]];
     let h = `<thead><tr><th></th>${rows.map((r, i) => `<th>${i ? "" : "baseline<br>"}${r.name}</th>`).join("")}</tr></thead><tbody>`;
@@ -321,6 +416,7 @@ document.addEventListener("click", async (ev) => {
   const t = ev.target;
   try {
     if (t.dataset && t.dataset.play) { const d = await api("/api/play", { kind: "run", name: t.dataset.play }); toast(`Unity replays ${d.title}`); }
+    if (t.dataset && t.dataset.time) { await loadTiming(t.dataset.time); $("#timebox").scrollIntoView({ behavior: "smooth", block: "nearest" }); }
     if (t.dataset && t.dataset.report) {
       $("#report").textContent = await (await fetch(`/api/runs/${encodeURIComponent(t.dataset.report)}/report`)).text();
       $("#report-title").textContent = t.dataset.report; $("#report-box").hidden = false;
@@ -338,5 +434,6 @@ document.addEventListener("click", async (ev) => {
     state.clips.forEach((c) => { const o = document.createElement("option"); o.value = c.name; o.textContent = c.name; s.appendChild(o); });
     await loadPresets();
     pollJob();
+    api("/api/runs").then((runs) => { const r = runs.find((x) => x.has_report); if (r && $("#timebox").hidden) loadTiming(r.name); }).catch(() => {});
   } catch (e) { toast("could not reach the server: " + e.message, 8000); }
 })();

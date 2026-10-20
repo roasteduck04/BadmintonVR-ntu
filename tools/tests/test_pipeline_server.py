@@ -250,3 +250,164 @@ def test_sync_file_from_the_offline_build(tmp_path, monkeypatch):
     assert k.make_sync("clipx")["archived"]                                   # the second one archives the first
     with pytest.raises(Exception):
         k.make_sync("clipy")                                                  # no offline build to take offsets from
+
+
+# ---------------------------------------------------------------------------------------------- v0.8.2 follow-up
+def test_time_settings_are_frames_on_the_page_and_seconds_in_the_config():
+    cfg = {"output_fps": 60, "section_s": [6.5, 16.5], "warmup": {"seconds": 2.0},           # no data files needed
+           "stream": {"window_s": 1.0, "history_s": 1.0}, "facing": {"window_s": 0.25},
+           "fallback": {"max_hold_s": 0.1667}, "sync": {"estimate": {"max_offset_s": 0.25}}}
+    v = st.values_from(cfg)
+    assert v["warmup.seconds"] == 120 and v["stream.window_s"] == 60 and v["facing.window_s"] == 15
+    assert v["section_s"] == [390, 990]                                       # 6.5-16.5 s at 60 fps
+    assert all(f["unit"] == "frames" for f in st.FIELDS if f.get("frames"))
+    # changed frames -> seconds at the page's fps; unchanged ones keep the config's exact seconds
+    cfg30 = dict(cfg, output_fps=30)
+    v30 = st.values_from(cfg30)
+    assert v30["facing.window_s"] == 8                                         # 0.25 s * 30 = 7.5 -> 8 frames
+    page = {k: v30[k] for k in st.FRAME_KEYS | {"output_fps"}}
+    o = st.overrides({**page, "warmup.seconds": 90}, backend="cached", base_cfg=cfg30)
+    assert o["warmup.seconds"] == 3.0 and o["facing.window_s"] == 0.25 and o["section_s"] == [6.5, 16.5]
+    o = st.overrides({"output_fps": 60, "warmup.seconds": 30, "section_s": [60, None]}, backend="cached")
+    assert o["warmup.seconds"] == 0.5 and o["section_s"] == [1.0, None]
+    with pytest.raises(ValueError, match="whole number"):
+        st.overrides({"output_fps": 60, "warmup.seconds": 1.5}, backend="cached")
+    with pytest.raises(ValueError, match="output_fps"):
+        st.overrides({"warmup.seconds": 30}, backend="cached")
+
+
+def test_saved_preset_stores_seconds(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "SETTINGS_DIR", str(tmp_path))
+    st.save_preset("frames_test", {"output_fps": 60, "warmup.seconds": 180, "section_s": [390, None]})
+    assert st.load_preset("frames_test") == {"output_fps": 60, "warmup.seconds": 3.0, "section_s": [6.5, None]}
+    for name in st.BUILTIN:
+        with pytest.raises(ValueError):
+            st.save_preset(name, {})
+
+
+def test_pure_live_preset_takes_nothing_from_an_offline_build():
+    p = st.load_preset("pure_live")
+    assert p["backend"] == "live" and p["sync.offsets"] == "auto"
+    assert {k: v for k, v in p.items() if k != "sync.offsets"} == \
+        {k: v for k, v in st.load_preset("best_live").items() if k != "sync.offsets"}
+
+
+def test_stream_start_passes_untouched_seconds_through(tmp_path, monkeypatch):
+    s, c = _app(tmp_path)
+    started = {}
+    monkeypatch.setattr(s.jobs, "start", lambda job: started.setdefault("job", job))
+    r = c.post("/api/stream/start", json={"clip": "singles_05x", "preset": "laptop_realtime", "force": True,
+                                          "values": {"output_fps": 60, "warmup.seconds": 60}})
+    assert r.status_code == 200, r.text
+    job = started["job"]
+    sets = [a for a in job.argv if "=" in a]
+    assert "warmup.seconds=1.0" in sets and "facing.window_s=0.25" in sets and "section_s=[6.5, 16.5]" in sets
+    assert job.meta["warmup_steps"] == 60 and job.meta["views"] == 3 and job.meta["fps"] == 60.0
+    assert job.meta["frames_dir"].endswith("unity_live_frames")
+
+
+def test_stream_job_phases_and_frame_count(tmp_path):
+    run = tmp_path / "run"
+    (run / "unity_live_frames").mkdir(parents=True)
+    code = ("import time,json,sys\n"
+            "p=sys.argv[1]\n"
+            "print('12:00:00 run folder x', flush=True); time.sleep(0.3)\n"
+            "for v in ('a','b'): print(f'12:00:01   2D worker {v}: model ready in 1.0 s, providers', flush=True)\n"
+            "time.sleep(0.3)\n"
+            "print('12:00:02   10 steps at 30 fps (realtime, backend live), setup 2.0 s (source ready 1.0 s)', flush=True)\n"
+            "time.sleep(0.3)\n"
+            "json.dump({'n_written': 4}, open(p+'/unity_live_frames/latest.json','w')); time.sleep(0.6)\n"
+            "json.dump({'n_written': 10}, open(p+'/unity_live_frames/latest.json','w')); time.sleep(0.6)\n"
+            "print('12:00:05 run done in 3.0 s: 10/10 frames', flush=True); time.sleep(0.3)\n"
+            "print('12:00:06 report x/report.md', flush=True)\n")
+    j = jobmod.Job("stream", [sys.executable, "-c", code, str(run)], cwd=HERE, run_dir=str(run),
+                   meta={"views": 2, "warmup_steps": 3, "backend": "live"}).start()
+    seen = set()
+    while j.running:
+        s_ = j.status()
+        act = [p["id"] for p in s_["phases"] if p["state"] == "active"]
+        seen.update(act)
+        if "models" in act:
+            assert "cameras" in next(p for p in s_["phases"] if p["id"] == "models")["detail"]
+        time.sleep(0.05)
+    final = j.status()
+    assert final["state"] == "done" and all(p["state"] == "done" for p in final["phases"])
+    assert {"models", "stream", "save", "report"} <= seen
+    assert final["progress"]["written"] == 10 and final["phases"][1]["detail"].startswith("2 / 2 cameras · setup 2.0 s")
+
+
+def test_error_line_is_picked_up():
+    assert jobmod.ERR_RE.match("ValueError: boom") and jobmod.ERR_RE.match("RuntimeError: 2D worker failed")
+    assert not jobmod.ERR_RE.match("12:00:00 step 1/10")
+
+
+def test_run_timing_reads_the_report(tmp_path):
+    run = tmp_path / "live_x"
+    run.mkdir()
+    (run / "run.log").write_text("10:00:00 live_run: run\n10:00:05 run done in 4.0 s: 10/10 frames\n"
+                                 "10:00:09 report x/report.md\n", encoding="utf-8")
+    (run / "report.json").write_text(json.dumps({"timing": {
+        "steps": 10, "written": 10, "setup_s": 1.5, "wall_s": 3.0, "realtime_factor": 0.5, "achieved_output_fps": 15.0,
+        "target_fps": 30.0, "stages": {"e2e": {"p50": 900.0, "p90": 1200.0, "max": 1500.0}, "infer": {"p50": 20.0}}},
+        "late_fraction_after_warmup": 0.0, "config": {"pace": "realtime"}}), encoding="utf-8")
+    t = srv.run_timing(str(run))
+    assert t["has_report"] and t["job_s"] == 9 and t["report_s"] == 4 and t["setup_s"] == 1.5
+    assert [s["key"] for s in t["stages"]] == ["infer", "e2e"] and t["e2e"]["p50"] == 900.0
+    assert srv.run_summary(str(run))["setup_s"] == 1.5 and srv.run_summary(str(run))["delay_p50_ms"] == 900.0
+
+
+def _synthetic_clicks(fov, names):
+    import calib as cm
+    import numpy as np
+    from analysis import multiview as mv
+    pts = cm._court_points()
+    K = mv.intrinsics_from_fov(1920, 1080, fov, on="long")
+    court = np.array([pts[n] for n in names], float)
+    R0, t0 = mv.solve_extrinsics(court[:4], np.array([[400, 900], [1500, 900], [700, 300], [1200, 300]], float), K)
+    X = np.c_[court[:, 0], np.zeros(len(court)), court[:, 1]]
+    P = (K @ (R0 @ X.T + np.asarray(t0).reshape(3, 1))).T
+    return court, P[:, :2] / P[:, 2:3]
+
+
+def test_calibrate_finds_the_field_of_view_itself(tmp_path, monkeypatch):
+    import calib as cm
+    import cv2
+    import numpy as np
+    repo = tmp_path / "repo"
+    (repo / "data" / "calib" / "frames").mkdir(parents=True)
+    cv2.imwrite(str(repo / "data" / "calib" / "frames" / "v1.jpg"), np.zeros((1080, 1920, 3), np.uint8))
+    k = cm.Calib(repo, repo)
+    monkeypatch.setattr(k, "cameras", lambda: [{"view": "v1", "video": "x.mov", "has_video": False, "clip": "c"}])
+    names = ["corner_nl", "corner_nr", "corner_fl", "corner_fr", "ssl_nl", "ssl_nr", "net_l", "net_r"]
+    _, px = _synthetic_clicks(73.3, names)
+    px[4] += [6.0, 0.0]                                                       # one sloppy click
+    r = k.calibrate({"view": "v1", "points": [{"name": n, "px": float(a), "py": float(b)} for n, (a, b) in zip(names, px)]})
+    assert abs(r["fov_deg"] - 73.3) < 1.0 and r["worst"]["name"] == "ssl_nl" and len(r["points"]) == len(names)
+    saved = json.loads((repo / "data" / "calib" / "v1_cam.json").read_text(encoding="utf-8"))
+    assert saved["fov_auto"] is True and saved["court_points"]["ssl_nl"]["err_px"] > 1.0
+    rp = cm.Calib.reprojected(saved)
+    assert set(rp) == set(names) and rp["ssl_nl"][2] == max(v[2] for v in rp.values())
+
+
+def test_solve_camera_warns_about_points_on_a_line():
+    import numpy as np
+    from analysis import multiview as mv
+    names = ["corner_nl", "corner_nr", "corner_fl", "corner_fr"]
+    _, px4 = _synthetic_clicks(70.0, names)
+    court = np.array([[-3.05, -6.7], [-1.0, -6.7], [1.0, -6.7], [3.05, -6.7], [0.0, -6.6]], float)
+    K = mv.intrinsics_from_fov(1920, 1080, 70.0)
+    import calib as cm
+    pts = cm._court_points()
+    R, t = mv.solve_extrinsics(np.array([pts[n] for n in names], float), px4, K)
+    X = np.c_[court[:, 0], np.zeros(len(court)), court[:, 1]]
+    P = (K @ (R @ X.T + t.reshape(3, 1))).T
+    s = mv.solve_camera(1920, 1080, court, P[:, :2] / P[:, 2:3], fov_deg=70.0)
+    assert any("one line" in n for n in s["notes"]) and s["rms_px"] < 1.0
+
+
+def test_find_best_fov_refines_below_the_coarse_step():
+    from analysis import multiview as mv
+    names = ["corner_nl", "corner_nr", "corner_fl", "corner_fr", "net_l", "net_r", "ssl_ctr_n"]
+    court, px = _synthetic_clicks(81.37, names)
+    fov, rms = mv.find_best_fov(1920, 1080, court, px)
+    assert abs(fov - 81.37) < 0.1 and rms < 0.5

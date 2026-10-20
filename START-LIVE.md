@@ -96,13 +96,16 @@ A black window starts the server and the page opens (http://localhost:8770). Che
 
 ## 7. First stream
 
-Tab **2 Stream**: clip **singles_05x**, preset **best_live** (2D straight from the videos, 60 fps, sync file).
-The source line must say "straight from the videos". Press **Start streaming to Unity**.
+Tab **2 Stream**: clip **singles_05x**, preset **best_live** (2D straight from the videos, 60 fps, sync file) or
+**pure_live** (the same, but the camera offsets are estimated in the warm-up: nothing from an offline build). The source
+line must say "straight from the videos". Press **Start streaming to Unity**.
 
 - The first run downloads the 2D models once (~300 MB) and warms the GPU up; the first frame can take a minute.
-- The page shows frame files written, time and the folder
-  (`runs\live_singles_05x_60fps_live2d_realtime_<date>_<time>\unity_live_frames\`). Open it in Explorer to watch the
-  JSON files appear one by one.
+- The page shows each phase (models, warm-up, streaming, saving, report) with its time, a bar that counts the frame
+  files, and the full path of the folder
+  (`C:\Users\<you>\BadmintonVR-unity\runs\live_singles_05x_60fps_live2d_realtime_<date>_<time>\unity_live_frames\`,
+  a new folder per stream). **Open folder** opens it in Explorer to watch the JSON files appear one by one.
+- When it ends, the **Time report** under Unity shows setup, speed, delay and the time of every stage.
 - Unity shows **● LIVE — Broadcasting: processing the game in real time**, frames/s arriving and seconds behind the
   cameras. Every frame is shown in order; if the PC is slower than the cameras the broadcast falls behind (it does not
   skip frames). At the end: **Broadcast ended**, and the timeline comes back.

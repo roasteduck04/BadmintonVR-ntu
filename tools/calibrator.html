@@ -60,6 +60,9 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .pc.placed{border-color:var(--success);color:var(--success);}
 .pc.active{border-color:var(--accent);color:var(--accent);background:rgba(59,130,246,.1);}
 
+.calib-result{padding:4px 12px 6px;border-bottom:1px solid var(--border);font-size:10px;color:var(--muted);line-height:1.45;display:none;}
+.calib-result b{color:var(--fg);}
+.calib-result .warn{color:var(--warn);}
 .re-extract{padding:4px 12px 8px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px;font-size:10px;color:var(--muted);}
 .re-extract input{width:42px;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--fg);padding:1px 3px;font-size:10px;}
 .re-extract button{font-size:9px;padding:2px 6px;cursor:pointer;background:var(--bg);border:1px solid var(--border);border-radius:3px;color:var(--fg);}
@@ -112,9 +115,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
     <div class="ov hint" id="hint"></div>
     <div class="ov zi" id="zInfo">100%</div>
     <div class="sbar">
-      <span>FOV: <input type="number" id="fovIn" value="78" step="0.5" min="30" max="180">°
-        <select id="fovOn"><option value="long">long</option><option value="short">short</option></select>
-        <button class="btn" id="bAutoFov" title="Find best FOV from clicked points">Auto</button></span>
+      <span title="Field of view across the long side of the picture, found from the clicks on Save">FOV: <span class="v" id="sFov">-</span></span>
       <span>Pixel: <span class="v" id="sPx">-</span></span>
       <span>Points: <span class="v" id="sPts">0</span></span>
       <span>RMS: <span class="v" id="sRms">-</span></span>
@@ -128,10 +129,11 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
     <div class="wf" id="wf">
       <div class="step cur" id="ws1"><span class="n">1</span> Click a point on the court</div>
       <div class="step" id="ws2"><span class="n">2</span> Click its position on the image</div>
-      <div class="step" id="ws3"><span class="n">3</span> Repeat (need 4+), then Save</div>
+      <div class="step" id="ws3"><span class="n">3</span> Repeat (need 4+, 6+ spread out is better), then Save</div>
     </div>
+    <div class="calib-result" id="calibResult"></div>
     <div class="re-extract">
-      Frame at t=<input type="number" id="frameTime" value="1.0" step="0.5" min="0">s
+      <span id="ftLbl">Frame at t=</span><input type="number" id="frameTime" value="1.0" step="0.5" min="0"><span id="ftUnit">s</span>
       <button id="bReExtract">Re-extract</button>
     </div>
     <h3>Court Diagram <span style="font-weight:400;text-transform:none">(near baseline = bottom)</span></h3>
@@ -213,6 +215,8 @@ let cameras=[],ci=-1,activePt=null,placed={},img=null;
 let zm=1,px=0,py=0;
 let undoS=[],redoS=[];
 let suggestPrev=null;
+let reproj={};   // {point: [x, y, err_px, clickX, clickY]}: where the saved calibration puts each clicked point
+const FRAME_MODE=!!window.EMBED_LIVE_SERVER;   // live server: re-extract by frame number
 
 /* ---- DOM ---- */
 const icv=document.getElementById('icv'),ix=icv.getContext('2d'),ipanel=document.getElementById('ipanel');
@@ -238,11 +242,13 @@ function goCamera(idx){
   if(addFrameMode)finishAddFrame(false);
   ci=idx;undoS=[];redoS=[];activePt=null;zm=1;px=0;py=0;suggestPrev=null;
   const cam=cameras[ci];
-  document.getElementById('fovIn').value=cam.saved_fov||cam.fov_deg;
-  placed={};
+  placed={};reproj={};
   if(cam.saved_points){
     for(const[n,px_]of Object.entries(cam.saved_points))placed[n]=px_;
+    for(const[n,r]of Object.entries(cam.saved_proj||{}))if(cam.saved_points[n])reproj[n]=[r[0],r[1],r[2],...cam.saved_points[n]];
   }
+  showFov(cam.saved_fov);
+  showResult(cam.calibrated?{rms_px:cam.rms,fov_deg:cam.saved_fov}:null);
   img=new Image();
   img.onload=()=>render();
   img.src='/frames/'+encodeURIComponent(cam.view+'.jpg')+'?t='+Date.now();
@@ -374,6 +380,21 @@ function drawImg(){
       const p=suggestPrev[n];
       const ppx=ox+p[0]*iw/img.width,ppy=oy+p[1]*ih/img.height;
       c.beginPath();c.arc(ppx,ppy,4/zm,0,Math.PI*2);c.fillStyle='rgba(255,220,50,.85)';c.fill();
+    }
+  }
+
+  // Saved calibration: where each clicked point lands (ring) and the miss (line); red = worst or > 15 px
+  let worstN=null;for(const n in reproj)if(!worstN||reproj[n][2]>reproj[worstN][2])worstN=n;
+  for(const n in reproj){
+    const r=reproj[n],p=placed[n];
+    if(!p||Math.abs(p[0]-r[3])>.01||Math.abs(p[1]-r[4])>.01)continue;   // click moved since the save
+    const cx=ox+p[0]*iw/img.width,cy=oy+p[1]*ih/img.height,qx=ox+r[0]*iw/img.width,qy=oy+r[1]*ih/img.height;
+    const col=(n===worstN&&r[2]>3)||r[2]>15?'#ef4444':r[2]>5?'#eab308':'#22c55e';
+    c.strokeStyle=col;c.lineWidth=1.5/zm;
+    c.beginPath();c.moveTo(cx,cy);c.lineTo(qx,qy);c.stroke();
+    c.beginPath();c.arc(qx,qy,6/zm,0,Math.PI*2);c.stroke();
+    if(n===worstN||r[2]>5){
+      c.font=`bold ${10/zm}px sans-serif`;c.fillStyle=col;c.fillText(r[2].toFixed(1)+'px',qx+8/zm,qy+12/zm);
     }
   }
 
@@ -562,49 +583,55 @@ async function saveCurrent(){
   if(ci<0)return;
   const pts=Object.entries(placed).map(([n,p])=>({name:n,px:p[0],py:p[1]}));
   if(pts.length<4){alert('Need at least 4 points.');return}
-  const fov=parseFloat(document.getElementById('fovIn').value);
-  const fovOn=document.getElementById('fovOn').value;
-  const res=await fetch('/api/calibrate',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({view:cameras[ci].view,fov_deg:fov,fov_on:fovOn,points:pts})
-  }).then(r=>r.json());
-  if(res.error){alert('Error: '+res.error);return}
+  const bSave=document.getElementById('bSave');
+  bSave.textContent='Finding FOV...';bSave.disabled=true;
+  let res;
+  try{
+    // no fov_deg: the server finds the best field of view from the clicks, then saves
+    res=await fetch('/api/calibrate',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({view:cameras[ci].view,points:pts})
+    }).then(r=>r.json());
+  }finally{bSave.textContent='Save (S)';bSave.disabled=false}
+  const err=res.error||res.detail;
+  if(err){alert('Error: '+(typeof err==='string'?err:JSON.stringify(err)));return}
   document.getElementById('sRms').textContent=res.rms_px.toFixed(2)+'px';
   document.getElementById('sRms').style.color=res.warning?'var(--warn)':'var(--success)';
-  cameras[ci].calibrated=true;cameras[ci].rms=res.rms_px;cameras[ci].saved_fov=fov;
-  cameras[ci].saved_points={};
-  for(const n in placed)cameras[ci].saved_points[n]=[...placed[n]];
-  renderCamList();
-  if(res.warning)alert('Saved but RMS '+res.rms_px.toFixed(1)+'px > 15px — check clicks or FOV.');
+  const cam=cameras[ci];
+  cam.calibrated=true;cam.rms=res.rms_px;cam.saved_fov=res.fov_deg;
+  cam.saved_points={};cam.saved_proj={};reproj={};
+  for(const n in placed)cam.saved_points[n]=[...placed[n]];
+  for(const p of res.points||[]){
+    cam.saved_proj[p.name]=[p.proj[0],p.proj[1],p.err_px];
+    if(placed[p.name])reproj[p.name]=[p.proj[0],p.proj[1],p.err_px,...placed[p.name]];
+  }
+  showFov(res.fov_deg);showResult(res);
+  renderCamList();drawImg();
+  if(res.warning)alert('Saved, but RMS '+res.rms_px.toFixed(1)+' px > 15 px. Worst click: '+(res.worst?res.worst.name+' ('+res.worst.err_px.toFixed(1)+' px)':'?')+'. Redo it and Save again.');
 }
 
-/* ---- Auto FOV ---- */
-document.getElementById('bAutoFov').addEventListener('click',async()=>{
-  if(ci<0)return;
-  const pts=Object.entries(placed).map(([n,p])=>({name:n,px:p[0],py:p[1]}));
-  if(pts.length<4){alert('Need at least 4 points.');return}
-  const fovOn=document.getElementById('fovOn').value;
-  document.getElementById('bAutoFov').textContent='...';
-  const res=await fetch('/api/auto-fov',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({view:cameras[ci].view,fov_on:fovOn,points:pts})
-  }).then(r=>r.json());
-  document.getElementById('bAutoFov').textContent='Auto';
-  if(res.error){alert('Error: '+res.error);return}
-  document.getElementById('fovIn').value=res.fov_deg.toFixed(1);
-  document.getElementById('sRms').textContent=res.rms_px.toFixed(2)+'px (preview)';
-  document.getElementById('sRms').style.color=res.rms_px>15?'var(--warn)':'var(--success)';
-  alert('Best FOV: '+res.fov_deg.toFixed(1)+'° → RMS '+res.rms_px.toFixed(2)+'px\nClick Save to apply.');
-});
+function showFov(fov){document.getElementById('sFov').textContent=fov!=null?(+fov).toFixed(2)+'°':'found on Save'}
+function showResult(res){
+  const el=document.getElementById('calibResult');
+  if(!res||res.rms_px==null){el.style.display='none';el.innerHTML='';return}
+  let worst=res.worst;
+  if(!worst){let w=null;for(const n in reproj)if(!w||reproj[n][2]>w.err_px)w={name:n,err_px:reproj[n][2]};worst=w}
+  const cls=res.rms_px>15?' class="warn"':'';
+  let h=`Saved: FOV <b>${res.fov_deg!=null?(+res.fov_deg).toFixed(2)+'°':'?'}</b>, RMS <b${cls}>${res.rms_px.toFixed(2)} px</b>`;
+  if(worst)h+=`<br>worst click <b>${worst.name}</b> ${worst.err_px.toFixed(1)} px (red line on the frame)`;
+  for(const n of res.notes||[])h+=`<br><span class="warn">${n}</span>`;
+  el.innerHTML=h;el.style.display='block';
+}
 
 /* ---- Re-extract ---- */
 document.getElementById('bReExtract').addEventListener('click',async()=>{
   if(ci<0)return;
-  const t=parseFloat(document.getElementById('frameTime').value)||1.0;
+  const v=parseFloat(document.getElementById('frameTime').value);
+  const body=FRAME_MODE?{view:cameras[ci].view,frame:Math.max(0,Math.round(isNaN(v)?60:v))}:{view:cameras[ci].view,time:isNaN(v)?1.0:v};
   document.getElementById('bReExtract').textContent='...';
   await fetch('/api/re-extract',{
     method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({view:cameras[ci].view,time:t})
+    body:JSON.stringify(body)
   });
   document.getElementById('bReExtract').textContent='Re-extract';
   img=new Image();img.onload=()=>render();
@@ -926,6 +953,11 @@ resizeIcv();drawImg();drawCourt();renderPS();
 loadCameras().then(()=>loadSeeds());
 // v0.8.2: inside the live server's Calibrate tab the stream is seedless, so only the calibration mode is shown
 if(window.EMBED_LIVE_SERVER){document.querySelector('.mode-toggle').style.display='none';}
+if(FRAME_MODE){
+  document.getElementById('ftLbl').textContent='Video frame #';document.getElementById('ftUnit').textContent='';
+  const ft=document.getElementById('frameTime');ft.value='60';ft.step='1';ft.style.width='52px';
+  ft.title="Frame number of this camera's video (60 = 1 s at 60 fps)";
+}
 </script>
 </body>
 </html>

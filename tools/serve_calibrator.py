@@ -380,13 +380,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/calibrate":
             cam_info = _camera(body.get("view"))
             view = cam_info["view"]
-            fov_deg = float(body["fov_deg"])
+            fov_deg = body.get("fov_deg")          # missing = find the best field of view first (the page's Save)
+            fov_deg = None if fov_deg is None else float(fov_deg)
             fov_on = body.get("fov_on", "long")
             names, image_px, court_xz = _points(body)
             w, h = _frame_size(view)
-            K = mv.intrinsics_from_fov(w, h, fov_deg, on=fov_on)
-            R, t_vec = mv.solve_extrinsics(court_xz, image_px, K)
-            rms = mv.reprojection_rms(court_xz, image_px, K, R, t_vec)
+            sol = mv.solve_camera(w, h, court_xz, image_px, fov_deg=fov_deg, on=fov_on)
+            K, R, t_vec, rms, fov_deg = sol["K"], sol["R"], sol["t"], sol["rms_px"], sol["fov_deg"]
             out = {
                 "view": view,
                 "source": os.path.basename(cam_info["video"]),
@@ -407,8 +407,13 @@ class Handler(BaseHTTPRequestHandler):
             if rms > 15:
                 status += " WARNING: rms > 15px"
             print(status)
+            worst = int(sol["err_px"].argmax())
             return self._json_response(
-                {"rms_px": float(rms), "path": out_path, "warning": bool(rms > 15)})
+                {"rms_px": float(rms), "fov_deg": fov_deg, "path": out_path, "warning": bool(rms > 15),
+                 "notes": sol["notes"],
+                 "points": [{"name": n, "proj": [float(a), float(b)], "err_px": float(e)}
+                            for n, (a, b), e in zip(names, sol["proj"], sol["err_px"])],
+                 "worst": {"name": names[worst], "err_px": float(sol["err_px"][worst])}})
 
         if path == "/api/extract-frame":
             cam = _camera(body.get("view"))

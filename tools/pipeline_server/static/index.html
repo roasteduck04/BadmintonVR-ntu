@@ -59,7 +59,8 @@
             </div>
             <div class="table-wrap"><table id="runs">
               <thead><tr><th></th><th>Stream</th><th>Frames</th><th>fps</th><th>× real time</th><th>Late</th>
-                <th>MPJPE cm</th><th>Knee °</th><th>Swaps</th><th></th></tr></thead>
+                <th>MPJPE cm</th><th>Knee °</th><th>Swaps</th><th title="models + videos, before the first frame">Setup s</th>
+                <th title="median delay from capture to frame file">Delay s</th><th></th></tr></thead>
               <tbody></tbody>
             </table></div>
             <div id="compare-box" hidden>
@@ -82,15 +83,21 @@
             Unity shows each pose as soon as its file lands.</p>
           <div id="job" class="job idle">
             <div class="job-title" id="job-title">Idle</div>
-            <div class="bar"><div id="bar-fill"></div></div>
+            <ol class="phases" id="phases"></ol>
+            <div class="bar" id="bar"><div id="bar-fill"></div><span id="bar-text"></span></div>
             <div class="stats" id="job-stats"></div>
-            <div class="stats" id="job-folder"></div>
+            <div class="stats folder"><span id="job-folder"></span>
+              <button class="small ghost" id="open-folder" hidden title="open the frame folder in Explorer">Open folder</button></div>
             <div class="err" id="job-err"></div>
             <details><summary>Log</summary><pre id="job-log"></pre></details>
           </div>
           <div class="np">
             <div class="lab">Unity</div>
             <div id="unity-detail" class="muted">…</div>
+          </div>
+          <div class="np" id="timebox" hidden>
+            <div class="lab">Time report <span id="time-name" class="muted"></span></div>
+            <div id="time-body"></div>
           </div>
         </div>
       </div>
@@ -102,8 +109,9 @@
     <div class="card">
       <div class="row spread"><h2>Court calibration</h2>
         <span class="muted">Pick a camera on the left, click court points on the frame (pick the point on the court
-          diagram first), <b>Auto</b> finds the field of view, <b>Save</b> writes <code>data/calib/&lt;camera&gt;_cam.json</code>
-          (the old one is archived). Below 15 px is good. Calibrate again whenever a camera moves.</span></div>
+          diagram first; 6+ points spread over the court). <b>Save</b> finds the field of view from the clicks and writes
+          <code>data/calib/&lt;camera&gt;_cam.json</code> (the old one is archived). Below 15 px is good; the red line on
+          the frame shows the worst click. Calibrate again whenever a camera moves.</span></div>
       <iframe id="calib-frame" title="court calibrator" loading="lazy"></iframe>
     </div>
     <div class="card">
