@@ -432,10 +432,23 @@ def trt_models(sol, rcfg, batch, in_hw):
         di = sol.det_model.session.get_inputs()[0]
         dw, dh = (int(x) for x in getattr(sol.det_model, "model_input_size", (640, 640)))
         dshape = _fixed(di.shape, (1, 3, dh, dw))
-        try:
-            sol.det_model.session = trt_session(sol.det_model.onnx_model, rcfg, {di.name: (dshape, dshape, dshape)})
-        except TensorRTUnavailable as e:
-            notes["det_model"] = f"CUDA ({e})"
+        # a detector TensorRT cannot build is remembered, so later runs do not spend the failed build again
+        mark = os.path.expanduser(os.path.join(rcfg.get("trt_cache") or TRT_CACHE,
+                                               os.path.basename(str(sol.det_model.onnx_model)) + ".no-trt.txt"))
+        if os.path.exists(mark):
+            with open(mark, "r", encoding="utf-8") as fh:
+                notes["det_model"] = f"CUDA (TensorRT failed before: {fh.read().strip()[:200]}; delete {mark} to retry)"
+        else:
+            try:
+                sol.det_model.session = trt_session(sol.det_model.onnx_model, rcfg, {di.name: (dshape, dshape, dshape)})
+            except TensorRTUnavailable as e:
+                notes["det_model"] = f"CUDA ({e})"
+                try:
+                    os.makedirs(os.path.dirname(mark), exist_ok=True)
+                    with open(mark, "w", encoding="utf-8") as fh:
+                        fh.write(str(e))
+                except OSError:
+                    pass
     else:
         notes["det_model"] = "CUDA (rtmpose.trt_models leaves it out)"
     return notes

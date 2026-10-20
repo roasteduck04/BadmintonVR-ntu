@@ -248,12 +248,14 @@ def test_detector_may_stay_on_cuda_but_the_pose_model_must_build(tmp_path, monke
         return "trt-session"
     monkeypatch.setattr(pf, "trt_session", fake)
     sol = Sol()
-    notes = pf.trt_models(sol, {}, batch=32, in_hw=(384, 288))
+    rc = {"trt_cache": str(tmp_path)}
+    notes = pf.trt_models(sol, rc, batch=32, in_hw=(384, 288))
     assert sol.pose_model.session == "trt-session" and "det.onnx" in notes["det_model"]
+    assert "failed before" in pf.trt_models(Sol(), rc, batch=32, in_hw=(384, 288))["det_model"]   # remembered
     assert built["pose.onnx"]["input"] == ((1, 3, 384, 288), (8, 3, 384, 288), (32, 3, 384, 288))
 
     def fail_pose(path, rcfg, shapes):
         raise pf.TensorRTUnavailable(f"TensorRT could not build {path}")
     monkeypatch.setattr(pf, "trt_session", fail_pose)
     with pytest.raises(pf.TensorRTUnavailable, match="pose.onnx"):
-        pf.trt_models(Sol(), {}, batch=32, in_hw=(384, 288))
+        pf.trt_models(Sol(), rc, batch=32, in_hw=(384, 288))
