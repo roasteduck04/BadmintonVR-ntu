@@ -92,25 +92,28 @@ def main(argv=None):
               f"({'FP32' if a.fp32 else 'FP16'}, cache {os.path.expanduser(pf.TRT_CACHE)})...")
         rc = {"trt_fp16": not a.fp32}
         t = time.perf_counter()
-        try:
-            for name in ("det_model", "pose_model"):
-                m = getattr(pose, name)
-                i = m.session.get_inputs()[0]
-                w, h = (int(x) for x in m.model_input_size)
-                shp = pf._fixed(i.shape, (1, 3, h, w))
-                m.session = pf.trt_session(m.onnx_model, rc, {i.name: (shp, shp, shp)})
+        notes = {}
+        try:                                      # the pose model must build; the detector may stay on CUDA
+            pm = pose.pose_model
+            pw, ph = (int(x) for x in pm.model_input_size)
+            notes = pf.trt_models(pose, rc, batch=1, in_hw=(ph, pw))
         except pf.TensorRTUnavailable as e:
             print(f"FAIL: {e}")
             trt_diagnostics(pf)
-            print("gpu-check: FAIL (TensorRT not usable; paste everything above)")
+            print("gpu-check: FAIL (TensorRT not usable for the pose model; paste everything above)")
             return 1
+        for name, note in notes.items():
+            print(f"{name}: stays on {note}")
         print(f"sessions ready in {time.perf_counter() - t:.1f} s")
         want = "TensorrtExecutionProvider"
     ok = True
     for name in ("det_model", "pose_model"):
         prov = getattr(pose, name).session.get_providers()
         print(f"{name}: {prov}")
-        ok = ok and prov[:1] == [want] if a.trt else ok and want in prov
+        if a.trt:
+            ok = ok and (prov[:1] == [want] if name == "pose_model" else "CUDAExecutionProvider" in prov)
+        else:
+            ok = ok and want in prov
     if a.video:
         import cv2
         cap = cv2.VideoCapture(a.video)
@@ -133,7 +136,9 @@ def main(argv=None):
             times.sort()
             print(f"next {len(times)} frames: median {times[len(times) // 2]:.0f} ms per frame (model only)")
     if a.trt:
-        print("gpu-check:", "OK (TensorRT)" if ok else "FAIL (TensorRT is not the first provider)")
+        det_trt = pose.det_model.session.get_providers()[:1] == ["TensorrtExecutionProvider"]
+        print("gpu-check:", ("OK (TensorRT" + (")" if det_trt else ": pose model; detector on CUDA)")) if ok
+              else "FAIL (the pose model is not on TensorRT)")
         return 0 if ok else 1
     print("gpu-check:", "OK (CUDA)" if ok else "FAIL (a sub-model runs without CUDAExecutionProvider)")
     return 0 if ok else 1

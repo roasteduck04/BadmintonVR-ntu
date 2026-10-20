@@ -413,6 +413,34 @@ class TensorRTUnavailable(RuntimeError):
     pass
 
 
+def trt_models(sol, rcfg, batch, in_hw):
+    """Put the pose model (required) and the detector (optional) of an rtmlib solution on TensorRT. The detector runs
+    only every det_every frames and its exported box filtering is often more than TensorRT accepts: if its engine
+    cannot be built it stays on CUDA and the reason is returned. rtmpose.trt_models picks which models to try
+    (default both). Returns {model: note} for models left on CUDA."""
+    notes = {}
+    want = rcfg.get("trt_models") or ["det", "pose"]
+    if "pose" in want:
+        pi = sol.pose_model.session.get_inputs()[0]
+        base = (1, 3, int(in_hw[0]), int(in_hw[1]))
+        opt_b = min(batch, max(1, int(rcfg.get("trt_opt_batch", 8))))
+        sol.pose_model.session = trt_session(sol.pose_model.onnx_model, rcfg, {pi.name: (
+            base, (opt_b,) + base[1:], (batch,) + base[1:])})
+    else:
+        notes["pose_model"] = "CUDA (rtmpose.trt_models leaves it out)"
+    if "det" in want:
+        di = sol.det_model.session.get_inputs()[0]
+        dw, dh = (int(x) for x in getattr(sol.det_model, "model_input_size", (640, 640)))
+        dshape = _fixed(di.shape, (1, 3, dh, dw))
+        try:
+            sol.det_model.session = trt_session(sol.det_model.onnx_model, rcfg, {di.name: (dshape, dshape, dshape)})
+        except TensorRTUnavailable as e:
+            notes["det_model"] = f"CUDA ({e})"
+    else:
+        notes["det_model"] = "CUDA (rtmpose.trt_models leaves it out)"
+    return notes
+
+
 def _shape_str(name, shape):
     return f"{name}:" + "x".join(str(int(d)) for d in shape)
 
@@ -432,7 +460,11 @@ def trt_session(onnx_path, rcfg, shapes=None):
         opts["trt_profile_opt_shapes"] = ",".join(_shape_str(n, s[1]) for n, s in shapes.items())
         opts["trt_profile_max_shapes"] = ",".join(_shape_str(n, s[2]) for n, s in shapes.items())
     prov = [("TensorrtExecutionProvider", opts), "CUDAExecutionProvider", "CPUExecutionProvider"]
-    sess = ort.InferenceSession(onnx_path, providers=prov)
+    try:
+        sess = ort.InferenceSession(onnx_path, providers=prov)
+    except Exception as e:  # noqa: BLE001 - e.g. "TensorRT EP failed to create engine from network"
+        msg = str(e).strip().splitlines()[-1] if str(e).strip() else type(e).__name__
+        raise TensorRTUnavailable(f"TensorRT could not build {os.path.basename(onnx_path)}: {msg[:300]}") from None
     got = sess.get_providers()
     if got[:1] != ["TensorrtExecutionProvider"]:
         # onnxruntime retries a failed TensorRT start on the CPU alone: never let a TensorRT run quietly use the CPU
@@ -547,17 +579,10 @@ class FastPose:
         self.ep = rcfg.get("ep", "cuda") if device == "cuda" else "cpu"
         self.batch = max(1, int(rcfg.get("pose_batch", 32)))
         self.trt_version = None
-        if self.ep == "trt":                  # rebuild both sessions on TensorRT (falls back to CUDA if it cannot)
+        self.trt_notes = {}
+        if self.ep == "trt":                  # pose model on TensorRT (required); detector too if TensorRT can build it
             self.trt_version = preload_tensorrt()
-            di = self.det.session.get_inputs()[0]
-            dw, dh = (int(x) for x in getattr(self.det, "model_input_size", (640, 640)))
-            dshape = _fixed(di.shape, (1, 3, dh, dw))
-            self.det.session = trt_session(self.det.onnx_model, rcfg, {di.name: (dshape, dshape, dshape)})
-            pi = self.pose.session.get_inputs()[0]
-            base = (1, 3, self.in_h, self.in_w)
-            opt_b = min(self.batch, max(1, int(rcfg.get("trt_opt_batch", 8))))
-            self.pose.session = trt_session(self.pose.onnx_model, rcfg, {pi.name: (
-                base, (opt_b,) + base[1:], (self.batch,) + base[1:])})
+            self.trt_notes = trt_models(self.sol, rcfg, self.batch, (self.in_h, self.in_w))
             self.providers = providers_of(self.sol)
         search = rcfg.get("cudnn_search")
         if search and device == "cuda" and self.ep != "trt":   # rebuild both sessions with this cuDNN algorithm search
@@ -801,7 +826,7 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                              "padded_sizes": warm_sizes if engine.pad else None, "providers": engine.providers, "engine": "fast",
                              "decoder": kind, "decode_size": [readers[v].out_w, readers[v].out_h],
                              "video_size": [readers[v].src_w, readers[v].src_h], "video_to_calib": k_cal[v],
-                             "ep": engine.ep, "trt_version": engine.trt_version,
+                             "ep": engine.ep, "trt_version": engine.trt_version, "trt_notes": engine.trt_notes,
                              "batch_views": len(views) > 1, "model": engine.model}))
     while not go_ev.wait(0.05):
         if stop_ev.is_set():

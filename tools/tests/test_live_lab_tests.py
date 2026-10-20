@@ -216,3 +216,44 @@ def test_tensorrt_session_never_falls_back_to_the_cpu_quietly(tmp_path, monkeypa
     monkeypatch.setattr(ort, "InferenceSession", FakeSession)
     with pytest.raises(pf.TensorRTUnavailable, match="fell back"):
         pf.trt_session("model.onnx", {"trt_cache": str(tmp_path)}, {"input": ((1, 3, 4, 4),) * 3})
+
+
+def test_detector_may_stay_on_cuda_but_the_pose_model_must_build(tmp_path, monkeypatch):
+    class Inp:
+        def __init__(self, name, shape):
+            self.name, self.shape = name, shape
+
+    class Sess:
+        def __init__(self, inp):
+            self.inp = inp
+
+        def get_inputs(self):
+            return [self.inp]
+
+    class Model:
+        def __init__(self, path, inp, size):
+            self.onnx_model, self.session, self.model_input_size = path, Sess(inp), size
+
+    class Sol:
+        def __init__(self):
+            self.det_model = Model("det.onnx", Inp("input", [1, 3, 640, 640]), (640, 640))
+            self.pose_model = Model("pose.onnx", Inp("input", ["batch", 3, 384, 288]), (288, 384))
+
+    built = {}
+
+    def fake(path, rcfg, shapes):
+        if path == "det.onnx":
+            raise pf.TensorRTUnavailable("TensorRT could not build det.onnx: failed to create engine")
+        built[path] = shapes
+        return "trt-session"
+    monkeypatch.setattr(pf, "trt_session", fake)
+    sol = Sol()
+    notes = pf.trt_models(sol, {}, batch=32, in_hw=(384, 288))
+    assert sol.pose_model.session == "trt-session" and "det.onnx" in notes["det_model"]
+    assert built["pose.onnx"]["input"] == ((1, 3, 384, 288), (8, 3, 384, 288), (32, 3, 384, 288))
+
+    def fail_pose(path, rcfg, shapes):
+        raise pf.TensorRTUnavailable(f"TensorRT could not build {path}")
+    monkeypatch.setattr(pf, "trt_session", fail_pose)
+    with pytest.raises(pf.TensorRTUnavailable, match="pose.onnx"):
+        pf.trt_models(Sol(), {}, batch=32, in_hw=(384, 288))
