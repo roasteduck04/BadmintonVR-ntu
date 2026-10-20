@@ -325,6 +325,10 @@ def resolve(c, probe=probe_sources) -> dict:
     c["out_clip"] = c["out_clip"].format(clip=c["clip"], nviews=len(c["views"]), fps=f"{c['fps']:g}")
     refs = c["report"].get("reference_clips") or []
     c["reference_clips"] = [r for r in refs if r]
+    from .cpulimits import budget as _cpu_budget
+    c["cpu_budget"] = _cpu_budget(c)                 # v0.8.3: threads per process (None = not limited)
+    if c["stream"].get("late_policy", "drop") not in ("drop", "use", "behind"):
+        raise ValueError(f"stream.late_policy must be drop, use or behind, got {c['stream']['late_policy']!r}")
     return c
 
 

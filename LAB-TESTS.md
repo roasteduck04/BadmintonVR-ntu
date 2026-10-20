@@ -102,3 +102,24 @@ offline builds, rescores every bench against the offline 2D and writes `runs/cam
 | 720p / 1080p tests skipped | step 3 |
 | unity tests skipped "not in Play mode" | press Play first; the heartbeat must be fresh (the page's pill turns green) |
 | campaign stopped when the window closed | run the same command again: it continues where it stopped |
+
+---
+
+## Round 2 (after docs/reports/v0.8.3-lab-tests.md)
+
+Tests the round-1 fixes one at a time and together, at 60 and 30 fps (`configs/live/campaign/lab_5090_r2.yaml`, 19
+streams + 3 with Unity, ~35 min): CPU thread limits (`cpu.limits`), late fits kept while the stream is behind
+(`stream.late_policy=behind`), TensorRT pose model (now the rtx5090 default), nearest-frame sync, GPU video decoding,
+thread budgets 2 / auto / 8, 30 fps, 28 s streams, pure_live. best_live now uses a 60-frame warm-up.
+
+```bash
+cd ~/BadmintonVR && source ~/venv-pc/bin/activate && git pull
+pip install PyNvVideoCodec        # optional: GPU video decoding (tests R06 / R07 are skipped without it)
+python tools/live_run.py campaign run --plan lab_5090_r2 --group all --dry-run --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+python tools/live_run.py campaign run --plan lab_5090_r2 --group main --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+# then Unity in Play mode:
+python tools/live_run.py campaign run --plan lab_5090_r2 --group unity --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+```
+
+Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r2.zip` (laptop: `BadmintonVR\runs\`).
+

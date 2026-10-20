@@ -43,6 +43,8 @@ rtmpose:                        # live backend only (same model + settings as th
   det: null                     # engine fast: detector model URL / path (null = the model's default for this mode)
   court_filter_m: null          # engine fast: pose only persons whose feet are on the court (+ this margin, m); null = all
   pad_batch: true               # engine fast: pad each pose call to 1/2/4/8/16/32 crops (a new input size is ~6x slower)
+  ep: cuda                      # v0.8.3, engine fast: cuda | trt = TensorRT for the pose model (+ detector if it builds)
+  trt_fp16: true                # ep trt: FP16 engines (lab: same 2D accuracy, pose model 18.5 -> 9.6 ms)
   warmup: true                  # engine fast: run every padded size once before the clock starts
   cudnn_search: null            # engine fast: cuDNN algorithm search (null = ORT default EXHAUSTIVE | heuristic | default)
   queue_depth: 8                # frames a camera worker may run ahead of the scheduler
@@ -78,6 +80,8 @@ stream:
   solver_tol: 1.0e-4            # v0.8.1: least_squares ftol = xtol = gtol (null = SciPy 1e-8, the offline fit). With
   lsmr_maxiter: 20              # the LSMR cap (null = LSMR default) the fit is 4.1x cheaper per frame, +0.1 cm / -0.1 deg
   late_policy: drop             # a window solved after its budget: drop = output the fallback (latency bounded)
+                                # | use = wait for it | behind (v0.8.3) = wait only while the stream is behind anyway
+                                # (its last frame arrived later than the budget), else drop
                                 # | use = wait and output the fit (latency grows when the fit is slower than real time)
   good_conf: {multi: 0.7, two_view: 0.45}   # body-length samples: triangulation confidence ...
   good_inliers: {multi: 3, two_view: 2}     # ... and inlier views
@@ -110,3 +114,10 @@ paths:
   runs_dir: runs
   analysis_dir: Assets/StreamingAssets/analysis
   sync_file: "{data_dir}/calib/{clip}_sync.json"
+
+cpu:                            # v0.8.3 (analysis/live/cpulimits.py): threads per process; auto splits the cores
+  limits: false                 # true = cap BLAS / OpenMP / OpenCV / decoder threads of every process
+  main_threads: auto
+  pose2d_threads: auto
+  decode_threads: auto
+  fit_threads: auto

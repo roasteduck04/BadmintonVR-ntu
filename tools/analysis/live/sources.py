@@ -103,7 +103,8 @@ def build_model(rcfg, device):
 
 def _worker(view, path, frames, rcfg, device, fps, origin, t0_val, go_ev, realtime, out_q, stop_ev, ctl=None):
     import cv2
-    from . import pose2d_fast
+    from . import cpulimits, pose2d_fast
+    cpulimits.apply(rcfg.get("_threads"))
     t_load = time.monotonic_ns()
     try:
         pose, providers = build_model(rcfg, device)
@@ -197,6 +198,11 @@ class VideoRtmlibSource:
         c = self.cfg
         rc = dict(c["rtmpose"])
         realtime = c["pace"] == "realtime"
+        from . import cpulimits
+        cb = c.get("cpu_budget") or {}
+        rc["_threads"] = cb.get("pose2d")
+        if cb and not rc.get("decode_threads"):
+            rc["decode_threads"] = cb.get("decode")
         if rc.get("ep") == "trt":           # a first TensorRT run builds its engines before "ready" (can take minutes)
             ready_timeout_s = max(ready_timeout_s, 3600)
         if rc.get("engine", "rtmlib") == "fast":
@@ -218,7 +224,8 @@ class VideoRtmlibSource:
                                            {v: float(origins[v]) for v in g}, rc, c["device"], float(c["source_fps"]),
                                            self.t0_val, self.go_ev, realtime, {v: self.queues[v] for v in g},
                                            self.stop_ev, 1.0 / float(c["fps"]), cq))
-                p.start()
+                with cpulimits.child_env(rc.get("_threads")):
+                    p.start()
                 for v in g:
                     self.procs[v] = p
         else:
@@ -230,7 +237,8 @@ class VideoRtmlibSource:
                 p = self.ctx.Process(target=_worker, name=f"pose2d-{v}", daemon=True,
                                      args=(v, c["videos"][v], list(plan[v]), rc, c["device"], float(c["source_fps"]),
                                            float(origins[v]), self.t0_val, self.go_ev, realtime, q, self.stop_ev, cq))
-                p.start()
+                with cpulimits.child_env(rc.get("_threads")):
+                    p.start()
                 self.procs[v], self.queues[v], self.stash[v] = p, q, {}
         for v in c["views"]:            # wait for every model, so model loading is not counted as frame latency
             kind, _, payload = self._next(v, ready_timeout_s)

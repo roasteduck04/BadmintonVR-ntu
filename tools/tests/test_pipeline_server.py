@@ -288,8 +288,10 @@ def test_saved_preset_stores_seconds(tmp_path, monkeypatch):
 def test_pure_live_preset_takes_nothing_from_an_offline_build():
     p = st.load_preset("pure_live")
     assert p["backend"] == "live" and p["sync.offsets"] == "auto"
-    assert {k: v for k, v in p.items() if k != "sync.offsets"} == \
-        {k: v for k, v in st.load_preset("best_live").items() if k != "sync.offsets"}
+    own = ("sync.offsets", "warmup.seconds")          # pure_live keeps the 120-frame warm-up for its sync estimate
+    assert "warmup.seconds" not in p
+    assert {k: v for k, v in p.items() if k not in own} == \
+        {k: v for k, v in st.load_preset("best_live").items() if k not in own}
 
 
 def test_stream_start_passes_untouched_seconds_through(tmp_path, monkeypatch):

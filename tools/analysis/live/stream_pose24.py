@@ -7,7 +7,9 @@ when its last step has arrived AND the previous window is resolved: fixed-lag lr
 window obs -> init (previous solution where there is one, else _fill_init of the window's raw triangulation) ->
 solve_window per player (inline, or in a process pool). A window is "late" when its solve finishes more than
 budget_s after its last step arrived (budget None = asfast: never late); late players' frames come from the
-fallback (quality 2) and the late solution is dropped. Output frames are emitted once each, in step order.
+fallback (quality 2) and the late solution is dropped (stream.late_policy drop), waited for (use), or - v0.8.3
+"behind" - waited for only while the stream is behind anyway (the window's last step reached the core more than
+budget_s after its capture time: dropping then saves no delay, it only loses the fit and the next window's warm start). Output frames are emitted once each, in step order.
 Gap handling (spec 6.2, causal): a step whose body has been unseen for more than max_gap steps (fit.MAX_GAP = 20 frames
 at 60 fps, scaled to the step rate) is invalid (NaN, quality NONE). The leading edge of a gap, up to max_gap steps, is
 still held/interpolated by the fit and output with quality FITTED but flagged interp=True (confidence 'filled')."""
@@ -34,6 +36,7 @@ class _Window:
     stop: int
     commit: int
     t_ready_ns: int
+    behind: bool = False
     lo: dict = field(default_factory=dict)
     jobs: dict = field(default_factory=dict)
     inputs: dict = field(default_factory=dict)
@@ -67,8 +70,8 @@ class StreamPose24:
         self.tol = cfg["stream"].get("solver_tol")
         self.lsmr_maxiter = cfg["stream"].get("lsmr_maxiter")
         self.late_policy = cfg["stream"].get("late_policy") or "drop"
-        if self.late_policy not in ("drop", "use"):
-            raise ValueError(f"stream.late_policy must be drop or use, got {self.late_policy!r}")
+        if self.late_policy not in ("drop", "use", "behind"):
+            raise ValueError(f"stream.late_policy must be drop, use or behind, got {self.late_policy!r}")
         self.partner_px = float(cfg["sync"]["partner_max_px"])
         self.tracker = SinglesTracker(self.cams, self.views, self.fps, cfg["tracker"], ankle_h=cfg.get("ankle_h_m"),
                                       wcfg=cfg.get("warmup"), warm_steps=int(cfg["warmup_steps"]))
@@ -86,11 +89,16 @@ class StreamPose24:
         self.stepper = stream_fit.WindowStepper(self.warm, self.n, cfg["window"], cfg["overlap"])
         self.pending = self.stepper.next_window()
         self.inflight, self.ready = [], {}
-        self.t_recv, self.ref = {}, {}
+        self.t_recv, self.ref, self.t_cap = {}, {}, {}
         self.next_pub, self.last_step, self.k = 0, -1, 0
         self.pool = None
         if workers:
-            self.pool = ProcessPoolExecutor(max_workers=int(workers), mp_context=mp.get_context("spawn"))
+            from . import cpulimits
+            nfit = (cfg.get("cpu_budget") or {}).get("fit")
+            with cpulimits.child_env(nfit):
+                self.pool = ProcessPoolExecutor(max_workers=int(workers), mp_context=mp.get_context("spawn"),
+                                                initializer=cpulimits.apply if nfit else None,
+                                                initargs=(nfit,) if nfit else ())
             for f in [self.pool.submit(stream_fit.ping) for _ in range(int(workers))]:
                 f.result()
 
@@ -101,6 +109,8 @@ class StreamPose24:
             return self.poll()
         t_recv = int(fs.get("t_recv_ns") or self.clock())
         self.t_recv[i], self.ref[i] = t_recv, int(fs["ref_frame"])
+        if fs.get("t_capture_ns") is not None:
+            self.t_cap[i] = int(fs["t_capture_ns"])
         self.last_step = max(self.last_step, i)
         t0 = time.perf_counter_ns()
         frames = {}
@@ -195,6 +205,8 @@ class StreamPose24:
 
     def _launch(self, lo, start, stop, commit):
         win = _Window(self.k, start, stop, commit, self.t_recv.get(stop - 1, self.clock()))
+        if self.budget_ns is not None and (stop - 1) in self.t_cap:
+            win.behind = win.t_ready_ns - self.t_cap[stop - 1] > self.budget_ns
         self.k += 1
         t0 = time.perf_counter_ns()
         h0 = max(0, start - self.hist)
@@ -239,14 +251,14 @@ class StreamPose24:
             for pid, job in win.jobs.items():
                 if pid in win.status:
                     continue
-                wait = block and (self.budget_ns is None or self.late_policy == "use")
+                keep = self.late_policy == "use" or (self.late_policy == "behind" and win.behind)
+                wait = block and (self.budget_ns is None or keep)
                 res = job if isinstance(job, dict) else (job.result() if (job.done() or wait) else None)
                 if res is not None:
                     late = self.budget_ns is not None and res["t_done_ns"] - win.t_ready_ns > self.budget_ns
-                    win.status[pid] = ("late_used" if self.late_policy == "use" else "late") if late else "fitted"
+                    win.status[pid] = ("late_used" if keep else "late") if late else "fitted"
                     win.result[pid] = res
-                elif (self.budget_ns is not None and self.late_policy == "drop"
-                      and now - win.t_ready_ns > self.budget_ns):
+                elif self.budget_ns is not None and not keep and now - win.t_ready_ns > self.budget_ns:
                     win.status[pid] = "late"
         while self.inflight and len(self.inflight[0].status) == len(self.pids):
             self._resolve(self.inflight.pop(0))

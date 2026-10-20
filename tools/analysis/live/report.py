@@ -337,6 +337,11 @@ def _quality_lines(name, q):
     return L
 
 
+def _cpu_line(cfg):
+    from .cpulimits import describe
+    return describe(cfg.get("cpu_budget"))
+
+
 def render_run(run_dir, log=print) -> str:
     R = load_run(run_dir)
     cfg, S, rows, evs = R["cfg"], R["summary"], R["rows"], R["events"]
@@ -412,6 +417,7 @@ def render_run(run_dir, log=print) -> str:
           f"- warm-up {cfg['warmup']['seconds']} s ({cfg['warmup_steps']} steps); window {cfg['window']} / overlap "
           f"{cfg['overlap']} / history {cfg['history']} steps; fit budget {cfg['fit_budget_s']:.3f} s; "
           f"{cfg['workers']} fit workers",
+          f"- {_cpu_line(cfg)}; late fits: {cfg['stream'].get('late_policy', 'drop')}",
           f"- 2D: {cfg['rtmpose']['model']} {cfg['rtmpose']['mode']}, detector every {cfg['rtmpose']['det_every']}, "
           f"downscale {cfg['rtmpose']['downscale']}, device {cfg['device']}, engine {cfg['rtmpose'].get('engine', 'rtmlib')}"
           + (f", decoder {cfg['rtmpose'].get('decoder')}, short side {cfg['rtmpose'].get('decode_short_side') or 'full'}, "

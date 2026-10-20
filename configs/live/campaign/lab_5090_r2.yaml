@@ -1,0 +1,60 @@
+# v0.8.3 round 2 on the lab RTX 5090 PC (docs/setup/lab-tests.md § Round 2): the fixes from round 1
+# (docs/reports/v0.8.3-lab-tests.md) one at a time, then together, at 60 and 30 fps.
+#   python tools/live_run.py campaign run --plan lab_5090_r2 --group main  --unity-project <Unity project>  (Unity NOT playing)
+#   python tools/live_run.py campaign run --plan lab_5090_r2 --group unity --unity-project <Unity project>  (Unity in Play mode)
+# best_live now has warm-up 60 frames; the rtx5090 preset now has rtmpose.ep=trt, so CUDA tests say ep=cuda.
+# "full" = TensorRT pose model + CPU thread limits + late fits kept while the stream is behind.
+name: lab_5090_r2
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+
+tests:
+  # ---------------------------------------------------------------- 60 fps, one change at a time
+  - {id: R01_reference, note: "round-1 best_live (CUDA, no limits, late fits dropped), warm-up 60",
+     set: ["rtmpose.ep=cuda", "cpu.limits=false", "stream.late_policy=drop"]}
+  - {id: R02_threads, note: "+ CPU thread limits", set: ["rtmpose.ep=cuda", "cpu.limits=true", "stream.late_policy=drop"]}
+  - {id: R03_threads_behind, note: "+ late fits kept while behind",
+     set: ["rtmpose.ep=cuda", "cpu.limits=true", "stream.late_policy=behind"]}
+  - {id: R04_full, repeat: 2, note: "+ TensorRT pose model (= full)", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind"]}
+  - {id: R05_full_nearest, repeat: 2, note: "full + nearest-frame sync", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest"]}
+  - {id: R06_full_nvdec, note: "full + GPU video decoding", requires: [tensorrt, PyNvVideoCodec],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "rtmpose.decoder=nvcodec"]}
+  - {id: R07_full_nearest_nvdec, note: "full + nearest + GPU decoding", requires: [tensorrt, PyNvVideoCodec],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest", "rtmpose.decoder=nvcodec"]}
+  - {id: R08_full_use, note: "full, late fits always waited for (use)", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=use"]}
+  - {id: R09_full_nearest_asfast, note: "full + nearest, as fast as possible (ceiling)", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest", "pace=asfast"]}
+  # ---------------------------------------------------------------- thread budgets (full + nearest)
+  - {id: R10_threads_2, note: "full + nearest, 2 threads everywhere", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest", "cpu.main_threads=2",
+           "cpu.pose2d_threads=2", "cpu.decode_threads=2", "cpu.fit_threads=2"]}
+  - {id: R11_threads_8, note: "full + nearest, 8 threads everywhere", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest", "cpu.main_threads=8",
+           "cpu.pose2d_threads=8", "cpu.decode_threads=8", "cpu.fit_threads=8"]}
+  # ---------------------------------------------------------------- 30 fps
+  - {id: R12_30_full, repeat: 2, note: "30 fps, full", requires: [tensorrt],
+     set: ["output_fps=30", "rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind"]}
+  - {id: R13_30_full_nearest, note: "30 fps, full + nearest", requires: [tensorrt],
+     set: ["output_fps=30", "rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest"]}
+  # ---------------------------------------------------------------- 28 s and pure_live
+  - {id: R14_long60_full_nearest, note: "60 fps full + nearest over 2-30 s", timeout_s: 3600, requires: [tensorrt],
+     set: ["section_s=[2.0, 30.0]", "rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest"]}
+  - {id: R15_long30_full, note: "30 fps full over 2-30 s", timeout_s: 3600, requires: [tensorrt],
+     set: ["section_s=[2.0, 30.0]", "output_fps=30", "rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind"]}
+  - {id: R16_pure_live_full, settings: pure_live, note: "pure_live (warm-up 120) + full + nearest", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest"]}
+
+  # ---------------------------------------------------------------- with Unity in Play mode
+  - {id: V01_full_nearest_unity, group: unity, stage: U, note: "R05 with Unity", compare_to: R05_full_nearest,
+     requires: [tensorrt], set: ["rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest"]}
+  - {id: V02_30_full_unity, group: unity, stage: U, note: "R12 with Unity", compare_to: R12_30_full, requires: [tensorrt],
+     set: ["output_fps=30", "rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind"]}
+  - {id: V03_long60_unity, group: unity, stage: U, note: "R14 with Unity", compare_to: R14_long60_full_nearest,
+     timeout_s: 3600, requires: [tensorrt],
+     set: ["section_s=[2.0, 30.0]", "rtmpose.ep=trt", "cpu.limits=true", "stream.late_policy=behind", "sync.mode=nearest"]}

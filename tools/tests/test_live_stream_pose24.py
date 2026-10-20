@@ -10,7 +10,7 @@ PELVIS = sk.SMPL28_NAMES.index("pelvis")
 LW = sk.SMPL28_NAMES.index("left_wrist")
 
 
-def _run(n=80, budget_s=None, workers=0, offsets=None, drop_steps=(), skip_steps=(), stream=None):
+def _run(n=80, budget_s=None, workers=0, offsets=None, drop_steps=(), skip_steps=(), stream=None, capture_lag_s=None):
     cams, players = ls.scene(F=2 * n + 4)
     cfg = ls.cfg(n_steps=n)
     cfg["stream"].update(stream or {})
@@ -24,6 +24,8 @@ def _run(n=80, budget_s=None, workers=0, offsets=None, drop_steps=(), skip_steps
         if i in skip_steps:
             continue
         fs = ls.frameset(i, r, cams, players, offsets=cfg["offsets"], drop=("P2",) if i in drop_steps else ())
+        if capture_lag_s is not None:              # captured this long before it reaches the core (stream behind)
+            fs["t_capture_ns"] = s.clock() - int(capture_lag_s * 1e9)
         outs += s.push(fs)
     outs += s.flush()
     s.close()
@@ -142,3 +144,13 @@ def test_late_policy_use_keeps_late_fits():
     wins = [e for e in events if e["ev"] == "window"]
     assert wins and all(set(w["status"].values()) == {"late_used"} for w in wins)
     assert all(o["quality"] == outputs.FITTED for o in outs[30:])
+
+
+def test_late_policy_behind_keeps_fits_only_while_the_stream_is_behind():
+    _, _, outs, events = _run(n=80, budget_s=0.0, stream={"late_policy": "behind"}, capture_lag_s=10.0)
+    wins = [e for e in events if e["ev"] == "window"]
+    assert wins and all(set(w["status"].values()) == {"late_used"} for w in wins)       # behind: kept
+    assert all(o["quality"] == outputs.FITTED for o in outs[30:])
+    _, _, outs, events = _run(n=80, budget_s=0.0, stream={"late_policy": "behind"}, capture_lag_s=-10.0)
+    wins = [e for e in events if e["ev"] == "window"]
+    assert wins and all("late_used" not in w["status"].values() for w in wins)          # on time: dropped

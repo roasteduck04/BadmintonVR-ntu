@@ -259,3 +259,29 @@ def test_detector_may_stay_on_cuda_but_the_pose_model_must_build(tmp_path, monke
     monkeypatch.setattr(pf, "trt_session", fail_pose)
     with pytest.raises(pf.TensorRTUnavailable, match="pose.onnx"):
         pf.trt_models(Sol(), rc, batch=32, in_hw=(384, 288))
+
+
+def test_cpu_budget_splits_the_cores_and_is_off_by_default():
+    from analysis.live import cpulimits
+    cfg = {"views": ["a", "b", "c"], "workers": 2, "cpu": {"limits": True}}
+    assert cpulimits.budget(cfg, n_cpu=48) == {"main": 6, "pose2d": 4, "decode": 4, "fit": 6, "cpus": 48}
+    assert cpulimits.budget(cfg, n_cpu=8) == {"main": 1, "pose2d": 1, "decode": 1, "fit": 1, "cpus": 8}
+    assert cpulimits.budget({**cfg, "cpu": {"limits": True, "fit_threads": 3}}, n_cpu=48)["fit"] == 3
+    assert cpulimits.budget({**cfg, "cpu": {"limits": False}}) is None
+    off = live_config.load("singles_05x", preset="rtx5090", probe=_probe())
+    assert off["cpu_budget"] is None and off["rtmpose"]["ep"] == "trt"          # lab preset: TensorRT on
+    on = live_config.load("singles_05x", preset="rtx5090", overrides=["cpu.limits=true"], probe=_probe())
+    assert set(on["cpu_budget"]) == {"main", "pose2d", "decode", "fit", "cpus"}
+    import os
+    before = os.environ.get("OMP_NUM_THREADS")
+    with cpulimits.child_env(3):
+        assert os.environ["OMP_NUM_THREADS"] == "3" and os.environ["OPENBLAS_NUM_THREADS"] == "3"
+    assert os.environ.get("OMP_NUM_THREADS") == before
+    with pytest.raises(ValueError, match="late_policy"):
+        live_config.load("singles_05x", preset="rtx5090", overrides=["stream.late_policy=sometimes"], probe=_probe())
+
+
+def test_round2_plan_loads():
+    p = campaign.load_plan(campaign.plan_path("lab_5090_r2"))
+    ids = [t["id"] for t in p["expanded"]]
+    assert "R04_full_r2" in ids and "V01_full_nearest_unity" in ids and len(ids) == len(set(ids))

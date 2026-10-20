@@ -64,6 +64,12 @@ FIELDS = [
     {"group": "speed2d", "key": "rtmpose.decode_short_side", "label": "Frame size", "kind": "choice", "live_only": True,
      "options": [[None, "full 4K"], [1080, "1080 px"], [720, "720 px"]],
      "help": "Shrink while decoding. 1080 costs ~1 px of 2D accuracy; 720 ~2 px for almost no gain."},
+    {"group": "speed2d", "key": "rtmpose.ep", "label": "Pose model runs on", "kind": "choice", "live_only": True,
+     "options": [["cuda", "CUDA"], ["trt", "TensorRT FP16 (needs TensorRT)"]],
+     "help": "TensorRT halves the pose model's time on the lab RTX 5090 at the same accuracy; the detector stays on CUDA."},
+    {"group": "speed2d", "key": "cpu.limits", "label": "Limit CPU threads per process", "kind": "bool",
+     "help": "Stops the 2D, decoding and body-fit processes fighting over the cores (lab: 2D 74 ms per frame in a stream "
+             "vs 21 ms alone)."},
     {"group": "speed2d", "key": "rtmpose.decoder", "label": "Video reader", "kind": "choice", "live_only": True,
      "options": [["pyav", "pyav"], ["cv2", "OpenCV"], ["ffmpeg", "ffmpeg"], ["nvcodec", "GPU (PyNvVideoCodec)"]],
      "help": "pyav with 1080 px was fastest on the RTX 3060 PC."},
@@ -116,8 +122,10 @@ FIELDS = [
     {"group": "fit", "key": "stream.fit_every", "label": "Fit every", "kind": "int", "unit": "windows",
      "help": "2 = every second window from smoothing only (cheaper, worse: +0.4 cm, +1 deg)."},
     {"group": "fit", "key": "stream.late_policy", "label": "A late fit", "kind": "choice",
-     "options": [["drop", "is dropped (delay stays short)"], ["use", "is waited for (delay grows)"]],
-     "help": "Real time: drop keeps the broadcast on time; use keeps the accuracy."},
+     "options": [["drop", "is dropped (delay stays short)"], ["use", "is waited for (delay grows)"],
+                 ["behind", "is waited for only when the stream is behind anyway"]],
+     "help": "Real time: drop keeps the broadcast on time; use keeps the accuracy; behind (v0.8.3) keeps fits that cost "
+             "no extra delay (lab: dropped fits doubled the error, 2.6 vs 1.3 cm)."},
     {"group": "fit", "key": "stream.workers", "label": "Fit processes", "kind": "int",
      "help": "0 = in the main process. 2 = one per player."},
     # fallback

@@ -795,6 +795,9 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
     def put(v, msg):
         queues[v].put(msg)
 
+    from .cpulimits import apply as _cpu_apply
+    _cpu_apply(rcfg.get("_threads"))
+
     def load():                      # model + readers + warm-up (under the TensorRT build lock)
         t_load = time.monotonic_ns()
         try:

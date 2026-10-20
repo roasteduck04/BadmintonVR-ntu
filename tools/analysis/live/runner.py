@@ -123,6 +123,11 @@ class Runner:
         with open(os.path.join(self.run_dir, "machine.json"), "w", encoding="utf-8") as fh:
             json.dump(mach, fh, indent=1)
         log(f"  machine: {machine.short(mach)}")
+        from . import cpulimits
+        cb = c.get("cpu_budget")
+        if cb:
+            cpulimits.apply(cb["main"])
+        log(f"  {cpulimits.describe(cb)}")
         self.tl = TimingLog(os.path.join(self.run_dir, "timing.jsonl"), "runner")
         t_setup = time.perf_counter()
         cams = self.cams or pv.load_cams(c["cam_paths"])
@@ -176,6 +181,7 @@ class Runner:
                 self.tl.write({"ev": "frames", "step": i, "ref_frame": st["ref_frame"], "t_capture_ns": t_capture,
                                "t_avail_ns": t_av, "t_2d_done_ns": t_2d, "t_push_ns": t_push, "views": per_view})
                 self._emit(self.core.push({"step": i, "ref_frame": st["ref_frame"], "t_recv_ns": t_push,
+                                           "t_capture_ns": t_capture,
                                            "views": views}), cap)
                 if c["offsets_source"] == "auto" and sync_info is None and i == c["warmup_steps"] - 1:
                     sync_info = estimate_offsets(self.core, c, i + 1, log)
