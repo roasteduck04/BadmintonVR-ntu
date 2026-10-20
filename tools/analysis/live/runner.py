@@ -133,7 +133,9 @@ class Runner:
         self.core = StreamPose24(c, cams, budget_s=budget, workers=c["workers"], events=self.tl.write,
                                  clock=self.clock)
         sides = self.core.tracker.sides
-        image_size = {v: [c["source"][v]["width"], c["source"][v]["height"]] for v in c["views"]}
+        k_cal = c.get("video_to_calib") or {}      # the 2D is in calibration pixels (a smaller video copy is rescaled)
+        image_size = {v: [int(round(c["source"][v]["width"] * k_cal.get(v, 1.0))),
+                          int(round(c["source"][v]["height"] * k_cal.get(v, 1.0)))] for v in c["views"]}
         self.writer = framewriter.FrameWriter(self.run_dir, c, docwriter.header(c, cams, sides, image_size), sides,
                                               write_frames=c["output"]["frames"],
                                               background=bool(c["output"].get("background_writer", True)),

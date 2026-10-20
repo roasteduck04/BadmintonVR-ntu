@@ -14,8 +14,14 @@ DEFAULTS = os.path.join(ROOT, "configs", "live", "defaults.yaml")
 
 
 def fake_probe(fps=60.0, n=1877):
-    return lambda c: {v: {"fps": fps, "frame_count": n, "width": 2160, "height": 3840, "source": "x"}
-                      for v in c["views"]}
+    """Every view at its calibration's size (portrait or landscape, v0.8.3 checks it against the calibration)."""
+    def probe(c):
+        out = {}
+        for v in c["views"]:
+            w, h = config.calib_size(c["cam_paths"][v]) or (2160, 3840)
+            out[v] = {"fps": fps, "frame_count": n, "width": w, "height": h, "source": "x"}
+        return out
+    return probe
 
 
 def load(overrides=None, preset=None, probe=None):

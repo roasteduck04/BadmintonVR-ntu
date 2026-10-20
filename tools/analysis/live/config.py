@@ -7,7 +7,12 @@ Every length in seconds is converted to steps for the chosen output_fps, so 30 a
 
 The resolved dict keeps the flat keys the streaming core reads (views, ref_frames, fps, warmup_steps, window, overlap,
 history, offsets, sync, stride, time_ref, out_clip, timeline_frames, kp2d_paths, cam_paths, ...) next to the nested
-sections (tracker, stream, fallback, ...)."""
+sections (tracker, stream, fallback, ...).
+
+v0.8.3: video_variant (null | "720p" | "1080p" | any tag) streams a smaller copy of each camera video made by
+`live_run.py transcode` (<video folder>_<tag>/<video name>.mp4, every frame kept, same fps). video_to_calib {view:
+calibration width / video width} is worked out for every live run from the calibration file's size, so the 2D comes
+back in calibration pixels whatever the video size (the fast engine only)."""
 from __future__ import annotations
 
 import copy
@@ -28,6 +33,25 @@ PACES = ("realtime", "asfast")
 SYNC_MODES = ("interp", "nearest")
 OFFSET_MODES = ("auto", "file", "zero")
 RTM_MODES = ("performance", "balanced", "lightweight")
+RTM_EPS = ("cuda", "trt")
+
+
+def variant_video(path, variant):
+    """<folder>/<name>.<ext> -> <folder>_<variant>/<name>.mp4 (the transcode output of `live_run.py transcode`)."""
+    if not path or not variant:
+        return path
+    d, base = os.path.split(path)
+    return os.path.join(d.rstrip("/\\") + "_" + str(variant), os.path.splitext(base)[0] + ".mp4")
+
+
+def calib_size(cam_path):
+    """(width, height) the calibration was made at, or None if the file does not say."""
+    try:
+        with open(cam_path, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return int(d["width"]), int(d["height"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 RTM_MODELS = ("wholebody", "body", "body_feet")
 RTM_ENGINES = ("rtmlib", "fast")
 RTM_DECODERS = ("cv2", "pyav", "ffmpeg", "nvdec", "nvcodec")
@@ -184,7 +208,10 @@ def resolve(c, probe=probe_sources) -> dict:
     if c["mode"] != "singles":
         raise ValueError(f"live-frames handles singles only (clip mode {c['mode']!r})")
     videos = base.get("videos") or entry.get("videos") or {}
-    c["videos"] = {v: videos.get(v) for v in c["views"]}
+    c["video_variant"] = c.get("video_variant") or None
+    if c["video_variant"] and c["backend"] != "live":
+        raise ValueError("video_variant needs backend live (the stored 2D was made from the original videos)")
+    c["videos"] = {v: variant_video(videos.get(v), c["video_variant"]) for v in c["views"]}
     for k, allowed in (("backend", BACKENDS), ("device", DEVICES), ("pace", PACES)):
         _check_choice(k, c[k], allowed)
     _check_choice("sync.mode", c["sync"]["mode"], SYNC_MODES)
@@ -195,6 +222,10 @@ def resolve(c, probe=probe_sources) -> dict:
     rp.setdefault("decoder", "cv2")
     _check_choice("rtmpose.engine", rp["engine"], RTM_ENGINES)
     _check_choice("rtmpose.decoder", rp["decoder"], RTM_DECODERS)
+    rp.setdefault("ep", "cuda")
+    _check_choice("rtmpose.ep", rp["ep"], RTM_EPS)
+    if rp["ep"] == "trt" and rp["engine"] != "fast":
+        raise ValueError("rtmpose.ep=trt needs rtmpose.engine=fast")
     if rp["engine"] == "rtmlib":
         fast_only = [k for k, dflt in (("decoder", "cv2"), ("decode_short_side", None), ("batch_views", False),
                                        ("det", None), ("court_filter_m", None)) if rp.get(k, dflt) != dflt]
@@ -218,8 +249,26 @@ def resolve(c, probe=probe_sources) -> dict:
     c["kp2d_paths"] = {v: os.path.join(data, "pose2d", f"{v}_kp2d.json") for v in c["views"]}
     paths["sync_file"] = paths["sync_file"].format(data_dir=data, clip=c["clip"])
 
-    src = probe(c)
+    try:
+        src = probe(c)
+    except ValueError as e:
+        if c["video_variant"] and "no video" in str(e):
+            raise ValueError(f"{e} - make the {c['video_variant']} copies first: python tools/live_run.py transcode "
+                             f"--clip {c['clip']} --short-side <pixels> --tag {c['video_variant']}") from None
+        raise
     c["source"] = src
+    c["video_to_calib"] = {}
+    for v in c["views"]:
+        k = 1.0
+        cs = calib_size(c["cam_paths"][v]) if c["backend"] == "live" else None
+        if cs and src[v].get("width"):
+            k = cs[0] / float(src[v]["width"])
+            if abs(cs[1] - k * float(src[v]["height"])) > max(2.0, 0.002 * cs[1]):
+                raise ValueError(f"{v}: video {src[v]['width']}x{src[v]['height']} is not the calibration's "
+                                 f"{cs[0]}x{cs[1]} shape (different aspect ratio)")
+        c["video_to_calib"][v] = round(k, 6)
+    if any(abs(k - 1.0) > 1e-6 for k in c["video_to_calib"].values()) and rp["engine"] != "fast":
+        raise ValueError("a video smaller than its calibration needs rtmpose.engine=fast (keypoints are rescaled there)")
     fps_set = {round(s["fps"], 3) for s in src.values()}
     if len(fps_set) != 1:
         raise ValueError(f"views have different frame rates {fps_set}")

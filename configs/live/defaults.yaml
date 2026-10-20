@@ -10,6 +10,7 @@ time_ref: null                  # reference view (default: registry time_ref if 
 section_s: [0.0, null]          # [start, end] in seconds of the reference view; null end = to the end of the video
 output_fps: 30                  # output frames per second; must divide the source fps (30 or 60 for 60 fps video)
 out_clip: "{clip}_{nviews}cam_live{fps}"   # final analysis file name: <out_clip>_pose24.analysis.json
+video_variant: null             # v0.8.3: stream <video folder>_<tag>/*.mp4 copies (e.g. 720p) made by live_run.py transcode
 
 backend: cached                 # cached = replay data/pose2d/<view>_kp2d.json frame by frame | live = video -> rtmlib
 device: cuda                    # live backend: cuda | cpu

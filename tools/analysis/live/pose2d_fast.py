@@ -9,7 +9,15 @@ Readers (rtmpose.decoder), all forward-only (frames must not go back) and all ab
 - ffmpeg an ffmpeg process (system ffmpeg, else imageio-ffmpeg) writing raw BGR frames scaled by its own filter threads
 - nvdec  ffmpeg with -hwaccel cuda: NVDEC decode + scale_cuda on the GPU (needs an ffmpeg built with CUDA)
 - nvcodec PyNvVideoCodec (pip): NVDEC decode, frames copied to the host, resized with cv2
-Keypoints always come back in full-resolution source pixels (divided by the reader's scale).
+Keypoints always come back in full-resolution source pixels (divided by the reader's scale), and in CALIBRATION pixels
+when the video is a smaller copy of the calibrated one (rtmpose._video_to_calib {view: calib width / video width}, set by
+the live config for e.g. a 720p transcode of a 4K camera; the court filter works in the same pixels).
+
+Execution provider (rtmpose.ep): cuda (default) | trt = onnxruntime's TensorRT provider for both models, FP16 with
+rtmpose.trt_fp16 (default true), engines + timing cache under rtmpose.trt_cache (default ~/.cache/badmintonvr/trt/<fp16|
+fp32>; the first run builds them, minutes) and one optimisation profile for the pose model's batch axis (1..pose_batch).
+TensorRT's libraries come from the pip wheel (tensorrt-cu13 / tensorrt: preload_tensorrt). If TensorRT cannot be used
+the session falls back to CUDA; the worker reports the providers each model really got.
 
 Pose engine (FastPose): the rtmlib models (YOLOX detector + RTMPose / RTMW), but
 - the detector runs every rtmpose.det_every frames per camera; between detections each person's box comes from its
@@ -326,6 +334,105 @@ def kp_map(model):
     return np.array([HALPE26_TO_WB.get(i, -1) for i in range(26)])
 
 
+TRT_CACHE = os.path.join("~", ".cache", "badmintonvr", "trt")
+
+
+def preload_tensorrt():
+    """Load TensorRT's shared libraries from its pip wheel (tensorrt_libs, the tensorrt-cu1x packages) with global
+    symbols, so onnxruntime's TensorRT provider finds them without LD_LIBRARY_PATH. Returns the TensorRT version
+    (None if the wheel says nothing); raises RuntimeError when TensorRT is not installed."""
+    import ctypes
+    import glob
+    import importlib
+    version, dirs = None, []
+    for mod in ("tensorrt_libs", "tensorrt", "tensorrt_bindings"):
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        version = version or getattr(m, "__version__", None)
+        if getattr(m, "__file__", None):
+            dirs.append(os.path.dirname(m.__file__))
+    libs = []
+    for d in dirs:
+        for pat in ("libnvinfer.so*", "libnvinfer_plugin.so*", "libnvonnxparser.so*", "nvinfer*.dll", "nvonnxparser*.dll"):
+            libs += sorted(glob.glob(os.path.join(d, pat)))
+    if not libs:
+        raise RuntimeError("TensorRT is not installed in this Python (pip install tensorrt-cu13, see docs/setup/lab-tests.md)")
+    order = lambda q: (0 if "nvinfer." in q or q.endswith("nvinfer.so") else 1 if "plugin" in q else 2)  # noqa: E731
+    loaded = set()
+    for q in sorted(libs, key=order):
+        base = os.path.basename(q).split(".so")[0]
+        if base in loaded:
+            continue
+        try:
+            ctypes.CDLL(q, mode=getattr(ctypes, "RTLD_GLOBAL", 0))
+            loaded.add(base)
+        except OSError:
+            pass
+    if not any("nvinfer" in b and "plugin" not in b for b in loaded):
+        raise RuntimeError(f"TensorRT libraries found but libnvinfer did not load ({libs[:3]})")
+    return version
+
+
+def _shape_str(name, shape):
+    return f"{name}:" + "x".join(str(int(d)) for d in shape)
+
+
+def trt_session(onnx_path, rcfg, shapes=None):
+    """An onnxruntime session with TensorRT first (then CUDA, CPU). shapes {input name: (min, opt, max) shapes} gives
+    an optimisation profile for dynamic axes (one engine for every batch size instead of one per size)."""
+    import onnxruntime as ort
+    fp16 = bool(rcfg.get("trt_fp16", True))
+    cache = os.path.expanduser(os.path.join(rcfg.get("trt_cache") or TRT_CACHE, "fp16" if fp16 else "fp32"))
+    os.makedirs(cache, exist_ok=True)
+    opts = {"trt_fp16_enable": str(fp16), "trt_engine_cache_enable": "True", "trt_engine_cache_path": cache,
+            "trt_timing_cache_enable": "True", "trt_timing_cache_path": cache,
+            "trt_max_workspace_size": str(int(rcfg.get("trt_workspace_gb", 4)) << 30)}
+    if shapes:
+        opts["trt_profile_min_shapes"] = ",".join(_shape_str(n, s[0]) for n, s in shapes.items())
+        opts["trt_profile_opt_shapes"] = ",".join(_shape_str(n, s[1]) for n, s in shapes.items())
+        opts["trt_profile_max_shapes"] = ",".join(_shape_str(n, s[2]) for n, s in shapes.items())
+    prov = [("TensorrtExecutionProvider", opts), "CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ort.InferenceSession(onnx_path, providers=prov)
+
+
+class trt_lock:
+    """Cross-process lock in the TensorRT cache folder (Linux flock; a no-op elsewhere): the per-camera 2D processes
+    would otherwise all build the same engines into the same cache at once on the first TensorRT run - one builds,
+    the others wait and then load the cached engines."""
+
+    def __init__(self, rcfg):
+        self.on = rcfg.get("ep") == "trt"
+        self.path = os.path.expanduser(os.path.join(rcfg.get("trt_cache") or TRT_CACHE, ".build.lock"))
+        self.fh = None
+
+    def __enter__(self):
+        if not self.on:
+            return self
+        try:
+            import fcntl
+        except ImportError:
+            return self
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fh = open(self.path, "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fh is not None:
+            import fcntl
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+            self.fh.close()
+            self.fh = None
+        return False
+
+
+def _fixed(shape, fallback):
+    """A model input shape with every dynamic axis replaced from fallback."""
+    return tuple(int(d) if isinstance(d, int) and d > 0 else int(f) for d, f in zip(shape, fallback))
+
+
 def providers_of(sol):
     out = {}
     for name in ("det_model", "pose_model"):
@@ -393,9 +500,23 @@ class FastPose:
         self.map = kp_map(self.model)
         self.mode = rcfg.get("mode", "performance")
         self.det_every = max(1, int(rcfg.get("det_every", 1)))
+        self.ep = rcfg.get("ep", "cuda") if device == "cuda" else "cpu"
         self.batch = max(1, int(rcfg.get("pose_batch", 32)))
+        self.trt_version = None
+        if self.ep == "trt":                  # rebuild both sessions on TensorRT (falls back to CUDA if it cannot)
+            self.trt_version = preload_tensorrt()
+            di = self.det.session.get_inputs()[0]
+            dw, dh = (int(x) for x in getattr(self.det, "model_input_size", (640, 640)))
+            dshape = _fixed(di.shape, (1, 3, dh, dw))
+            self.det.session = trt_session(self.det.onnx_model, rcfg, {di.name: (dshape, dshape, dshape)})
+            pi = self.pose.session.get_inputs()[0]
+            base = (1, 3, self.in_h, self.in_w)
+            opt_b = min(self.batch, max(1, int(rcfg.get("trt_opt_batch", 8))))
+            self.pose.session = trt_session(self.pose.onnx_model, rcfg, {pi.name: (
+                base, (opt_b,) + base[1:], (self.batch,) + base[1:])})
+            self.providers = providers_of(self.sol)
         search = rcfg.get("cudnn_search")
-        if search and device == "cuda":       # rebuild both sessions with this cuDNN algorithm search mode
+        if search and device == "cuda" and self.ep != "trt":   # rebuild both sessions with this cuDNN algorithm search
             import onnxruntime as ort
             prov = [("CUDAExecutionProvider", {"cudnn_conv_algo_search": str(search).upper()}), "CPUExecutionProvider"]
             self.det.session = ort.InferenceSession(self.det.onnx_model, providers=prov)
@@ -592,40 +713,51 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
     def put(v, msg):
         queues[v].put(msg)
 
-    t_load = time.monotonic_ns()
-    try:
-        check_cuda(device)
-        engine = FastPose(rcfg, device)
-    except Exception as e:  # noqa: BLE001 - reported to the scheduler, which stops the run
-        for v in views:
-            put(v, ("error", v, f"{type(e).__name__}: {e}"))
-        return
-    load_ns = time.monotonic_ns() - t_load
-    short = rcfg.get("decode_short_side")
-    kind = rcfg.get("decoder", "cv2")
-    readers = {}
-    try:
-        for v in views:
-            first = plans[v][0] if plans[v] else 0
-            readers[v] = open_reader(kind, paths[v], first, fps, short, rcfg.get("decode_threads", 0))
-    except Exception as e:  # noqa: BLE001
-        for v in views:
-            put(v, ("error", v, f"{kind} reader: {type(e).__name__}: {e}"))
-        return
-    for v in views:
-        engine.set_view(v, readers[v].scale, readers[v].src_h)
-    warm_s, warm_sizes = 0.0, []
-    if rcfg.get("warmup", True):
+    def load():                      # model + readers + warm-up (under the TensorRT build lock)
+        t_load = time.monotonic_ns()
         try:
-            warm_s, warm_sizes = engine.warmup((readers[views[0]].out_h, readers[views[0]].out_w))
+            check_cuda(device)
+            engine = FastPose(rcfg, device)
+        except Exception as e:  # noqa: BLE001 - reported to the scheduler, which stops the run
+            for v in views:
+                put(v, ("error", v, f"{type(e).__name__}: {e}"))
+            return None
+        load_ns = time.monotonic_ns() - t_load
+        short = rcfg.get("decode_short_side")
+        kind = rcfg.get("decoder", "cv2")
+        readers = {}
+        try:
+            for v in views:
+                first = plans[v][0] if plans[v] else 0
+                readers[v] = open_reader(kind, paths[v], first, fps, short, rcfg.get("decode_threads", 0))
         except Exception as e:  # noqa: BLE001
             for v in views:
-                put(v, ("error", v, f"warm-up: {type(e).__name__}: {e}"))
-            return
+                put(v, ("error", v, f"{kind} reader: {type(e).__name__}: {e}"))
+            return None
+        k_cal = {v: float((rcfg.get("_video_to_calib") or {}).get(v, 1.0)) for v in views}   # calib px per video px
+        for v in views:
+            engine.set_view(v, readers[v].scale / k_cal[v], readers[v].src_h * k_cal[v])
+        warm_s, warm_sizes = 0.0, []
+        if rcfg.get("warmup", True):
+            try:
+                warm_s, warm_sizes = engine.warmup((readers[views[0]].out_h, readers[views[0]].out_w))
+            except Exception as e:  # noqa: BLE001
+                for v in views:
+                    put(v, ("error", v, f"warm-up: {type(e).__name__}: {e}"))
+                return None
+        return engine, readers, k_cal, load_ns, warm_s, warm_sizes, kind
+
+    with trt_lock(rcfg):
+        loaded = load()
+    if loaded is None:
+        return
+    engine, readers, k_cal, load_ns, warm_s, warm_sizes, kind = loaded
     for v in views:
         put(v, ("ready", v, {"model_load_ns": load_ns, "court_filter": engine.court is not None, "warmup_s": warm_s,
                              "padded_sizes": warm_sizes if engine.pad else None, "providers": engine.providers, "engine": "fast",
                              "decoder": kind, "decode_size": [readers[v].out_w, readers[v].out_h],
+                             "video_size": [readers[v].src_w, readers[v].src_h], "video_to_calib": k_cal[v],
+                             "ep": engine.ep, "trt_version": engine.trt_version,
                              "batch_views": len(views) > 1, "model": engine.model}))
     while not go_ev.wait(0.05):
         if stop_ev.is_set():
@@ -692,7 +824,7 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                 v, f = key
                 engine.finish(v, kps[a:a + n])
                 img, dec_ns, wait_ns = got[key]
-                inv = 1.0 / readers[v].scale
+                inv = k_cal[v] / readers[v].scale
                 dets = engine.to_raw(kps[a:a + n], scs[a:a + n], inv) if img is not None else []
                 put(v, ("frame", v, f, dets, {
                     "t_avail_ns": t_av, "t_done_ns": time.monotonic_ns(), "decode_ns": dec_ns, "wait_ns": wait_ns,

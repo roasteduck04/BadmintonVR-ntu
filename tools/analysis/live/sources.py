@@ -197,9 +197,12 @@ class VideoRtmlibSource:
         c = self.cfg
         rc = dict(c["rtmpose"])
         realtime = c["pace"] == "realtime"
+        if rc.get("ep") == "trt":           # a first TensorRT run builds its engines before "ready" (can take minutes)
+            ready_timeout_s = max(ready_timeout_s, 3600)
         if rc.get("engine", "rtmlib") == "fast":
             from . import pose2d_fast
             rc["_cam_paths"] = dict(c["cam_paths"])
+            rc["_video_to_calib"] = dict(c.get("video_to_calib") or {})
             groups = [list(c["views"])] if rc.get("batch_views") else [[v] for v in c["views"]]
             for v in c["views"]:
                 # one process feeding every camera's queue: unbounded, else a full queue of one camera blocks the

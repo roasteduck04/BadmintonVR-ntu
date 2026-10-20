@@ -13,6 +13,11 @@
                                                      # v0.8.1: the live 2D step alone, as fast as possible + quality vs
                                                      # the offline 2D (runs/bench2d/<date>_<host>_<tag>/bench.md)
     python tools/live_run.py bench2d-compare runs/bench2d/<a> runs/bench2d/<b> ... [--out runs/bench2d/compare.md]
+    python tools/live_run.py bench2d-rescore runs/bench2d/<a> ...   # v0.8.3: score benches made where no offline 2D was
+    python tools/live_run.py transcode --clip singles_05x --short-side 720 [--tag 720p]   # v0.8.3: real 720p video copies
+                                                     (stream them with --set video_variant=720p)
+    python tools/live_run.py campaign run --plan lab_5090 --group main|unity [--unity-project PATH]   # v0.8.3 test
+    python tools/live_run.py campaign pack|report <folder or zip>        campaign (analysis/live/campaign.py)
 
 --clip is a file in configs/live/ (or a path), --preset one in configs/live/presets/ (or a path); every key of
 configs/live/defaults.yaml can be changed with --set key.sub=value (repeatable). --dry-run prints the resolved config.
@@ -41,7 +46,11 @@ class Tee:
 
     def __call__(self, *a):
         msg = " ".join(str(x) for x in a)
-        print(msg, flush=True)
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:          # a Windows console code page without the character (the log file keeps it)
+            enc = sys.stdout.encoding or "ascii"
+            print(msg.encode(enc, "replace").decode(enc), flush=True)
         self.fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
 
 
@@ -187,6 +196,34 @@ def cmd_bench2d_compare(a):
     print(bench2d.compare(a.runs, out=a.out))
 
 
+def cmd_bench2d_rescore(a):
+    from analysis.live import bench2d
+    for rd in a.runs:
+        bench2d.rescore(rd)
+
+
+def cmd_transcode(a):
+    from analysis.live import transcode
+    cfg = live_config.load(a.clip, preset=a.preset, overrides=list(a.set or []) + ["backend=live", "video_variant=null"])
+    views = a.views.split(",") if a.views else None
+    for r in transcode.transcode_clip(cfg, a.short_side, tag=a.tag, views=views, codec=a.codec, crf=a.crf,
+                                      force=a.force):
+        print(f"{r['view']}: {r['path']}")
+
+
+def cmd_campaign(a):
+    from analysis.live import campaign
+    if a.action == "run":
+        if not a.plan:
+            raise SystemExit("campaign run needs --plan")
+        campaign.run_campaign(a.plan, group=a.group, unity_dir=a.unity_project, only=a.only,
+                              retry_failed=a.retry_failed, dry_run=a.dry_run)
+    elif a.action == "pack":
+        print(campaign.pack(a.target))
+    elif a.action == "report":
+        print(campaign.report(a.target, out=a.out))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python tools/live_run.py", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -234,6 +271,31 @@ def main(argv=None):
     p.add_argument("runs", nargs="+")
     p.add_argument("--out")
     p.set_defaults(fn=cmd_bench2d_compare)
+    p = sub.add_parser("bench2d-rescore", help="score bench2d folders against this machine's offline 2D (dets.npz)")
+    p.add_argument("runs", nargs="+")
+    p.set_defaults(fn=cmd_bench2d_rescore)
+    p = sub.add_parser("transcode", help="smaller copies of the clip's videos (e.g. 720p), every frame kept")
+    p.add_argument("--clip", required=True)
+    p.add_argument("--preset")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE")
+    p.add_argument("--short-side", type=int, required=True, help="pixels of the shorter side (720 = 720p)")
+    p.add_argument("--tag", help="folder suffix / video_variant name (default <short-side>p)")
+    p.add_argument("--views", help="comma-separated views (default: the clip's live views)")
+    p.add_argument("--codec", default="auto", help="auto (libx264, else h264_nvenc, else mpeg4) or an encoder name")
+    p.add_argument("--crf", type=int, default=18)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_transcode)
+    p = sub.add_parser("campaign", help="v0.8.3 test campaign: run | pack | report")
+    p.add_argument("action", choices=("run", "pack", "report"))
+    p.add_argument("target", nargs="?", help="pack / report: the campaign folder or its zip")
+    p.add_argument("--plan", help="run: configs/live/campaign/<name>.yaml (name or path)")
+    p.add_argument("--group", default="main", choices=("main", "unity", "all"))
+    p.add_argument("--unity-project", help="run: the Unity project (results in its runs/campaign/; heartbeat check)")
+    p.add_argument("--only", nargs="+", help="run: stages (A B U), test ids or base ids")
+    p.add_argument("--retry-failed", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--out", help="report: summary markdown path")
+    p.set_defaults(fn=cmd_campaign)
     p = sub.add_parser("sync-file", help="write data/calib/<clip>_sync.json from an analysis doc's offsets")
     p.add_argument("--clip", required=True)
     p.add_argument("--preset")

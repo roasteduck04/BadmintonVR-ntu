@@ -1,0 +1,72 @@
+# v0.8.3 lab test campaign on the RTX 5090 PC (docs/setup/lab-tests.md). Run from the repository root:
+#   python tools/live_run.py campaign run --plan lab_5090 --group main  --unity-project <Unity project>   (Unity NOT playing)
+#   python tools/live_run.py campaign run --plan lab_5090 --group unity --unity-project <Unity project>   (Unity in Play mode)
+# Settings presets are configs/live/settings/<name>.yaml (seconds); `set` adds --set overrides (config keys, seconds).
+# Stage A = bench2d: the 2D step alone, as fast as possible, 10 s of the section, scored later against the offline 2D.
+# Stage B = whole streams of the clip section (6.5-16.5 s unless set), scored later against the offline builds.
+name: lab_5090
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live           # 2D from the video, 60 fps, sync file, fast 2D (pyav, 1080, court filter, detector/5), fast fit
+  seconds: 10                   # bench2d only
+  timeout_s: 1800
+
+tests:
+  # ---------------------------------------------------------------- stage A: 2D engine, input size, batching
+  - {id: A01_cuda_1080, kind: bench2d, note: "baseline best_live: CUDA, 4K decoded and shrunk to 1080"}
+  - {id: A02_cuda_4k, kind: bench2d, note: "CUDA, full 4K frames", set: ["rtmpose.decode_short_side=null"]}
+  - {id: A03_cuda_720, kind: bench2d, note: "CUDA, 4K decoded and shrunk to 720", set: ["rtmpose.decode_short_side=720"]}
+  - {id: A04_cuda_file1080, kind: bench2d, note: "CUDA, real 1080p video files", requires: ["video:1080p"],
+     set: ["video_variant=1080p", "rtmpose.decode_short_side=null"]}
+  - {id: A05_cuda_file720, kind: bench2d, note: "CUDA, real 720p video files", requires: ["video:720p"],
+     set: ["video_variant=720p", "rtmpose.decode_short_side=null"]}
+  - {id: A06_trt16_1080, kind: bench2d, note: "TensorRT FP16, 1080 shrink", requires: [tensorrt],
+     set: ["rtmpose.ep=trt"], timeout_s: 3600}
+  - {id: A07_trt32_1080, kind: bench2d, note: "TensorRT FP32, 1080 shrink", requires: [tensorrt],
+     set: ["rtmpose.ep=trt", "rtmpose.trt_fp16=false"], timeout_s: 3600}
+  - {id: A08_trt16_file720, kind: bench2d, note: "TensorRT FP16, real 720p files", requires: [tensorrt, "video:720p"],
+     set: ["rtmpose.ep=trt", "video_variant=720p", "rtmpose.decode_short_side=null"]}
+  - {id: A09_trt16_file1080, kind: bench2d, note: "TensorRT FP16, real 1080p files", requires: [tensorrt, "video:1080p"],
+     set: ["rtmpose.ep=trt", "video_variant=1080p", "rtmpose.decode_short_side=null"]}
+  - {id: A10_cuda_1080_det3, kind: bench2d, note: "CUDA 1080, detector every 3rd frame", set: ["rtmpose.det_every=3"]}
+  - {id: A11_cuda_1080_det1, kind: bench2d, note: "CUDA 1080, detector every frame", set: ["rtmpose.det_every=1"]}
+  - {id: A12_cuda_1080_1proc, kind: bench2d, note: "CUDA 1080, one process batching all 3 cameras",
+     set: ["rtmpose.batch_views=true"]}
+  - {id: A13_trt16_file720_1proc, kind: bench2d, note: "TensorRT FP16, 720p files, one process for all cameras",
+     requires: [tensorrt, "video:720p"],
+     set: ["rtmpose.ep=trt", "video_variant=720p", "rtmpose.decode_short_side=null", "rtmpose.batch_views=true"]}
+  - {id: A14_trt16_file720_det3, kind: bench2d, note: "TensorRT FP16, 720p files, detector every 3rd frame",
+     requires: [tensorrt, "video:720p"],
+     set: ["rtmpose.ep=trt", "video_variant=720p", "rtmpose.decode_short_side=null", "rtmpose.det_every=3"]}
+  - {id: A15_nvcodec_1080, kind: bench2d, note: "GPU video decode (PyNvVideoCodec), 1080 shrink",
+     requires: [PyNvVideoCodec], set: ["rtmpose.decoder=nvcodec"]}
+  - {id: A16_cuda_1080_again, kind: bench2d, note: "baseline again (drift / noise check)"}
+
+  # ---------------------------------------------------------------- stage B: whole streams, Unity not playing
+  - {id: B01_best_live, repeat: 2, note: "best_live, real time, 60 fps"}
+  - {id: B02_best_live_asfast, note: "best_live, as fast as possible", set: ["pace=asfast"]}
+  - {id: B03_pure_live, repeat: 2, settings: pure_live, note: "pure_live: offsets estimated in the warm-up"}
+  - {id: B04_file720, repeat: 2, note: "best_live on real 720p files", requires: ["video:720p"],
+     set: ["video_variant=720p", "rtmpose.decode_short_side=null"]}
+  - {id: B05_trt_file720, repeat: 2, note: "TensorRT FP16 + real 720p files", requires: [tensorrt, "video:720p"],
+     set: ["rtmpose.ep=trt", "video_variant=720p", "rtmpose.decode_short_side=null"]}
+  - {id: B06_trt_file720_asfast, note: "TensorRT FP16 + 720p files, as fast as possible", requires: [tensorrt, "video:720p"],
+     set: ["rtmpose.ep=trt", "video_variant=720p", "rtmpose.decode_short_side=null", "pace=asfast"]}
+  - {id: B07_30fps, note: "best_live at 30 fps", set: ["output_fps=30"]}
+  - {id: B08_window30, note: "fit window 30 frames (0.5 s) instead of 60: less delay", set: ["stream.window_s=0.5"]}
+  - {id: B09_warmup60, note: "warm-up 60 frames (1 s) instead of 120", set: ["warmup.seconds=1.0"]}
+  - {id: B10_window30_warmup60, note: "fit window 30 + warm-up 60", set: ["stream.window_s=0.5", "warmup.seconds=1.0"]}
+  - {id: B11_long_best_live, note: "best_live over 2-30 s (28 s): does the delay keep growing?", timeout_s: 3600,
+     set: ["section_s=[2.0, 30.0]"]}
+  - {id: B12_long_trt_file720, note: "TensorRT + 720p files over 2-30 s", timeout_s: 3600, requires: [tensorrt, "video:720p"],
+     set: ["section_s=[2.0, 30.0]", "rtmpose.ep=trt", "video_variant=720p", "rtmpose.decode_short_side=null"]}
+
+  # ---------------------------------------------------------------- the same streams with Unity in Play mode
+  - {id: U01_best_live_unity, group: unity, stage: U, note: "B01 with Unity playing the stream", compare_to: B01_best_live}
+  - {id: U02_file720_unity, group: unity, stage: U, note: "B04 with Unity", compare_to: B04_file720,
+     requires: ["video:720p"], set: ["video_variant=720p", "rtmpose.decode_short_side=null"]}
+  - {id: U03_trt_file720_unity, group: unity, stage: U, note: "B05 with Unity", compare_to: B05_trt_file720,
+     requires: [tensorrt, "video:720p"], set: ["rtmpose.ep=trt", "video_variant=720p", "rtmpose.decode_short_side=null"]}
+  - {id: U04_long_best_live_unity, group: unity, stage: U, note: "B11 with Unity", compare_to: B11_long_best_live,
+     timeout_s: 3600, set: ["section_s=[2.0, 30.0]"]}

@@ -11,7 +11,8 @@ frame) - persons matched by body keypoints (Hungarian), then per-keypoint pixel 
 offline 2D is sure of (raw score >= score_thr), per body part.
 
 Folder runs/bench2d/<date>_<time>_<host>[_tag]/: bench.json, bench.md, config.resolved.yaml, machine.json,
-gpu_samples.csv, cpu_samples.csv, bench.log."""
+gpu_samples.csv, cpu_samples.csv, bench.log, dets.npz (v0.8.3: every frame's detections, quarter-pixel int16, so a
+machine without the offline 2D - the lab PC - can be scored later with `live_run.py bench2d-rescore <folder>`)."""
 from __future__ import annotations
 
 import json
@@ -63,6 +64,10 @@ def settings_label(cfg):
                   "1proc" if r.get("batch_views") else "proc/cam"]
         if r.get("court_filter_m") is not None:
             parts.append(f"court{r['court_filter_m']}")
+        if r.get("ep", "cuda") == "trt":
+            parts.append("trt-fp16" if r.get("trt_fp16", True) else "trt-fp32")
+    if cfg.get("video_variant"):
+        parts.append(f"video-{cfg['video_variant']}")
     elif float(r.get("downscale", 1.0)) != 1.0:
         parts.append(f"downscale{r['downscale']}")
     return " ".join(parts)
@@ -141,6 +146,69 @@ def match_quality(results, kp2d, score_thr=SCORE_THR, match_px=MATCH_PX, court=N
             "score_thr": score_thr, "match_px": match_px, "parts": parts}
 
 
+def save_dets(path, results):
+    """{(view, frame): [(133, 3) arrays]} -> npz: per key "<view>|<frame>" an int16 (n, 133, 3) array of x, y in quarter
+    pixels and the raw score x 1000 (half the size of float32, 0.25 px steps)."""
+    arrs = {}
+    for (v, f), dets in results.items():
+        a = np.zeros((len(dets), 133, 3), np.int16)
+        for i, d in enumerate(dets):
+            d = np.nan_to_num(np.asarray(d, np.float32))
+            a[i, :, 0:2] = np.clip(np.round(d[:, 0:2] * 4), -32768, 32767)
+            a[i, :, 2] = np.clip(np.round(d[:, 2] * 1000), -32768, 32767)
+        arrs[f"{v}|{int(f)}"] = a
+    np.savez_compressed(path, **arrs)
+
+
+def load_dets(path) -> dict:
+    out = {}
+    with np.load(path) as z:
+        for k in z.files:
+            v, f = k.rsplit("|", 1)
+            a = z[k].astype(np.float32)
+            a[:, :, 0:2] /= 4.0
+            a[:, :, 2] /= 1000.0
+            out[(v, int(f))] = [x for x in a]
+    return out
+
+
+def score(cfg, results):
+    """Quality of results against the offline 2D of cfg's views, or None when this machine has no offline 2D."""
+    missing = [v for v in cfg["views"] if not os.path.exists(cfg["kp2d_paths"][v])]
+    if missing:
+        return None
+    kp2d = {}
+    for v in cfg["views"]:
+        with open(cfg["kp2d_paths"][v], "r", encoding="utf-8") as fh:
+            kp2d[v] = json.load(fh)["frames"]
+    from .pose2d_fast import CourtFilter, load_cams
+    court = CourtFilter(load_cams(cfg["cam_paths"]), cfg["rtmpose"].get("court_filter_m") or 1.0)
+    return match_quality(results, kp2d, court=court)
+
+
+def rescore(out_dir, log=print) -> dict:
+    """Score a finished bench folder (dets.npz + config.resolved.yaml) against this machine's offline 2D; rewrites
+    bench.json / bench.md."""
+    import yaml
+    with open(os.path.join(out_dir, "bench.json"), "r", encoding="utf-8") as fh:
+        b = json.load(fh)
+    with open(os.path.join(out_dir, "config.resolved.yaml"), "r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh)
+    dp = os.path.join(out_dir, "dets.npz")
+    if not os.path.exists(dp):
+        raise FileNotFoundError(f"{dp} (bench made before v0.8.3 or without detections)")
+    q = score(cfg, load_dets(dp))
+    if q is None:
+        raise FileNotFoundError(f"no offline 2D here for {cfg['views']} ({list(cfg['kp2d_paths'].values())[:1]}...)")
+    b["quality"], b["quality_scored_on"] = q, socket.gethostname()
+    with open(os.path.join(out_dir, "bench.json"), "w", encoding="utf-8") as fh:
+        json.dump(b, fh, indent=1, default=str)
+    with open(os.path.join(out_dir, "bench.md"), "w", encoding="utf-8") as fh:
+        fh.write(render(b))
+    log(summary_line(b))
+    return b
+
+
 def run(cfg, out_dir, seconds=None, log=print, quality=True):
     from . import config as live_config
     from . import machine, samplers, sources
@@ -202,16 +270,12 @@ def run(cfg, out_dir, seconds=None, log=print, quality=True):
     }
     gpu = samplers.summarise_gpu(os.path.join(out_dir, "gpu_samples.csv"))
     cpu = samplers.summarise_cpu(os.path.join(out_dir, "cpu_samples.csv"))
-    q = None
-    if quality:
-        kp2d = {}
-        for v in cfg["views"]:
-            with open(cfg["kp2d_paths"][v], "r", encoding="utf-8") as fh:
-                kp2d[v] = json.load(fh)["frames"]
-        from .pose2d_fast import CourtFilter, load_cams
-        court = CourtFilter(load_cams(cfg["cam_paths"]), cfg["rtmpose"].get("court_filter_m") or 1.0)
-        q = match_quality(results, kp2d, court=court)
+    save_dets(os.path.join(out_dir, "dets.npz"), results)
+    q = score(cfg, results) if quality else None
+    if quality and q is None:
+        log("  no offline 2D on this machine: quality left out (bench2d-rescore <folder> where data/pose2d is)")
     out = {"label": label, "rtmpose": cfg["rtmpose"], "device": cfg["device"], "views": cfg["views"],
+           "video_variant": cfg.get("video_variant"), "video_to_calib": cfg.get("video_to_calib"),
            "fps": cfg["fps"], "source_fps": cfg["source_fps"], "section_s": cfg["section_s"], "seconds": seconds,
            "timing": timing, "gpu": gpu, "cpu": cpu, "quality": q, "workers": info, "machine": machine.short(m),
            "host": socket.gethostname()}
