@@ -110,6 +110,8 @@ A black window starts the server and the page opens (http://localhost:8770). Che
 
 ## 7. First stream
 
+v0.8.4: press **1 Warm up** first (models + players once), then **2 Start streaming to Unity** as often as you like.
+
 Tab **2 Stream**: clip **singles_05x**, preset **best_live** (2D straight from the videos, 60 fps, sync file) or
 **pure_live** (the same, but the camera offsets are estimated in the warm-up: nothing from an offline build). The source
 line must say "straight from the videos". Press **Start streaming to Unity**.

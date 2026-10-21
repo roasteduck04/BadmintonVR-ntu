@@ -16,7 +16,9 @@ PACKAGES = ("numpy", "scipy", "opencv-python", "opencv-python-headless", "onnxru
 
 def _run(cmd, timeout=10):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # stdin=DEVNULL: under the live engine stdin is the server's command pipe; Git for Windows waited on it and,
+        # killed at the timeout, its child kept the output pipe open - the run hung for good (v0.8.4)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return r.stdout if r.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None

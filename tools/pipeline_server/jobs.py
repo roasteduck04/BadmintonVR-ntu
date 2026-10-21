@@ -60,6 +60,7 @@ class Job:
         self.proc = None
         self._thread = None
         self._stop_requested = False
+        self.stdin_pipe = False
 
     def start(self):
         kw = {}
@@ -67,10 +68,10 @@ class Job:
             kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kw["start_new_session"] = True
-        env = dict(os.environ, PYTHONUNBUFFERED="1", **(self.env or {}))
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", **(self.env or {}))
         self.proc = subprocess.Popen(self.argv, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                                     bufsize=1, env=env, **kw)
+                                     stdin=subprocess.PIPE if self.stdin_pipe else subprocess.DEVNULL, text=True,
+                                     encoding="utf-8", errors="replace", bufsize=1, env=env, **kw)
         self.state = "running"
         self._thread = threading.Thread(target=self._read, name=f"job-{self.kind}", daemon=True)
         self._thread.start()
@@ -79,6 +80,9 @@ class Job:
     def _read(self):
         for line in self.proc.stdout:
             line = line.rstrip("\n")
+            if line.startswith("ENGINE "):
+                self._engine_line(line[7:])
+                continue
             self.lines.append(line)
             m = STEP_RE.search(line)
             if m:
@@ -171,6 +175,9 @@ class Job:
                 if p["state"] != "done":
                     p.update(state="done", t0=p["t0"] or time.time(), t1=time.time())
 
+    def _engine_line(self, payload):
+        """`ENGINE {json}` status lines (v0.8.4 live engine); plain jobs never print them."""
+
     def live_written(self):
         """Frames written so far, from the run's latest.json (None before the first frame)."""
         if not self.run_dir:
@@ -234,6 +241,126 @@ class Job:
                 "now": time.time(), "returncode": self.returncode, "progress": dict(self.progress),
                 "error": self.error, "run_dir": self.run_dir, "log": list(self.lines)[-60:], "argv": self.argv,
                 "phases": [dict(p) for p in self.phases], "meta": dict(self.meta)}
+
+
+ENGINE_WARM_PHASES = [("models", "Loading the 2D models"), ("players", "Warm-up: picking the players"),
+                      ("ready", "Ready to stream")]
+ENGINE_STREAM_PHASES = [("stream", "Streaming frames to Unity"), ("save", "Saving the analysis file"),
+                        ("report", "Writing the report")]
+
+
+class EngineJob(Job):
+    """v0.8.4: the live engine (`live_run.py engine`) as one long-lived job. Commands go to its stdin (send); its
+    ENGINE status lines set `engine` {state, warm, run_dir, error, ...}; each warm-up / stream gets its own phases and,
+    for a stream, run_dir / progress (frame count from the run's latest.json)."""
+
+    def __init__(self, argv, cwd, clip, preset, title="live engine", commands=None):
+        """commands = the file the engine follows (live_run.py engine --commands); no stdin: on Windows a thread
+        blocked on a stdin pipe stalls every child process the engine starts."""
+        super().__init__("engine", argv, cwd, title=title)
+        self.commands = commands
+        self.clip, self.preset = clip, preset
+        self.engine = {"state": "starting", "clip": clip, "preset": preset, "warm": None, "run_dir": None,
+                       "error": None, "streams": 0}
+        self.send_lock = threading.Lock()
+
+    def send(self, obj):
+        if self.proc is None or self.proc.poll() is not None:
+            raise RuntimeError("the live engine is not running")
+        with self.send_lock:
+            if self.commands:
+                with open(self.commands, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(obj) + "\n")
+            else:
+                self.proc.stdin.write(json.dumps(obj) + "\n")
+                self.proc.stdin.flush()
+
+    def _set_phases(self, spec):
+        self.phases = [{"id": i, "label": lab, "state": "pending", "t0": None, "t1": None, "detail": ""}
+                       for i, lab in spec]
+
+    def _engine_line(self, payload):
+        try:
+            ev = json.loads(payload)
+        except ValueError:
+            return
+        e = ev.get("ev")
+        self.lines.append(f"[engine] {e}: " + ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("ev", "trace",
+                                                                                                    "info", "warm")))
+        if e == "state":
+            st = ev.get("state")
+            self.engine["state"] = st
+            if st == "loading":
+                self._set_phases(ENGINE_WARM_PHASES)
+                self._phase("models", "models into GPU memory, warm-up passes (TensorRT engines on the first run)")
+            elif st == "warming":
+                if not self.phases or self.phases[0]["id"] != "models":
+                    self._set_phases(ENGINE_WARM_PHASES)
+                    self.phases[0].update(state="done", detail="already loaded (reused)", t0=time.time(), t1=time.time())
+                self._phase("players", "the first frames of the part: P1 / P2, body sizes, floor, offsets")
+            elif st == "ready" and ev.get("warm"):
+                self.engine["warm"] = ev["warm"]
+                self._phase("ready", f"players {ev['warm'].get('players')} in {ev['warm'].get('seconds')} s")
+                for ph in self.phases:
+                    ph["state"], ph["t1"] = "done", ph["t1"] or time.time()
+            elif st == "off":
+                self.engine["warm"] = None
+        elif e == "models":
+            self.engine["models_s"] = ev.get("seconds")
+            if self.phases and self.phases[0]["id"] == "models":
+                self.phases[0]["detail"] = f"loaded in {ev.get('seconds')} s"
+        elif e == "stream_start":
+            self.run_dir = ev.get("run_dir")
+            self.engine["run_dir"] = self.run_dir
+            self.engine["streams"] += 1
+            self.meta.update(run=os.path.basename(str(self.run_dir).rstrip("/\\")), warmup_steps=0)
+            self.progress = {"step": 0, "steps": int(ev.get("steps") or 0), "written": 0}
+            self._set_phases(ENGINE_STREAM_PHASES)
+            self._phase("stream", "warm start: every frame in order from the first one")
+            self.stream_started = time.time()
+        elif e == "stream_done":
+            self.progress = {**self.progress, "written": int(ev.get("written") or 0), "steps": int(ev.get("steps") or 0)}
+            for ph in self.phases:
+                if ph["state"] != "done":
+                    ph.update(state="done", t0=ph["t0"] or time.time(), t1=time.time())
+            self.engine["last_stream"] = {"run_dir": ev.get("run_dir"), "written": ev.get("written"),
+                                          "stopped": ev.get("stopped")}
+        elif e == "error":
+            self.engine["error"] = {"message": ev.get("message"), "cmd": ev.get("cmd"), "t": time.time()}
+            self.error = ev.get("message")
+            for ph in self.phases:
+                if ph["state"] == "active":
+                    ph.update(state="failed", t1=time.time())
+
+    def _phase_line(self, line):
+        if not self.phases or self.phases[0]["id"] != "stream":
+            return
+        if DONE_RE.search(line):
+            self._phase("report", "timing, quality, plots")
+
+    def _update_from_frames(self):
+        n = self.live_written()
+        if n is None or not self.phases or self.phases[0]["id"] != "stream":
+            return
+        if n > self.progress.get("written", 0):
+            self.progress = {**self.progress, "written": n}
+        steps = self.progress.get("steps")
+        if steps and n >= steps and self.phases[0]["state"] == "active":
+            self._phase("save", "both players' whole stream in one analysis file")
+
+    def status(self) -> dict:
+        self._update_from_frames()
+        out = super().status()
+        out["engine"] = dict(self.engine)
+        return out
+
+    def stop(self, timeout_s=10.0):
+        try:
+            self.send({"cmd": "quit"})
+            self.proc.wait(timeout_s)
+        except Exception:  # noqa: BLE001 - not responding: kill it
+            pass
+        super().stop(timeout_s)
 
 
 class JobManager:

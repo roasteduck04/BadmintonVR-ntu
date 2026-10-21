@@ -244,7 +244,8 @@ class FfmpegReader(Reader):
             args += ["-vf", vf]
         args += ["-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
         self.args = args
-        self.p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=self.frame_bytes * 2)
+        self.p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                  bufsize=self.frame_bytes * 2)     # ffmpeg reads stdin for key presses
         self.pos = int(first)
 
     def _read_raw(self):
@@ -304,7 +305,69 @@ class NvCodecReader(Reader):
         return img
 
 
-READERS = {"cv2": Cv2Reader, "pyav": PyAvReader, "ffmpeg": FfmpegReader, "nvdec": NvdecReader, "nvcodec": NvCodecReader}
+def is_stream_url(path) -> bool:
+    """A camera stream address (rtsp://, http(s)://, tcp://, udp://, rtmp://, srt://) rather than a video file."""
+    return isinstance(path, str) and "://" in path.split("?")[0][:12]
+
+
+class CameraReader(Reader):
+    """v0.8.4 camera source: a live stream address read by OpenCV (FFmpeg backend: RTSP, HTTP MJPEG, TCP, UDP...) on
+    a background thread that keeps only the newest frame. read(f) returns the newest frame that arrived after the one
+    returned before (waiting up to `timeout_s`), so a step gets whatever the camera has at that moment - frame numbers
+    are the schedule's, not the camera's; the frame's arrival time is kept in `last_arrival_ns`."""
+    kind = "camera"
+
+    def __init__(self, path, first, fps, short_side, threads=0, timeout_s=5.0):
+        import cv2
+        self.cv2 = cv2
+        self.path, self.fps, self.threads, self.timeout_s = path, float(fps), int(threads or 0), float(timeout_s)
+        self.cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+        if not self.cap.isOpened():
+            raise FileNotFoundError(f"cannot open camera stream {path}")
+        ok, img = self.cap.read()
+        if not ok or img is None:
+            raise FileNotFoundError(f"camera stream {path} sends no frames")
+        self.src_h, self.src_w = img.shape[:2]
+        self.codec = "stream"
+        self.out_w, self.out_h, self.scale = target_size(self.src_w, self.src_h, short_side)
+        self.pos = int(first)
+        self.cond = threading.Condition()
+        self.latest, self.count, self.given, self.last_arrival_ns = img, 1, 0, time.monotonic_ns()
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True, name=f"camera-{path}")
+        self.thread.start()
+
+    def _loop(self):
+        while self.running:
+            ok, img = self.cap.read()
+            if not ok or img is None:
+                time.sleep(0.01)
+                continue
+            with self.cond:
+                self.latest, self.count, self.last_arrival_ns = img, self.count + 1, time.monotonic_ns()
+                self.cond.notify_all()
+
+    def read(self, f):
+        with self.cond:
+            self.cond.wait_for(lambda: self.count > self.given or not self.running, timeout=self.timeout_s)
+            if self.count <= self.given:
+                return None
+            img, self.given = self.latest, self.count
+        self.pos = int(f) + 1
+        if self.scale != 1.0:
+            img = self.cv2.resize(img, (self.out_w, self.out_h), interpolation=self.cv2.INTER_AREA)
+        return img
+
+    def close(self):
+        self.running = False
+        with self.cond:
+            self.cond.notify_all()
+        self.thread.join(timeout=2.0)
+        self.cap.release()
+
+
+READERS = {"cv2": Cv2Reader, "pyav": PyAvReader, "ffmpeg": FfmpegReader, "nvdec": NvdecReader, "nvcodec": NvCodecReader,
+           "camera": CameraReader}
 
 
 def open_reader(kind, path, first, fps, short_side=None, threads=0):
@@ -790,15 +853,48 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                 step_s=None, ctl=None):
     """One process for `views`: decode (prefetch threads) -> boxes -> crops -> one batched pose call -> results.
     Messages on queues[view]: ("ready", view, info), ("frame", view, f, dets, timing), ("done", view, None),
-    ("error", view, message). `ctl` (queue): {view: frames still needed} narrows the plan - other frames are neither
-    decoded nor posed, and nothing is sent for them."""
+    ("error", view, message). Control messages on `ctl`: {"keep": {view: frames still needed}} narrows the plan (other
+    frames are neither decoded nor posed, nothing is sent for them); {"end": True} ends the current session.
+
+    One-shot (plans given, `live_run.py run`): load, "ready", wait for go, run the plan, "done", exit.
+    Sessions (plans None, v0.8.4 live engine): load once, "ready"; then for every {"session": {"plans", "origins",
+    "realtime"}} on ctl: open the readers at the plan's first frames (camera readers stay open), "ready", wait for go
+    (the scheduler sets t0 and go once every worker is ready, and clears go before the next session), run, "done";
+    until stop_ev."""
     def put(v, msg):
         queues[v].put(msg)
 
     from .cpulimits import apply as _cpu_apply
     _cpu_apply(rcfg.get("_threads"))
+    short = rcfg.get("decode_short_side")
+    kind = rcfg.get("decoder", "cv2")
+    k_cal = {v: float((rcfg.get("_video_to_calib") or {}).get(v, 1.0)) for v in views}   # calib px per video px
+    cams_open = {}                   # camera readers: opened once, kept across sessions
 
-    def load():                      # model + readers + warm-up (under the TensorRT build lock)
+    def reader_for(v, first):
+        if is_stream_url(paths[v]):
+            if v not in cams_open:
+                cams_open[v] = open_reader("camera", paths[v], first, fps, short, rcfg.get("decode_threads", 0))
+            return cams_open[v]
+        return open_reader(kind, paths[v], first, fps, short, rcfg.get("decode_threads", 0))
+
+    def open_readers(pl):
+        rd = {}
+        try:
+            for v in views:
+                rd[v] = reader_for(v, pl[v][0] if pl and pl.get(v) else 0)
+        except Exception as e:  # noqa: BLE001
+            for v in views:
+                put(v, ("error", v, f"{kind} reader: {type(e).__name__}: {e}"))
+            return None
+        return rd
+
+    def close_readers(rd):
+        for v, r in (rd or {}).items():
+            if v not in cams_open:
+                r.close()
+
+    def load():                      # model + warm-up (under the TensorRT build lock)
         t_load = time.monotonic_ns()
         try:
             check_cuda(device)
@@ -808,20 +904,9 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                 put(v, ("error", v, f"{type(e).__name__}: {e}"))
             return None
         load_ns = time.monotonic_ns() - t_load
-        short = rcfg.get("decode_short_side")
-        kind = rcfg.get("decoder", "cv2")
-        readers = {}
-        try:
-            for v in views:
-                first = plans[v][0] if plans[v] else 0
-                readers[v] = open_reader(kind, paths[v], first, fps, short, rcfg.get("decode_threads", 0))
-        except Exception as e:  # noqa: BLE001
-            for v in views:
-                put(v, ("error", v, f"{kind} reader: {type(e).__name__}: {e}"))
+        readers = open_readers(plans)
+        if readers is None:
             return None
-        k_cal = {v: float((rcfg.get("_video_to_calib") or {}).get(v, 1.0)) for v in views}   # calib px per video px
-        for v in views:
-            engine.set_view(v, readers[v].scale / k_cal[v], readers[v].src_h * k_cal[v])
         warm_s, warm_sizes = 0.0, []
         if rcfg.get("warmup", True):
             try:
@@ -830,45 +915,104 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                 for v in views:
                     put(v, ("error", v, f"warm-up: {type(e).__name__}: {e}"))
                 return None
-        return engine, readers, k_cal, load_ns, warm_s, warm_sizes, kind
+        return engine, readers, load_ns, warm_s, warm_sizes
 
     with trt_lock(rcfg):
         loaded = load()
     if loaded is None:
         return
-    engine, readers, k_cal, load_ns, warm_s, warm_sizes, kind = loaded
-    for v in views:
-        put(v, ("ready", v, {"model_load_ns": load_ns, "court_filter": engine.court is not None, "warmup_s": warm_s,
-                             "padded_sizes": warm_sizes if engine.pad else None, "providers": engine.providers, "engine": "fast",
-                             "decoder": kind, "decode_size": [readers[v].out_w, readers[v].out_h],
-                             "video_size": [readers[v].src_w, readers[v].src_h], "video_to_calib": k_cal[v],
-                             "ep": engine.ep, "trt_version": engine.trt_version, "trt_notes": engine.trt_notes,
-                             "batch_views": len(views) > 1, "model": engine.model}))
-    while not go_ev.wait(0.05):
-        if stop_ev.is_set():
+    engine, readers, load_ns, warm_s, warm_sizes = loaded
+
+    def ready_info(rd, extra=None):
+        for v in views:
+            engine.set_view(v, rd[v].scale / k_cal[v], rd[v].src_h * k_cal[v])
+            put(v, ("ready", v, dict({"model_load_ns": load_ns, "court_filter": engine.court is not None,
+                                      "warmup_s": warm_s, "padded_sizes": warm_sizes if engine.pad else None,
+                                      "providers": engine.providers, "engine": "fast", "decoder": rd[v].kind,
+                                      "decode_size": [rd[v].out_w, rd[v].out_h],
+                                      "video_size": [rd[v].src_w, rd[v].src_h], "video_to_calib": k_cal[v],
+                                      "ep": engine.ep, "trt_version": engine.trt_version, "trt_notes": engine.trt_notes,
+                                      "batch_views": len(views) > 1, "model": engine.model}, **(extra or {}))))
+
+    def wait_go():
+        while not go_ev.wait(0.05):
+            if stop_ev.is_set():
+                return False
+        return True
+
+    if plans is not None:                                   # one-shot
+        ready_info(readers)
+        if not wait_go():
             return
-    t0_ns = int(t0_val.value)
+        _run_session(engine, readers, k_cal, views, plans, origins, fps, int(t0_val.value), realtime, put, stop_ev,
+                     ctl, step_s, rcfg)
+        close_readers(readers)
+        for v in views:
+            put(v, ("done", v, None))
+        return
+
+    close_readers(readers)                                  # sessions: the models stay, the readers are per session
+    ready_info(readers, {"stage": "loaded"})
+    while not stop_ev.is_set():
+        try:
+            msg = ctl.get(timeout=0.2)
+        except queue_mod.Empty:
+            continue
+        if not isinstance(msg, dict) or "session" not in msg:
+            continue                                        # a stale keep / end from a finished session
+        s = msg["session"]
+        pl, org = s["plans"], s["origins"]
+        rd = open_readers(pl)
+        if rd is None:
+            continue
+        ready_info(rd, {"stage": "session"})
+        if not wait_go():
+            break
+        _run_session(engine, rd, k_cal, views, pl, org, fps, int(t0_val.value), bool(s.get("realtime", True)), put,
+                     stop_ev, ctl, step_s, rcfg)
+        close_readers(rd)
+        for v in views:
+            put(v, ("done", v, None))
+    for r in cams_open.values():
+        r.close()
+
+
+def _run_session(engine, readers, k_cal, views, plans, origins, fps, t0_ns, realtime, put, stop_ev, ctl, step_s, rcfg):
+    """One plan through decode -> boxes -> crops -> batched pose; returns "done", "ended" (ctl end) or "stopped"."""
     window = (step_s if step_s is not None else 0.0) if len(views) > 1 else 0.0
     batches = schedule(views, plans, origins, fps, window)
     cap_ns = (lambda v: (lambda f: t0_ns + int(max(0.0, f - origins[v]) / fps * 1e9))) if realtime \
         else (lambda v: (lambda f: None))
     holder = {"keep": None}
-    pre = {v: Prefetch(readers[v], plans[v], cap_ns(v), rcfg.get("prefetch", 2), stop_ev, v, holder) for v in views}
+    sess_stop = threading.Event()
+    stop_any = _AnyEvent(stop_ev, sess_stop)
+    pre = {v: Prefetch(readers[v], plans[v], cap_ns(v), rcfg.get("prefetch", 2), stop_any, v, holder) for v in views}
     for p in pre.values():
         p.start()
     pool = ThreadPoolExecutor(max_workers=max(1, len(views)))
     drop_behind = rcfg.get("drop_behind_s")
     first_call = True
+    reason = "done"
     try:
         for t_last, items in batches:
             if stop_ev.is_set():
+                reason = "stopped"
                 break
+            ended = False
             while ctl is not None:
                 try:
                     k = ctl.get_nowait()
                 except queue_mod.Empty:
                     break
-                holder["keep"] = {v: set(int(x) for x in fr) for v, fr in k.items()}
+                if isinstance(k, dict) and k.get("end"):
+                    ended = True
+                elif isinstance(k, dict) and "keep" in k:
+                    holder["keep"] = {v: set(int(x) for x in fr) for v, fr in k["keep"].items()}
+                elif isinstance(k, dict) and "session" not in k:      # v0.8.1 form {view: frames}
+                    holder["keep"] = {v: set(int(x) for x in fr) for v, fr in k.items()}
+            if ended:
+                reason = "ended"
+                break
             t_av = t0_ns + int(t_last * 1e9) if realtime else time.monotonic_ns()
             got = {}
             for v, f in items:                         # frames arrive in each view's plan order
@@ -918,11 +1062,30 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                     "dropped": img is None, "first_call": first_call}))
             first_call = False
     except Exception as e:  # noqa: BLE001
+        reason = "error"
         for v in views:
             put(v, ("error", v, f"{type(e).__name__}: {e}"))
     finally:
+        sess_stop.set()
+        deadline = time.monotonic() + 3.0
+        for p in pre.values():                 # unblock prefetch threads waiting on a full queue, let them finish
+            while p.is_alive() and time.monotonic() < deadline:
+                try:
+                    while True:
+                        p.q.get_nowait()
+                except queue_mod.Empty:
+                    pass
+                p.join(0.05)
         pool.shutdown(wait=False)
-        for r in readers.values():
-            r.close()
-        for v in views:
-            put(v, ("done", v, None))
+        engine.state.clear()                   # the next session starts with a fresh detector pass
+    return reason
+
+
+class _AnyEvent:
+    """is_set() of either event (the process's stop or the session's end)."""
+
+    def __init__(self, *evs):
+        self.evs = evs
+
+    def is_set(self):
+        return any(e.is_set() for e in self.evs)

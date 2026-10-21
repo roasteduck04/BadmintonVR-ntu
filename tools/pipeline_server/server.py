@@ -3,8 +3,9 @@
 Spec: docs/superpowers/specs/2026-10-19-v0.8.2-pipeline-server-design.md. Run from the repository root:
     python tools/pipeline_server/server.py [--unity-project PATH] [--runs-dir PATH] [--machine rtx5090]
     -> http://127.0.0.1:8770
-Two tabs: 1 Calibrate, 2 Stream (every live setting; "Start streaming to Unity" goes straight from the videos - or the
-stored 2D on a machine without a GPU - to Unity, frame by frame). Unity's ServerFollower follows runs/now_playing.json
+Tabs: 0 Source (v0.8.4: the clip's videos or live camera streams), 1 Calibrate, 2 Stream (every live setting; step 1
+"Warm up" starts the live engine - models loaded, players warmed up - and step 2 "Start streaming to Unity" streams from
+that warm state, as often as wanted, frame by frame). Unity's ServerFollower follows runs/now_playing.json
 and writes a heartbeat (runs/unity_status.json) the server checks before streaming.
 Loopback only unless --host 0.0.0.0 --allow-host <name> (same rule as serve_calibrator.py). The process works in
 the repository root (config paths are relative to it); main() changes there.
@@ -45,6 +46,9 @@ STATIC = HERE / "static"
 NOW_PLAYING = "now_playing.json"
 UNITY_STATUS = "unity_status.json"
 UNITY_STALE_S = 3.0              # no heartbeat for this long = Unity is not in Play mode
+INPUT_FILE = "input.json"        # v0.8.4 Source tab (in the runs folder: machine-specific camera addresses)
+# settings the warm-up depends on: changing one after the warm-up means warming up again
+WARM_PREFIXES = ("backend", "rtmpose.", "cpu.", "warmup.", "sync.offsets", "video_variant", "input.", "device")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
 
 
@@ -222,6 +226,7 @@ class Server:
         self.machine = machine or detect_machine()
         self.jobs = jobmod.JobManager()
         self._np_lock = threading.Lock()
+        self.warm_request = None         # {clip, warm: {key: value}} of the last warm-up sent to the engine
 
     # ------------------------------------------------------------------ catalogue
     @property
@@ -382,12 +387,190 @@ class Server:
         threading.Thread(target=self._point_unity_when_ready, args=(job, name), daemon=True).start()
         return job.status()
 
-    def _point_unity_when_ready(self, job, name):
+    # ------------------------------------------------------------------ v0.8.4 Source tab
+    def get_input(self) -> dict:
+        p = self.runs / INPUT_FILE
+        d = {"kind": "video", "fps": 60, "max_minutes": 5, "cameras": {}, "video_variant": None}
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                d.update(json.load(fh) or {})
+        except (OSError, ValueError):
+            pass
+        return d
+
+    def set_input(self, d) -> dict:
+        kind = d.get("kind", "video")
+        if kind not in ("video", "camera"):
+            raise HTTPException(400, "kind must be video or camera")
+        cams = {str(k): str(v).strip() for k, v in (d.get("cameras") or {}).items() if str(v).strip()}
+        bad = [v for v, u in cams.items() if "://" not in u]
+        if bad:
+            raise HTTPException(400, f"not a stream address (rtsp://, http://, tcp://, udp://...): {bad}")
+        try:
+            fps, mins = float(d.get("fps", 60)), float(d.get("max_minutes", 5))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "fps and max_minutes must be numbers")
+        if not (1 <= fps <= 240 and 0.1 <= mins <= 60):
+            raise HTTPException(400, "fps 1-240, max_minutes 0.1-60")
+        vv = d.get("video_variant") or None
+        if vv is not None and not re.match(r"^[A-Za-z0-9_-]{1,20}$", str(vv)):
+            raise HTTPException(400, "bad video_variant")
+        out = {"kind": kind, "fps": fps, "max_minutes": mins, "cameras": cams, "video_variant": vv}
+        atomic_json(self.runs / INPUT_FILE, out)
+        return out
+
+    def video_variants(self, clip) -> list:
+        """Tags of the smaller video copies (`live_run.py transcode`) that exist for every live view of the clip."""
+        import glob
+        try:
+            cfg = live_config.load(clip, overrides=["backend=live", "rtmpose.engine=fast", "video_variant=null"],
+                                   probe=lambda c: {v: dict(zip(("width", "height"), live_config.calib_size(
+                                       c["cam_paths"][v]) or (1, 1)), fps=60.0, frame_count=10 ** 6) for v in c["views"]})
+        except (ValueError, FileNotFoundError):
+            return []
+        vids = [cfg["videos"][v] for v in cfg["views"] if cfg["videos"].get(v)]
+        if not vids:
+            return []
+        d0 = os.path.dirname(vids[0])
+        tags = sorted({os.path.basename(p)[len(os.path.basename(d0)) + 1:] for p in glob.glob(d0 + "_*") if os.path.isdir(p)})
+        return [t for t in tags if t and all(os.path.exists(live_config.variant_video(v, t)) for v in vids)]
+
+    def input_sets(self) -> list:
+        d = self.get_input()
+        if d["kind"] == "camera":
+            return ["input.kind=camera", "input.cameras=" + json.dumps(d["cameras"]), f"input.fps={d['fps']}",
+                    f"input.max_minutes={d['max_minutes']}", "video_variant=null"]
+        return ["input.kind=video"] + ([f"video_variant={d['video_variant']}"] if d.get("video_variant") else [])
+
+    def test_cameras(self, cams) -> dict:
+        """One frame from every camera address: {view: {ok, size | error, ms}}."""
+        import cv2
+        out = {}
+        for v, url in (cams or {}).items():
+            t = time.perf_counter()
+            if "://" not in str(url):
+                out[v] = {"ok": False, "error": "not a stream address"}
+                continue
+            cap = cv2.VideoCapture(str(url), cv2.CAP_FFMPEG)
+            try:
+                ok, img = cap.read() if cap.isOpened() else (False, None)
+            finally:
+                cap.release()
+            out[v] = ({"ok": True, "size": [int(img.shape[1]), int(img.shape[0])],
+                       "ms": round(1000 * (time.perf_counter() - t))} if ok and img is not None
+                      else {"ok": False, "error": "no frames (address, port, firewall?)"})
+        return out
+
+    # ------------------------------------------------------------------ v0.8.4 live engine
+    def engine_job(self):
+        j = self.jobs.current
+        return j if isinstance(j, jobmod.EngineJob) and j.running else None
+
+    def _ensure_engine(self, clip):
+        j = self.engine_job()
+        if j is not None and j.clip == clip and j.preset == self.machine:
+            return j
+        if j is not None:
+            j.stop()
+        cmd_dir = self.runs / "engine"
+        cmd_dir.mkdir(parents=True, exist_ok=True)
+        cmds = cmd_dir / f"commands_{time.strftime('%Y-%m-%d_%H%M%S')}.jsonl"
+        cmds.write_text("", encoding="utf-8")
+        argv = jobmod.python_cmd(str(self.repo / "tools" / "live_run.py"), "engine", "--clip", clip, "--preset",
+                                 self.machine, "--runs-dir", str(self.runs), "--commands", str(cmds))
+        j = jobmod.EngineJob(argv, cwd=str(self.repo), clip=clip, preset=self.machine,
+                             title=f"live engine · {clip} · {self.machine}", commands=str(cmds))
+        try:
+            self.jobs.start(j)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        return j
+
+    def _request(self, clip, preset, values):
+        """(cfg, overrides, fps, src) of a page request, frames converted to seconds (as start_stream does)."""
+        if clip not in [c["name"] for c in self.clips()]:
+            raise HTTPException(400, f"no live config for clip {clip!r}")
+        cfg = self.merged(clip, preset)
+        base = dict(cfg, output_fps=(values or {}).get("output_fps", cfg.get("output_fps")))
+        vals = st.values_from(base)
+        vals.update(values or {})
+        try:
+            over = st.overrides(vals, vals.get("backend") or "cached", base_cfg=base)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        fps = over.get("output_fps", cfg.get("output_fps"))
+        src = "live2d" if over.get("backend") == "live" else "stored2d"
+        return cfg, over, fps, src
+
+    @staticmethod
+    def _warm_part(sets) -> dict:
+        out = {}
+        for a in sets:
+            k, _, v = a.partition("=")
+            if k.startswith(WARM_PREFIXES):
+                out[k] = v
+        return out
+
+    def warmup(self, clip, preset=None, values=None) -> dict:
+        cfg, over, fps, src = self._request(clip, preset, values)
+        sets = st.as_set_args(over) + self.input_sets()
+        if self.get_input()["kind"] == "camera" and src != "live2d":
+            raise HTTPException(400, "camera input needs the 2D from the video (backend live, GPU PC)")
+        j = self._ensure_engine(clip)
+        if j.engine.get("state") == "streaming":
+            raise HTTPException(409, "a stream is running: stop it first")
+        j.send({"cmd": "warmup", "set": sets})
+        self.warm_request = {"clip": clip, "warm": self._warm_part(sets), "fps": fps}
+        return j.status()
+
+    def stream_engine(self, clip, preset=None, values=None, force=False) -> dict:
+        j = self.engine_job()
+        if j is None or j.clip != clip or not j.engine.get("warm"):
+            raise HTTPException(409, {"code": "not_warm", "message": "Warm up first (step 1): it loads the models and "
+                                                                      "picks the players once for every stream after it."})
+        if j.engine.get("state") in ("loading", "warming"):
+            raise HTTPException(409, {"code": "warming", "message": "Still warming up: wait for Ready."})
+        if j.engine.get("state") == "streaming":
+            raise HTTPException(409, "a stream is already running")
+        cfg, over, fps, src = self._request(clip, preset, values)
+        sets = st.as_set_args(over) + self.input_sets()
+        changed = sorted(k for k in set(self._warm_part(sets)) | set((self.warm_request or {}).get("warm", {}))
+                         if self._warm_part(sets).get(k) != (self.warm_request or {}).get("warm", {}).get(k))
+        if changed:
+            raise HTTPException(409, {"code": "rewarm", "message": "These settings changed since the warm-up: "
+                                      + ", ".join(changed) + ". Warm up again (step 1)."})
+        if not force and not self.unity_status().get("in_play"):
+            raise HTTPException(409, {"code": "unity_not_playing",
+                                      "message": "Unity is not in Play mode. Press Play in Unity, or start anyway "
+                                                 "(the frames are still written and Unity can join later)."})
+        kind = self.get_input()["kind"]
+        name = "_".join(["live", clip, f"{int(fps)}fps", "camera" if kind == "camera" else src,
+                         over.get("pace", "realtime"), time.strftime("%Y-%m-%d_%H%M%S")])
+        run_dir = self.runs / name
+        title = f"{clip} · {int(fps)} fps · {'cameras' if kind == 'camera' else ('2D from video' if src == 'live2d' else 'stored 2D')} · warm"
+        j.meta.update(fps=float(fps), pace=over.get("pace", cfg.get("pace")), backend=over.get("backend"),
+                      views=len(cfg.get("views") or []), frames_dir=win_path(run_dir / fw.FRAMES_DIR), title=title)
+        j.send({"cmd": "stream", "set": sets, "run_dir": str(run_dir), "title": title})
+        threading.Thread(target=self._point_unity_when_ready, args=(j, name, str(run_dir), title), daemon=True).start()
+        return j.status()
+
+    def stop_stream(self) -> dict:
+        j = self.engine_job()
+        if j is not None:
+            if j.engine.get("state") == "streaming":
+                j.send({"cmd": "stop"})
+            return j.status()
+        job = self.jobs.stop()
+        return job.status() if job else {"state": "idle"}
+
+    def _point_unity_when_ready(self, job, name, run_dir=None, title=None):
         """As soon as the run's manifest exists, Unity follows it (the first frames are then picked up live)."""
-        while job.running:
-            if fw.frames_dir(job.run_dir) is not None:
+        rd = run_dir or job.run_dir
+        t_end = time.time() + 600
+        while job.running and time.time() < t_end:
+            if rd and fw.frames_dir(rd) is not None:
                 try:
-                    self.play("run", name, title=job.title)
+                    self.play("run", name, title=title or job.title)
                 except HTTPException:
                     pass
                 return
@@ -414,7 +597,7 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
         return response
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
-    app.include_router(calibmod.router(calibmod.Calib(server.repo, server.unity), TOOLS))   # tab 1 Calibrate
+    app.include_router(calibmod.router(calibmod.Calib(server.repo, server.unity, input_fn=server.get_input), TOOLS))
 
     @app.get("/")
     def index():
@@ -467,12 +650,41 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
     @app.post("/api/stream/start")
     async def stream_start(request: Request):
         b = await request.json()
-        return server.start_stream(b.get("clip"), b.get("preset") or None, b.get("values") or {}, bool(b.get("force")))
+        if b.get("oneshot"):                    # the v0.8.2 path: one process loads, warms up and streams once
+            return server.start_stream(b.get("clip"), b.get("preset") or None, b.get("values") or {}, bool(b.get("force")))
+        return server.stream_engine(b.get("clip"), b.get("preset") or None, b.get("values") or {}, bool(b.get("force")))
 
     @app.post("/api/stream/stop")
     def stream_stop():
+        return server.stop_stream()
+
+    @app.post("/api/engine/warmup")
+    async def engine_warmup(request: Request):
+        b = await request.json()
+        return server.warmup(b.get("clip"), b.get("preset") or None, b.get("values") or {})
+
+    @app.post("/api/engine/stop")
+    def engine_stop():
         job = server.jobs.stop()
+        server.warm_request = None
         return job.status() if job else {"state": "idle"}
+
+    @app.get("/api/input")
+    def input_get():
+        return server.get_input()
+
+    @app.post("/api/input")
+    async def input_set(request: Request):
+        return server.set_input(await request.json())
+
+    @app.get("/api/input/variants")
+    def input_variants(clip: str):
+        return {"variants": server.video_variants(clip)}
+
+    @app.post("/api/input/test")
+    async def input_test(request: Request):
+        b = await request.json()
+        return server.test_cameras(b.get("cameras") or server.get_input().get("cameras") or {})
 
     @app.get("/api/job")
     def job_status():

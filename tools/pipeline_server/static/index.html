@@ -10,13 +10,16 @@
 <header>
   <div class="brand">BadmintonVR <span>live</span></div>
   <nav id="tabs">
+    <button data-tab="source">0 Source</button>
     <button data-tab="calibrate">1 Calibrate</button>
     <button data-tab="stream" class="on">2 Stream</button>
   </nav>
   <div class="topright">
     <div id="unity" class="pill" title="Unity's heartbeat (runs/unity_status.json)">Unity: …</div>
     <div id="machine" class="pill" title="machine preset"></div>
-    <button id="start" class="primary big">Start streaming to Unity</button>
+    <div id="engine" class="pill" title="the live engine: models loaded once, players warmed up once, then any number of streams">Engine: off</div>
+    <button id="warm" class="big">1 Warm up</button>
+    <button id="start" class="primary big" disabled>2 Start streaming to Unity</button>
     <button id="stop" class="danger" disabled>Stop</button>
   </div>
 </header>
@@ -92,6 +95,12 @@
             <details><summary>Log</summary><pre id="job-log"></pre></details>
           </div>
           <div class="np">
+            <div class="lab">Engine</div>
+            <div id="engine-detail" class="muted">Off. Step 1 "Warm up" loads the 2D models and picks the players once;
+              step 2 then streams from that warm state as often as you like.</div>
+            <div class="row tight"><button id="engine-off" class="ghost small" disabled>Shut down the engine</button></div>
+          </div>
+          <div class="np">
             <div class="lab">Unity</div>
             <div id="unity-detail" class="muted">…</div>
           </div>
@@ -101,6 +110,41 @@
           </div>
         </div>
       </div>
+    </div>
+  </section>
+
+  <!-- ======================================================== source -->
+  <section id="tab-source" class="tab">
+    <div class="card">
+      <h2>Where the frames come from</h2>
+      <p class="muted">For now the clip's recorded videos; later live cameras (e.g. Raspberry Pis) that send their frames
+        over the network. Calibrate every camera (tab 1) for the frames it really sends. After changing the source,
+        warm up again (step 1).</p>
+      <div class="row">
+        <label class="radio"><input type="radio" name="kind" value="video" checked> Video files</label>
+        <label class="radio"><input type="radio" name="kind" value="camera"> Cameras (stream address per camera)</label>
+      </div>
+      <div id="src-video">
+        <h3>Videos of <span id="src-clip"></span></h3>
+        <div class="table-wrap"><table id="src-videos"><thead><tr><th>Camera</th><th>Video</th></tr></thead><tbody></tbody></table></div>
+        <label class="lab">Video size <select id="src-variant"></select></label>
+        <p class="muted">Smaller copies are made with <code>python tools/live_run.py transcode --clip &lt;clip&gt; --short-side 720</code>
+          (the lab tests found 720p costs about 1 cm for little speed).</p>
+      </div>
+      <div id="src-camera" hidden>
+        <h3>Camera addresses</h3>
+        <div class="table-wrap"><table id="src-cams"><thead><tr><th>Camera</th><th>Stream address</th><th>Test</th></tr></thead><tbody></tbody></table></div>
+        <div class="row">
+          <label class="lab">Frames per second <input id="src-fps" type="number" min="1" max="240" step="1" value="60"></label>
+          <label class="lab">Longest stream (minutes) <input id="src-mins" type="number" min="0.1" max="60" step="0.5" value="5"></label>
+          <button id="src-test" class="ghost">Test cameras</button>
+        </div>
+        <p class="muted">Any address OpenCV / FFmpeg can open: <code>rtsp://pi1:8554/cam</code>, <code>http://pi1:8080/stream.mjpg</code>,
+          <code>tcp://pi1:5000</code>, <code>udp://@:5000</code>. Without cameras: <code>python tools/fake_camera.py --clip singles_05x</code>
+          plays the videos as live cameras on <code>http://&lt;this PC&gt;:8090/&lt;camera&gt;.mjpg</code>. Frames are time-stamped
+          when they arrive (network delay varies 10-50 ms; the warm-up estimates the camera offsets).</p>
+      </div>
+      <div class="row tight"><button id="src-save" class="primary">Save source</button><span id="src-msg" class="muted"></span></div>
     </div>
   </section>
 

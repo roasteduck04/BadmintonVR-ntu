@@ -123,7 +123,7 @@ def test_stream_start_builds_the_live_run_command(tmp_path, monkeypatch):
         job.state = "running"
         return job
     monkeypatch.setattr(s.jobs, "start", fake_start)
-    r = c.post("/api/stream/start", json={"clip": "singles_05x", "preset": "laptop_realtime", "force": True,
+    r = c.post("/api/stream/start", json={"oneshot": True, "clip": "singles_05x", "preset": "laptop_realtime", "force": True,
                                           "values": {"output_fps": 60, "rtmpose.det_every": 3}})
     assert r.status_code == 200, r.text
     argv = started["job"].argv
@@ -131,8 +131,8 @@ def test_stream_start_builds_the_live_run_command(tmp_path, monkeypatch):
     assert not any(a.startswith("rtmpose.") for a in argv)                  # stored 2D: 2D-speed keys dropped
     assert os.path.basename(argv[argv.index("--run-dir") + 1]).startswith("live_singles_05x_60fps_stored2d_realtime_")
     started["job"].state = "done"
-    assert c.post("/api/stream/start", json={"clip": "nope"}).status_code == 400
-    assert c.post("/api/stream/start", json={"clip": "singles_05x", "force": True, "values": {"pace": "warp"}}).status_code == 400
+    assert c.post("/api/stream/start", json={"oneshot": True, "clip": "nope"}).status_code == 400
+    assert c.post("/api/stream/start", json={"oneshot": True, "clip": "singles_05x", "force": True, "values": {"pace": "warp"}}).status_code == 400
 
 
 def test_foreign_host_and_cross_site_post_are_refused(tmp_path):
@@ -175,7 +175,7 @@ def test_stream_start_checks_that_unity_is_in_play_mode(tmp_path, monkeypatch):
     s, c = _app(tmp_path)
     monkeypatch.setattr(s.jobs, "start", lambda job: job)
     assert c.get("/api/unity").json() == {"in_play": False, "seen": False}
-    r = c.post("/api/stream/start", json={"clip": "singles_05x", "preset": "laptop_realtime"})
+    r = c.post("/api/stream/start", json={"oneshot": True, "clip": "singles_05x", "preset": "laptop_realtime"})
     assert r.status_code == 409 and r.json()["detail"]["code"] == "unity_not_playing"
     hb = s.runs / "unity_status.json"
     hb.write_text(json.dumps({"v": 1, "playing": True, "t": time.time() - 10, "mode": "idle"}), encoding="utf-8")
@@ -184,7 +184,7 @@ def test_stream_start_checks_that_unity_is_in_play_mode(tmp_path, monkeypatch):
                   encoding="utf-8")
     u = c.get("/api/unity").json()
     assert u["in_play"] is True and u["mode"] == "broadcast"
-    assert c.post("/api/stream/start", json={"clip": "singles_05x", "preset": "laptop_realtime"}).status_code == 200
+    assert c.post("/api/stream/start", json={"oneshot": True, "clip": "singles_05x", "preset": "laptop_realtime"}).status_code == 200
     hb.write_text(json.dumps({"v": 1, "playing": False, "t": time.time()}), encoding="utf-8")   # Play mode ended
     assert c.get("/api/unity").json()["in_play"] is False
 
@@ -298,7 +298,7 @@ def test_stream_start_passes_untouched_seconds_through(tmp_path, monkeypatch):
     s, c = _app(tmp_path)
     started = {}
     monkeypatch.setattr(s.jobs, "start", lambda job: started.setdefault("job", job))
-    r = c.post("/api/stream/start", json={"clip": "singles_05x", "preset": "laptop_realtime", "force": True,
+    r = c.post("/api/stream/start", json={"oneshot": True, "clip": "singles_05x", "preset": "laptop_realtime", "force": True,
                                           "values": {"output_fps": 60, "warmup.seconds": 60}})
     assert r.status_code == 200, r.text
     job = started["job"]

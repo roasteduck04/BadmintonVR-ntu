@@ -121,3 +121,10 @@ cpu:                            # v0.8.3 (analysis/live/cpulimits.py): threads p
   pose2d_threads: auto
   decode_threads: auto
   fit_threads: auto
+
+input:                          # v0.8.4 Source tab: where the frames come from
+  kind: video                   # video = the clip's video files (registry) | camera = live streams below
+  fps: 60                       # camera: frames per second the cameras send
+  max_minutes: 5                # camera: longest stream (the 3D core keeps a whole stream in memory)
+  cameras: {}                   # camera: {view: stream address}, e.g. back_051: rtsp://pi1:8554/cam,
+                                # http://pi1:8080/stream.mjpg, tcp://pi1:5000 (test: python tools/fake_camera.py)

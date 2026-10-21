@@ -9,6 +9,10 @@ The resolved dict keeps the flat keys the streaming core reads (views, ref_frame
 history, offsets, sync, stride, time_ref, out_clip, timeline_frames, kp2d_paths, cam_paths, ...) next to the nested
 sections (tracker, stream, fallback, ...).
 
+v0.8.4: input.kind camera streams live camera addresses instead of the clip's videos (input.cameras {view: address},
+input.fps, input.max_minutes): the section is the next input.max_minutes of whatever the cameras send, frames are
+taken as they arrive (pose2d_fast.CameraReader), the frame size comes from each camera's first frame.
+
 v0.8.3: video_variant (null | "720p" | "1080p" | any tag) streams a smaller copy of each camera video made by
 `live_run.py transcode` (<video folder>_<tag>/<video name>.mp4, every frame kept, same fps). video_to_calib {view:
 calibration width / video width} is worked out for every live run from the calibration file's size, so the 2D comes
@@ -34,6 +38,7 @@ SYNC_MODES = ("interp", "nearest")
 OFFSET_MODES = ("auto", "file", "zero")
 RTM_MODES = ("performance", "balanced", "lightweight")
 RTM_EPS = ("cuda", "trt")
+SECONDS_PER_MINUTE = 60
 
 
 def variant_video(path, variant):
@@ -152,9 +157,26 @@ def video_info(path) -> dict:
     return info
 
 
+def probe_camera(url, fps, max_minutes) -> dict:
+    """A camera stream: size from its first frame; fps and length (the longest stream) from the input config."""
+    import cv2
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    try:
+        ok, img = cap.read() if cap.isOpened() else (False, None)
+    finally:
+        cap.release()
+    if not ok or img is None:
+        raise ValueError(f"no frames from camera {url} (is it streaming? test it with: python tools/fake_camera.py ...)")
+    return {"fps": float(fps), "frame_count": int(round(float(fps) * SECONDS_PER_MINUTE * float(max_minutes))),
+            "width": int(img.shape[1]), "height": int(img.shape[0]), "source": url}
+
+
 def probe_sources(c) -> dict:
     """{view: {fps, frame_count, width, height, source}} from the inputs the backend will read."""
     out = {}
+    if (c.get("input") or {}).get("kind") == "camera":
+        ip = c["input"]
+        return {v: probe_camera(c["videos"][v], ip["fps"], ip["max_minutes"]) for v in c["views"]}
     for v in c["views"]:
         if c["backend"] == "cached":
             p = c["kp2d_paths"][v]
@@ -212,6 +234,20 @@ def resolve(c, probe=probe_sources) -> dict:
     if c["video_variant"] and c["backend"] != "live":
         raise ValueError("video_variant needs backend live (the stored 2D was made from the original videos)")
     c["videos"] = {v: variant_video(videos.get(v), c["video_variant"]) for v in c["views"]}
+    ip = c.setdefault("input", {})
+    ip.setdefault("kind", "video")
+    if ip["kind"] not in ("video", "camera"):
+        raise ValueError(f"input.kind must be video or camera, got {ip['kind']!r}")
+    if ip["kind"] == "camera":
+        cams = ip.get("cameras") or {}
+        missing = [v for v in c["views"] if not cams.get(v)]
+        if missing:
+            raise ValueError(f"input.kind camera: no stream address for {missing} (Source tab / input.cameras)")
+        if c["backend"] != "live" or c["video_variant"]:
+            raise ValueError("input.kind camera needs backend live and no video_variant")
+        c["videos"] = {v: str(cams[v]) for v in c["views"]}
+        c["section_s"] = [0.0, None]                   # cameras: from now, up to input.max_minutes
+        c["sync"]["mode"] = "nearest"                  # a live stream has no "two frames around the instant" to blend
     for k, allowed in (("backend", BACKENDS), ("device", DEVICES), ("pace", PACES)):
         _check_choice(k, c[k], allowed)
     _check_choice("sync.mode", c["sync"]["mode"], SYNC_MODES)

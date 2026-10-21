@@ -18,6 +18,8 @@
                                                      (stream them with --set video_variant=720p)
     python tools/live_run.py campaign run --plan lab_5090 --group main|unity [--unity-project PATH]   # v0.8.3 test
     python tools/live_run.py campaign pack|report <folder or zip>        campaign (analysis/live/campaign.py)
+    python tools/live_run.py engine --clip singles_05x --preset rtx5090   # v0.8.4 live engine (stdin commands; the
+                                                     live server starts and drives it: analysis/live/engine.py)
 
 --clip is a file in configs/live/ (or a path), --preset one in configs/live/presets/ (or a path); every key of
 configs/live/defaults.yaml can be changed with --set key.sub=value (repeatable). --dry-run prints the resolved config.
@@ -211,6 +213,11 @@ def cmd_transcode(a):
         print(f"{r['view']}: {r['path']}")
 
 
+def cmd_engine(a):
+    from analysis.live import engine
+    engine.serve(a.clip, preset=a.preset, base_sets=list(a.set or []), runs_dir=a.runs_dir, commands=a.commands)
+
+
 def cmd_campaign(a):
     from analysis.live import campaign
     if a.action == "run":
@@ -225,8 +232,9 @@ def cmd_campaign(a):
 
 
 def main(argv=None):
-    if argv is None and any(x.replace(" ", "") == "rtmpose.ep=trt" for x in sys.argv[1:]):
-        from analysis.live import pose2d_fast            # TensorRT's folders on LD_LIBRARY_PATH (restarts once)
+    if argv is None and len(sys.argv) > 1 and sys.argv[1] in ("run", "sweep", "bench2d", "engine"):
+        # TensorRT's folders on LD_LIBRARY_PATH (restarts once; a no-op without TensorRT): a preset can turn it on
+        from analysis.live import pose2d_fast
         pose2d_fast.ensure_trt_library_path()
     ap = argparse.ArgumentParser(prog="python tools/live_run.py", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -288,6 +296,14 @@ def main(argv=None):
     p.add_argument("--crf", type=int, default=18)
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_transcode)
+    p = sub.add_parser("engine", help="v0.8.4 live engine: models stay loaded; JSON commands on stdin (warmup / "
+                                      "stream / stop / quit), ENGINE status lines on stdout (the live server drives it)")
+    p.add_argument("--clip", required=True)
+    p.add_argument("--preset")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE")
+    p.add_argument("--runs-dir", default="runs")
+    p.add_argument("--commands", help="read commands appended to this file instead of stdin (the live server's way)")
+    p.set_defaults(fn=cmd_engine)
     p = sub.add_parser("campaign", help="v0.8.3 test campaign: run | pack | report")
     p.add_argument("action", choices=("run", "pack", "report"))
     p.add_argument("target", nargs="?", help="pack / report: the campaign folder or its zip")

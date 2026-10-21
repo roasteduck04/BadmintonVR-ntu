@@ -38,8 +38,9 @@ def _court_points():
 
 
 class Calib:
-    def __init__(self, repo, unity):
+    def __init__(self, repo, unity, input_fn=None):
         self.repo, self.unity = str(repo), str(unity)
+        self.input_fn = input_fn or (lambda: {"kind": "video"})     # v0.8.4: the Source tab's choice
         self.calib_dir = os.path.join(self.repo, "data", "calib")
         self.frames_dir = os.path.join(self.calib_dir, "frames")
 
@@ -68,6 +69,10 @@ class Calib:
                                    saved_proj=self.reprojected(cd))
                     except (OSError, ValueError, KeyError, TypeError):
                         cam["calibrated"] = False
+                inp = self.input_fn() or {}
+                url = (inp.get("cameras") or {}).get(view) if inp.get("kind") == "camera" else None
+                if url:                                   # v0.8.4 camera source: frames come from the stream
+                    cam.update(video=url, has_video=True, input="camera")
                 out.append(cam)
         return out
 
@@ -99,9 +104,12 @@ class Calib:
         if not cam.get("has_video"):
             raise HTTPException(404, f"video of {cam['view']} not found ({cam.get('video')})")
         os.makedirs(self.frames_dir, exist_ok=True)
-        cap = cv2.VideoCapture(os.path.join(self.repo, cam["video"]))
+        is_url = "://" in str(cam["video"])
+        cap = cv2.VideoCapture(cam["video"], cv2.CAP_FFMPEG) if is_url else cv2.VideoCapture(os.path.join(self.repo, cam["video"]))
         try:
-            if frame is not None:
+            if is_url:                                    # a live camera: the frame it sends now
+                pass
+            elif frame is not None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame)))
             else:
                 cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t_s)) * 1000.0)

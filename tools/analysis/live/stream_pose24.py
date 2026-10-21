@@ -10,6 +10,9 @@ budget_s after its last step arrived (budget None = asfast: never late); late pl
 fallback (quality 2) and the late solution is dropped (stream.late_policy drop), waited for (use), or - v0.8.3
 "behind" - waited for only while the stream is behind anyway (the window's last step reached the core more than
 budget_s after its capture time: dropping then saves no delay, it only loses the fit and the next window's warm start). Output frames are emitted once each, in step order.
+v0.8.4 live engine: warm_state (export_warm_state() of an earlier warm-up: body models, ankle plane) starts the core
+already warm - no warm-up steps, the tracker re-acquires P1 / P2 by court half from the first step, the first window
+is fitted with the saved body models. stop_at(m) ends a stream early (only steps < m are published at flush).
 Gap handling (spec 6.2, causal): a step whose body has been unseen for more than max_gap steps (fit.MAX_GAP = 20 frames
 at 60 fps, scaled to the step rate) is invalid (NaN, quality NONE). The leading edge of a gap, up to max_gap steps, is
 still held/interpolated by the fit and output with quality FITTED but flagged interp=True (confidence 'filled')."""
@@ -45,9 +48,30 @@ class _Window:
     ev: dict = field(default_factory=dict)
 
 
+def model_to_dict(m) -> dict:
+    return {"lengths": _plain(m.lengths), "rest": np.asarray(m.rest, float).tolist(), "sgn": float(m.sgn)}
+
+
+def model_from_dict(d):
+    lengths = d["lengths"]
+    return stream_fit.BodyModel(lengths, fit.edge_arrays(lengths), np.asarray(d["rest"], float), float(d["sgn"]))
+
+
+def _plain(x):
+    if isinstance(x, dict):
+        return {str(k): _plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_plain(v) for v in x]
+    if isinstance(x, (np.floating, np.integer)):
+        return x.item()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    return x
+
+
 class StreamPose24:
     def __init__(self, cfg, cams, budget_s=None, workers=0, score_params=None, events=None,
-                 clock=time.monotonic_ns):
+                 clock=time.monotonic_ns, warm_state=None):
         self.views = sorted(cfg["views"])
         self.cams = {v: cams[v] for v in self.views}
         self.P = pv.proj_mats(self.cams, self.views)
@@ -55,7 +79,7 @@ class StreamPose24:
         self.n = len(self.ref_frames)
         self.fps = float(cfg["fps"])
         self.kind = cfg["skeleton"]
-        self.warm = int(cfg["warmup_steps"])
+        self.warm = 0 if warm_state else int(cfg["warmup_steps"])
         self.warmed = False
         self.max_gap = int(round(fit.MAX_GAP * self.fps / float(cfg["source_fps"])))   # MAX_GAP: source frames
         self.hist = int(cfg["history"])
@@ -73,8 +97,9 @@ class StreamPose24:
         if self.late_policy not in ("drop", "use", "behind"):
             raise ValueError(f"stream.late_policy must be drop, use or behind, got {self.late_policy!r}")
         self.partner_px = float(cfg["sync"]["partner_max_px"])
-        self.tracker = SinglesTracker(self.cams, self.views, self.fps, cfg["tracker"], ankle_h=cfg.get("ankle_h_m"),
-                                      wcfg=cfg.get("warmup"), warm_steps=int(cfg["warmup_steps"]))
+        ankle = (warm_state or {}).get("ankle_h_m") if warm_state else cfg.get("ankle_h_m")
+        self.tracker = SinglesTracker(self.cams, self.views, self.fps, cfg["tracker"], ankle_h=ankle,
+                                      wcfg=cfg.get("warmup"), warm_steps=self.warm)
         self.n_tracker_events = 0
         self.late_init = {}
         self.pids = list(self.tracker.pids)
@@ -86,6 +111,11 @@ class StreamPose24:
         self.seen = {p: np.zeros(self.n, bool) for p in self.pids}
         self.ema = {p: fallback.EmaSmoother(cfg["fallback"]["alpha"], cfg["fallback_max_hold"]) for p in self.pids}
         self.model = {}
+        if warm_state:
+            for pid, m in (warm_state.get("models") or {}).items():
+                if pid in self.pids and m:
+                    self.model[pid] = model_from_dict(m)
+            self.warmed = True
         self.stepper = stream_fit.WindowStepper(self.warm, self.n, cfg["window"], cfg["overlap"])
         self.pending = self.stepper.next_window()
         self.inflight, self.ready = [], {}
@@ -316,6 +346,23 @@ class StreamPose24:
                          nfev={p: r.get("nfev") for p, r in win.result.items()},
                          t_done_ns={p: r["t_done_ns"] for p, r in win.result.items()}, status=dict(win.status),
                          regress_ns=time.perf_counter_ns() - t0, t_resolved_ns=self.clock()))
+
+    # ------------------------------------------------------------------ v0.8.4 warm state / early stop
+    def export_warm_state(self) -> dict:
+        """What a later stream can reuse instead of its own warm-up: each player's body model and the ankle plane."""
+        return {"models": {pid: (model_to_dict(m) if m is not None else None) for pid, m in self.model.items()},
+                "ankle_h_m": float(self.tracker.ankle_h), "views": list(self.views), "fps": self.fps}
+
+    def stop_at(self, m):
+        """End the stream after step m - 1: steps >= m are never published (a stopped live stream)."""
+        m = max(int(m), self.next_pub)
+        if m >= self.n:
+            return
+        self.n = m
+        self.stepper.n = m
+        if self.pending is not None:
+            lo, start, stop, commit = self.pending
+            self.pending = None if start >= m else (lo, start, min(stop, m), min(commit, m) if stop < m else m)
 
     # ------------------------------------------------------------------ end of stream
     def flush(self, sleep_s=0.002):

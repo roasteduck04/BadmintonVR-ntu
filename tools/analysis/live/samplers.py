@@ -30,7 +30,8 @@ class GpuSampler:
         self.fh.flush()
         try:
             self.proc = subprocess.Popen([exe, f"--query-gpu={GPU_FIELDS}", "--format=csv,noheader,nounits",
-                                          f"-lms={self.interval_ms}"], stdout=self.fh, stderr=subprocess.DEVNULL)
+                                          f"-lms={self.interval_ms}"], stdout=self.fh, stderr=subprocess.DEVNULL,
+                                         stdin=subprocess.DEVNULL)
         except OSError as e:
             self.error = f"{type(e).__name__}: {e}"
         return self

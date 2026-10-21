@@ -11,6 +11,11 @@ deliver it) and the 3D core is polled while waiting, so fits finish and frames a
 Sync `auto`: the warm-up runs with zero offsets; right after the last warm-up step the per-view offsets are
 estimated (pose_v2.estimate_offsets on the warm-up observations, at step rate) and the rest of the schedule is rebuilt.
 
+v0.8.4 live engine: Runner(..., source=<an open source>, session=True) runs one stream as a session of that source
+(models stay loaded; the source is not closed), warm_state= starts the 3D core warm (no warm-up steps, offsets and
+facing signs from the state), stop_event= ends the stream early (the frames so far are finalised), and
+export_warm=True puts a warm state for later streams into the result (res["warm_state"]).
+
 Events (timing.jsonl): node "runner": "frames" (per step: capture / availability / 2D timings per view), "out"
 (per written frame), "sync", "phase"; node "pose3d": the core's "step" / "window" / "warmup"."""
 from __future__ import annotations
@@ -65,9 +70,12 @@ def estimate_offsets(core, cfg, upto, log=print) -> dict:
 
 
 class Runner:
-    def __init__(self, cfg, run_dir, log=print, source=None, cams=None, clock=time.monotonic_ns, sleep=time.sleep):
+    def __init__(self, cfg, run_dir, log=print, source=None, cams=None, clock=time.monotonic_ns, sleep=time.sleep,
+                 session=False, warm_state=None, stop_event=None, export_warm=False, on_step=None):
         self.cfg, self.run_dir, self.log, self.cams = cfg, run_dir, log, cams
         self.source, self.clock, self.sleep = source, clock, sleep
+        self.session, self.warm_state, self.stop_event = bool(session), warm_state, stop_event
+        self.export_warm, self.on_step = bool(export_warm), on_step
         framewriter.refuse_inside_assets(run_dir)
 
     # ------------------------------------------------------------------ helpers
@@ -136,7 +144,7 @@ class Runner:
         self.src = self.source or sources.make(c, log=log)
         budget = c["fit_budget_s"] if c["pace"] == "realtime" else None
         self.core = StreamPose24(c, cams, budget_s=budget, workers=c["workers"], events=self.tl.write,
-                                 clock=self.clock)
+                                 clock=self.clock, warm_state=self.warm_state)
         sides = self.core.tracker.sides
         k_cal = c.get("video_to_calib") or {}      # the 2D is in calibration pixels (a smaller video copy is rescaled)
         image_size = {v: [int(round(c["source"][v]["width"] * k_cal.get(v, 1.0))),
@@ -145,12 +153,19 @@ class Runner:
                                               write_frames=c["output"]["frames"],
                                               background=bool(c["output"].get("background_writer", True)),
                                               on_written=self._written)
+        for pid, sg in ((self.warm_state or {}).get("signs") or {}).items():     # facing handedness from the warm-up
+            if pid in self.writer.signs and sg is not None:
+                self.writer.signs[pid].fixed = float(sg)
         self.outs, cap = [], {}
         plan = plan_for(c, schedule)
         ref0 = c["ref_frames"][0]
         origins = {v: ref0 + float(c["offsets"][v]) for v in c["views"]}
         t_src = time.perf_counter()
-        self.src.start(plan, origins)
+        if self.session:
+            self.src.log = log                          # an engine's source outlives the run that opened it
+            self.src.session(plan, origins, realtime=c["pace"] == "realtime")
+        else:
+            self.src.start(plan, origins)
         src_ready_s = time.perf_counter() - t_src
         setup_s = time.perf_counter() - t_setup
         sync_info = None
@@ -168,6 +183,10 @@ class Runner:
             t_loop = time.perf_counter()
             i = 0
             while i < n:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    log(f"  stopped at step {i}")
+                    self.core.stop_at(i)
+                    break
                 st = schedule[i]
                 t_capture = t0 + int((st["ref_frame"] - ref0) / sfps * 1e9)
                 if realtime:
@@ -183,7 +202,10 @@ class Runner:
                 self._emit(self.core.push({"step": i, "ref_frame": st["ref_frame"], "t_recv_ns": t_push,
                                            "t_capture_ns": t_capture,
                                            "views": views}), cap)
-                if c["offsets_source"] == "auto" and sync_info is None and i == c["warmup_steps"] - 1:
+                if self.on_step is not None:
+                    self.on_step(i, n, len(self.outs))
+                if (c["offsets_source"] == "auto" and sync_info is None and not self.warm_state
+                        and i == c["warmup_steps"] - 1):
                     sync_info = estimate_offsets(self.core, c, i + 1, log)
                     c["offsets"] = sync_info["offsets"]
                     c["offsets_estimated"] = sync_info
@@ -203,10 +225,22 @@ class Runner:
             self._emit(self.core.flush(), cap)
             self.writer.close()
             loop_s = time.perf_counter() - t_loop
+            warm = None
+            if self.export_warm:
+                warm = self.core.export_warm_state()
+                warm["signs"] = {pid: (sl.fixed if sl.fixed is not None else
+                                       (-1.0 if sl.vals and float(np.median(sl.vals)) < 0 else 1.0))
+                                 for pid, sl in self.writer.signs.items()}
+                warm["offsets"] = dict(c["offsets"])
+                warm["offsets_source"] = c["offsets_source"]
             self.core.close()
-            self.src.close()
+            if self.session:
+                self.src.end_session()
+            else:
+                self.src.close()
             self.tl.write({"ev": "phase", "phase": "end", "loop_s": loop_s})
-        res = {"steps": n, "written": len(self.outs), "loop_s": loop_s, "setup_s": setup_s,
+        n = min(n, self.core.n)
+        res = {"steps": n, "written": len(self.outs), "loop_s": loop_s, "setup_s": setup_s, "warm_state": warm,
                "source_ready_s": src_ready_s, "writer": self.writer.stats(), "sync": sync_info,
                "offsets": dict(c["offsets"]), "gpu_sampler_error": gs.error, "cpu_sampler_error": cs.error,
                "source_info": getattr(self.src, "info", {})}

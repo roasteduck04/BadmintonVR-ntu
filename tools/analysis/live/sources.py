@@ -1,6 +1,8 @@
 """2D frame sources for a live run: detections of one camera at one source frame, plus how long they took.
 
     src = make(cfg); src.start(plan, origins); src.begin(t0_ns); dets, tim = src.get(view, frame); src.close()
+    v0.8.4 live engine (models loaded once, many streams):
+    src.open(); [src.session(plan, origins, realtime); src.begin(t0_ns); ... get ...; src.end_session()] * n; src.close()
 
 `plan` = {view: sorted source frames the run may ask for}; `origins` = {view: source frame (float) captured at t0}
 (the section start + the view's offset), so a frame's capture time is t0 + (frame - origin) / source_fps.
@@ -53,6 +55,18 @@ class CachedSource:
 
     def start(self, plan, origins):
         self.origins = {v: float(origins[v]) for v in plan}
+
+    def open(self, ready_timeout_s=None):
+        pass
+
+    def session(self, plan, origins, realtime=None, timeout_s=None):
+        self.start(plan, origins)
+        self.t0 = None
+        if realtime is not None:
+            self.realtime = bool(realtime)
+
+    def end_session(self, timeout_s=None):
+        pass
 
     def begin(self, t0_ns):
         self.t0 = int(t0_ns)
@@ -251,6 +265,81 @@ class VideoRtmlibSource:
             self.log(f"  2D worker {v}: model ready in {payload['model_load_ns'] / 1e9:.1f} s, "
                      f"providers {payload['providers']}{extra}")
 
+    # ------------------------------------------------------------------ v0.8.4 sessions (live engine)
+    def open(self, ready_timeout_s=600):
+        """Start the 2D processes in session mode (fast engine): models loaded and warmed once, no plan yet."""
+        c = self.cfg
+        rc = dict(c["rtmpose"])
+        if rc.get("engine", "rtmlib") != "fast":
+            raise ValueError("the live engine needs rtmpose.engine=fast")
+        from . import cpulimits, pose2d_fast
+        cb = c.get("cpu_budget") or {}
+        rc["_threads"] = cb.get("pose2d")
+        if cb and not rc.get("decode_threads"):
+            rc["decode_threads"] = cb.get("decode")
+        if rc.get("ep") == "trt":
+            ready_timeout_s = max(ready_timeout_s, 3600)
+        rc["_cam_paths"] = dict(c["cam_paths"])
+        rc["_video_to_calib"] = dict(c.get("video_to_calib") or {})
+        groups = [list(c["views"])] if rc.get("batch_views") else [[v] for v in c["views"]]
+        for v in c["views"]:
+            self.queues[v] = self.ctx.Queue(maxsize=0)
+            self.stash[v] = {}
+        for g in groups:
+            cq = self.ctx.Queue()
+            self.ctl.append(cq)
+            self.ctl_views.append(list(g))
+            p = self.ctx.Process(target=pose2d_fast.fast_worker, name="pose2d-" + "+".join(g), daemon=True,
+                                 args=(g, {v: c["videos"][v] for v in g}, None, None, rc, c["device"],
+                                       float(c["source_fps"]), self.t0_val, self.go_ev, True,
+                                       {v: self.queues[v] for v in g}, self.stop_ev, 1.0 / float(c["fps"]), cq))
+            with cpulimits.child_env(rc.get("_threads")):
+                p.start()
+            for v in g:
+                self.procs[v] = p
+        self.sessions = True
+        self._wait_ready(ready_timeout_s, "model ready")
+
+    def _wait_ready(self, timeout_s, what):
+        for v in self.cfg["views"]:
+            kind, _, payload = self._next(v, timeout_s)
+            while kind in ("frame", "done"):          # leftovers of an earlier session
+                kind, _, payload = self._next(v, timeout_s)
+            if kind != "ready":
+                raise RuntimeError(f"2D worker {v} failed to start: {payload}")
+            self.info[v] = payload
+            self.log(f"  2D worker {v}: {what}" + (f" in {payload['model_load_ns'] / 1e9:.1f} s" if what == "model ready"
+                                                   else "") + f", providers {payload['providers']}, "
+                     f"decoder {payload['decoder']} {payload['decode_size'][0]}x{payload['decode_size'][1]}")
+
+    def session(self, plan, origins, realtime=None, timeout_s=120):
+        """One stream on the loaded models: every worker opens its readers at the plan's first frames."""
+        self.go_ev.clear()
+        self.done = set()
+        self.stash = {v: {} for v in self.cfg["views"]}
+        rt = (self.cfg["pace"] == "realtime") if realtime is None else bool(realtime)
+        for cq, vs in zip(self.ctl, self.ctl_views):
+            cq.put({"session": {"plans": {v: list(plan[v]) for v in vs}, "origins": {v: float(origins[v]) for v in vs},
+                                "realtime": rt}})
+        self._wait_ready(timeout_s, "session ready")
+
+    def end_session(self, timeout_s=30):
+        """Stop the current stream's 2D (if still running) and wait until every worker is idle again."""
+        for cq in self.ctl:
+            cq.put({"end": True})
+        t_end = time.monotonic() + timeout_s
+        for v in self.cfg["views"]:
+            while v not in self.done and time.monotonic() < t_end:
+                try:
+                    msg = self.queues[v].get(timeout=0.2)
+                except queue_mod.Empty:
+                    continue
+                if msg[0] == "done":
+                    self.done.add(v)
+                elif msg[0] == "error":
+                    raise RuntimeError(f"2D worker {v}: {msg[2]}")
+        self.go_ev.clear()
+
     def begin(self, t0_ns):
         self.t0_val.value = int(t0_ns)
         self.go_ev.set()
@@ -258,7 +347,8 @@ class VideoRtmlibSource:
     def narrow(self, keep):
         """The run needs only these frames from now on ({view: frames}): workers skip the others (not decoded / posed)."""
         for cq, vs in zip(self.ctl, self.ctl_views):
-            cq.put({v: list(keep.get(v, [])) for v in vs} if isinstance(vs, list) else list(keep.get(vs, [])))
+            cq.put({"keep": {v: list(keep.get(v, [])) for v in vs}} if isinstance(vs, list)
+                   else list(keep.get(vs, [])))
 
     def _next(self, view, timeout_s):
         try:

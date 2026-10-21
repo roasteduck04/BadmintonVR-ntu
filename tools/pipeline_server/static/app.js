@@ -25,9 +25,64 @@ const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
   document.querySelectorAll("#tabs button").forEach((x) => x.classList.toggle("on", x === b));
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.id === "tab-" + b.dataset.tab));
+  if (b.dataset.tab === "source") loadSource();
   if (b.dataset.tab === "calibrate") openCalibrate();
   if (b.dataset.tab === "stream") loadSettings();          // a new calibration / sync file shows in the clip line
 }));
+
+// ------------------------------------------------------------------ 0 Source
+async function loadSource() {
+  const clip = $("#clip").value;
+  try {
+    const [inp, cams, vars] = await Promise.all([api("/api/input"), api("/calib/api/cameras"),
+      api(`/api/input/variants?clip=${encodeURIComponent(clip)}`)]);
+    const c = state.clips.find((x) => x.name === clip) || { views: [] };
+    $("#src-clip").textContent = clip;
+    document.querySelectorAll('input[name="kind"]').forEach((r) => (r.checked = r.value === inp.kind));
+    showSourceKind(inp.kind);
+    const byView = Object.fromEntries(cams.map((x) => [x.view, x]));
+    $("#src-videos tbody").innerHTML = c.views.map((v) => {
+      const cam = byView[v] || {};
+      const vid = cam.input === "camera" ? "(camera source active)" : (cam.video || "–");
+      return `<tr><td class="name">${v}</td><td class="name">${vid}${cam.has_video === false ? ' <span class="badc">missing</span>' : ""}</td></tr>`;
+    }).join("");
+    $("#src-variant").innerHTML = [`<option value="">as recorded</option>`]
+      .concat((vars.variants || []).map((t) => `<option value="${t}">${t} copies</option>`)).join("");
+    $("#src-variant").value = inp.video_variant || "";
+    $("#src-cams tbody").innerHTML = c.views.map((v) => `<tr><td class="name">${v}</td>
+      <td><input data-cam="${v}" placeholder="rtsp://… or http://…/stream.mjpg" value="${(inp.cameras || {})[v] || ""}"></td>
+      <td class="muted" data-test="${v}">–</td></tr>`).join("");
+    $("#src-fps").value = inp.fps; $("#src-mins").value = inp.max_minutes;
+    $("#src-msg").textContent = "";
+  } catch (e) { toast("source: " + e.message); }
+}
+function showSourceKind(kind) { $("#src-video").hidden = kind !== "video"; $("#src-camera").hidden = kind !== "camera"; }
+document.querySelectorAll('input[name="kind"]').forEach((r) => r.addEventListener("change", () => showSourceKind(r.value)));
+function sourceForm() {
+  const kind = (document.querySelector('input[name="kind"]:checked') || {}).value || "video";
+  const cameras = {};
+  document.querySelectorAll("#src-cams input[data-cam]").forEach((i) => { if (i.value.trim()) cameras[i.dataset.cam] = i.value.trim(); });
+  return { kind, cameras, fps: Number($("#src-fps").value), max_minutes: Number($("#src-mins").value),
+    video_variant: $("#src-variant").value || null };
+}
+$("#src-save").addEventListener("click", async () => {
+  try {
+    const d = await api("/api/input", sourceForm());
+    $("#src-msg").textContent = `Saved: ${d.kind === "camera" ? Object.keys(d.cameras).length + " camera streams" : "video files" + (d.video_variant ? " (" + d.video_variant + ")" : "")}. Warm up again before streaming.`;
+    loadSettings();
+  } catch (e) { toast(e.message, 7000); }
+});
+$("#src-test").addEventListener("click", async () => {
+  const f = sourceForm();
+  document.querySelectorAll("[data-test]").forEach((td) => (td.textContent = f.cameras[td.dataset.test] ? "testing…" : "–"));
+  try {
+    const r = await api("/api/input/test", { cameras: f.cameras });
+    Object.entries(r).forEach(([v, x]) => {
+      const td = document.querySelector(`[data-test="${v}"]`);
+      if (td) { td.className = x.ok ? "good" : "badc"; td.textContent = x.ok ? `✓ ${x.size[0]}×${x.size[1]} (${x.ms} ms)` : `✗ ${x.error}`; }
+    });
+  } catch (e) { toast(e.message, 7000); }
+});
 
 // ------------------------------------------------------------------ 1 Calibrate
 function openCalibrate() {
@@ -138,7 +193,9 @@ function renderForm() {
 
 function sourceLine() {
   const v = state.values;
-  const src = v.backend === "live" ? "straight from the videos (2D pose on the GPU, frame by frame)" : "the stored 2D files (this machine has no NVIDIA GPU)";
+  const cam = state.input && state.input.kind === "camera";
+  const src = cam ? `live camera streams (${Object.keys(state.input.cameras || {}).length} cameras, tab 0 Source)`
+    : v.backend === "live" ? "straight from the videos (2D pose on the GPU, frame by frame)" : "the stored 2D files (this machine has no NVIDIA GPU)";
   $("#source-line").innerHTML = `<b>Source:</b> ${src} · ${v.output_fps} fps · ${v.pace === "realtime" ? "real time (camera clock)" : "as fast as possible"}`;
 }
 
@@ -172,6 +229,7 @@ function markChanged() {
 async function loadSettings() {
   const clip = $("#clip").value, preset = $("#preset").value;
   if (!clip) return;
+  try { state.input = await api("/api/input"); } catch (e) { state.input = null; }
   try {
     const d = await api(`/api/settings?clip=${encodeURIComponent(clip)}&preset=${encodeURIComponent(preset)}`);
     state.base = d.values; state.values = JSON.parse(JSON.stringify(d.values));
@@ -218,30 +276,79 @@ async function start(force) {
   } catch (e) {
     $("#start").disabled = false;
     if (e.detail && e.detail.code === "unity_not_playing") { $("#confirm-msg").textContent = e.detail.message; $("#confirm").hidden = false; }
-    else toast(e.message, 7000);
+    else toast(e.message, 9000);
   }
+}
+
+async function warmup() {
+  try {
+    $("#warm").disabled = true;
+    showJob(await api("/api/engine/warmup", { clip: $("#clip").value, preset: $("#preset").value, values: state.values }));
+    toast("Warming up: the models load once, then the first frames pick the players.", 5000);
+    pollJob();
+  } catch (e) { $("#warm").disabled = false; toast(e.message, 8000); }
+}
+$("#warm").addEventListener("click", warmup);
+$("#engine-off").addEventListener("click", async () => {
+  try { showJob(await api("/api/engine/stop", {})); toast("Engine shut down (the models are unloaded)."); } catch (e) { toast(e.message); }
+});
+
+const ENGINE_WORDS = { starting: "Engine starting", cold: "Engine started", loading: "Loading the models",
+  warming: "Warming up the players", ready: "Ready to stream", streaming: "Streaming", off: "Engine off" };
+
+function showEngine(j) {
+  const eng = j && j.kind === "engine" && j.state === "running" ? (j.engine || {}) : null;
+  const pill = $("#engine"), det = $("#engine-detail");
+  $("#engine-off").disabled = !eng;
+  if (!eng) {
+    pill.className = "pill"; pill.textContent = "Engine: off";
+    $("#warm").disabled = false; $("#warm").textContent = "1 Warm up";
+    det.textContent = 'Off. Step 1 "Warm up" loads the 2D models and picks the players once; step 2 then streams from that warm state as often as you like.';
+    return null;
+  }
+  const busy = ["starting", "cold", "loading", "warming", "streaming"].includes(eng.state);
+  pill.className = "pill " + (eng.state === "ready" ? "warm" : busy ? "busy" : "");
+  pill.textContent = `Engine: ${ENGINE_WORDS[eng.state] || eng.state}`;
+  $("#warm").disabled = busy;
+  $("#warm").textContent = eng.warm ? "1 Warm up again" : "1 Warm up";
+  const w = eng.warm;
+  const bits = [`${eng.clip} · ${eng.preset}`];
+  if (eng.models_s != null) bits.push(`models loaded in ${fmt(eng.models_s)} s`);
+  if (w) {
+    const pl = Object.entries(w.players || {}).map(([p, ok]) => `${p} ${ok ? "✓" : "✗"}`).join(" ");
+    const offs = Object.entries(w.offsets || {}).map(([v, o]) => `${v.replace(/_\d+$/, "")} ${o >= 0 ? "+" : ""}${Number(o).toFixed(1)}`).join(", ");
+    bits.push(`warm since ${(w.made || "").slice(11, 16)}: ${pl}, floor ${fmt((w.ankle_h_m || 0) * 100)} cm, offsets ${offs}`);
+    bits.push(`${eng.streams} stream${eng.streams === 1 ? "" : "s"} from this warm-up`);
+  } else bits.push(busy ? "warming up…" : "not warm: press 1 Warm up");
+  if (eng.error && eng.error.message) bits.push(`last error: ${eng.error.message}`);
+  det.textContent = bits.join(" · ");
+  return eng;
 }
 $("#start").addEventListener("click", () => start(false));
 $("#confirm-anyway").addEventListener("click", () => start(true));
 $("#confirm-cancel").addEventListener("click", () => ($("#confirm").hidden = true));
 $("#stop").addEventListener("click", async () => { try { showJob(await api("/api/stream/stop", {})); } catch (e) { toast(e.message); } });
 
+const meta_title = (j) => (j.meta && j.meta.title) || j.title;
 const mmss = (s) => (s == null || !isFinite(s) ? "–" : s < 60 ? `${Math.round(s)} s` : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`);
 const ICON = { pending: "○", done: "✓", failed: "✗", stopped: "■" };
 
 function showJob(j) {
   const box = $("#job");
   box.className = "job " + (j ? j.state : "idle");
-  const running = !!(j && (j.state === "running" || j.state === "starting"));
-  $("#start").disabled = running; $("#stop").disabled = !running;
-  $("#start").textContent = running ? "Streaming…" : "Start streaming to Unity";
+  const eng = showEngine(j);
+  const running = eng ? ["starting", "cold", "loading", "warming", "streaming"].includes(eng.state)
+    : !!(j && (j.state === "running" || j.state === "starting"));
+  const streaming = eng ? eng.state === "streaming" : running;
+  $("#start").disabled = eng ? eng.state !== "ready" : true; $("#stop").disabled = !streaming;
+  $("#start").textContent = streaming ? "Streaming…" : "2 Start streaming to Unity";
   if (!j) {
     $("#job-title").textContent = "Idle"; $("#job-stats").textContent = ""; $("#job-folder").textContent = "";
     $("#phases").innerHTML = ""; $("#bar").className = "bar"; $("#bar-fill").style.width = "0"; $("#bar-text").textContent = "";
     $("#open-folder").hidden = true; return;
   }
   const words = { starting: "Starting", running: "Streaming", done: "Stream finished", failed: "Failed", stopped: "Stopped" };
-  $("#job-title").textContent = `${words[j.state] || j.state}: ${j.title}`;
+  $("#job-title").textContent = eng ? `${ENGINE_WORDS[eng.state] || eng.state}: ${meta_title(j)}` : `${words[j.state] || j.state}: ${j.title}`;
   const p = j.progress || {}, ph = j.phases || [], now = j.now || Date.now() / 1000, meta = j.meta || {};
   // phases: ✓ done (how long it took), spinner = now (how long so far), ○ still to come
   $("#phases").innerHTML = ph.map((x) => {
@@ -255,15 +362,21 @@ function showJob(j) {
   const counting = act && (act.id === "warmup" || act.id === "stream") && p.steps;
   const pct = p.steps ? Math.min(100, Math.round((p.written / p.steps) * 100)) : 0;
   $("#bar").className = "bar" + (running && !counting ? " indet" : "");
-  $("#bar-fill").style.width = `${j.state === "done" ? 100 : pct}%`;
+  const ls = eng && eng.last_stream;
+  const idleDone = eng ? (!running && ls) : j.state === "done";
+  $("#bar-fill").style.width = `${idleDone ? 100 : pct}%`;
   $("#bar-text").textContent = running ? (counting ? `${pct}% · frame ${p.written} / ${p.steps}` : act ? act.label + "…" : "starting…")
+    : eng ? (ls ? (ls.stopped ? `stopped · ${ls.written} frames` : "done") : (eng.warm ? "ready" : ""))
     : j.state === "done" ? "done" : words[j.state] || "";
   // speed since the first frame step (warm-up start) and time left at that speed
   const t0 = (ph.find((x) => x.id === "warmup" && x.t0) || ph.find((x) => x.id === "stream" && x.t0) || {}).t0;
   const t1 = (ph.find((x) => x.id === "stream") || {}).t1 || (running ? now : j.ended);
   const rate = t0 && p.written ? p.written / Math.max(0.1, t1 - t0) : null;
   const left = rate && p.steps && running && counting ? (p.steps - p.written) / rate : null;
-  const bits = [`elapsed ${mmss(j.elapsed_s)}`];
+  const t_first = ph.length && ph[0].t0 ? ph[0].t0 : null;           // engine: this warm-up / stream, not the engine
+  const t_last = ph.length ? (ph.map((x) => x.t1).filter(Boolean).pop() || null) : null;
+  const elapsed = eng && t_first ? ((running ? now : (t_last || now)) - t_first) : j.elapsed_s;
+  const bits = [`elapsed ${mmss(elapsed)}`];
   if (p.steps) bits.unshift(`${p.written} / ${p.steps} frame files`);
   if (rate) bits.push(`${fmt(rate)} frames/s${meta.fps ? ` (${fmt(rate / meta.fps, 2)}× real time)` : ""}`);
   if (left != null) bits.push(`about ${mmss(left)} left`);
@@ -274,9 +387,12 @@ function showJob(j) {
   $("#open-folder").hidden = !meta.run; $("#open-folder").dataset.run = meta.run || "";
   $("#job-err").textContent = j.error || "";
   $("#job-log").textContent = (j.log || []).join("\n");
-  if (state.lastState === "running" && j.state !== "running") { loadRuns(); if (meta.run) loadTiming(meta.run); }
+  const key = eng ? eng.state : j.state;
+  if ((state.lastState === "running" && key !== "running") || (state.lastState === "streaming" && key !== "streaming")) {
+    loadRuns(); if (meta.run) loadTiming(meta.run);
+  }
   if (!state.lastState && !running && meta.run && j.state === "done") loadTiming(meta.run);
-  state.lastState = j.state;
+  state.lastState = key;
 }
 
 $("#open-folder").addEventListener("click", async (ev) => {
@@ -339,7 +455,7 @@ async function pollJob() {
   try {
     const [d, u] = await Promise.all([api("/api/job"), api("/api/unity")]);
     showJob(d.current); showUnity(u);
-    const running = d.current && (d.current.state === "running" || d.current.state === "starting");
+    const running = d.current && (d.current.state === "running" || d.current.state === "starting");   // incl. the engine
     clearTimeout(state.polling);
     state.polling = setTimeout(pollJob, running ? 1000 : 2000);
   } catch (e) { clearTimeout(state.polling); state.polling = setTimeout(pollJob, 5000); }
