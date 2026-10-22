@@ -79,7 +79,10 @@ $("#src-test").addEventListener("click", async () => {
     const r = await api("/api/input/test", { cameras: f.cameras });
     Object.entries(r).forEach(([v, x]) => {
       const td = document.querySelector(`[data-test="${v}"]`);
-      if (td) { td.className = x.ok ? "good" : "badc"; td.textContent = x.ok ? `✓ ${x.size[0]}×${x.size[1]} (${x.ms} ms)` : `✗ ${x.error}`; }
+      if (!td) return;
+      td.className = x.ok ? "good" : "badc";
+      td.textContent = x.ok ? `✓ ${x.size[0]}×${x.size[1]} (${x.ms} ms)` : `✗ ${x.error}`;
+      if (x.thumb) { const img = document.createElement("img"); img.src = x.thumb; img.className = "cam-thumb"; td.append(img); }
     });
   } catch (e) { toast(e.message, 7000); }
 });

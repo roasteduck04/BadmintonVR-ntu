@@ -170,6 +170,10 @@ def test_fake_camera_serves_a_stream_the_camera_reader_reads(tmp_path):
         frames = [r.read(f) for f in range(5)]
         r.close()
         assert all(f is not None and f.shape == (36, 64, 3) for f in frames)
+        _, s = _server(tmp_path)                                         # the Source tab's Test cameras + preview
+        t = s.test_cameras({"v": f"http://127.0.0.1:{port}/v.mjpg", "bad": "not-a-url"})
+        assert t["v"]["ok"] and t["v"]["size"] == [64, 36] and t["v"]["thumb"].startswith("data:image/jpeg;base64,")
+        assert not t["bad"]["ok"]
     finally:
         cam.running = False
         srv.shutdown()

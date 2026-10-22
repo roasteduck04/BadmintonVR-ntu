@@ -10,6 +10,11 @@ Frames are shrunk to --short-side (default 1080) and JPEG-encoded (--quality); t
 4K calibration (config video_to_calib), as for a real camera of another resolution. --variant reads the
 `live_run.py transcode` copies (e.g. 720p: much lighter to decode than the 4K originals on a laptop).
 
+--webcam serves a camera attached to this machine instead (laptop webcam, USB camera), like a tablet or a Pi would:
+
+    python tools/fake_camera.py --webcam 0 [--webcam-size 1280x720] [--fps 30]
+    -> http://<this machine>:8090/webcam.mjpg
+
 On a Raspberry Pi the same idea serves the Pi camera instead of a file (a later version adds capture timestamps)."""
 from __future__ import annotations
 
@@ -91,6 +96,48 @@ class Camera(threading.Thread):
             return self.jpeg, self.seq
 
 
+class Webcam(Camera):
+    """A camera attached to this machine (index for OpenCV): every captured frame becomes the newest JPEG."""
+
+    def __init__(self, view, index, short_side, quality, size=None, fps=30.0):
+        threading.Thread.__init__(self, daemon=True, name=f"webcam-{view}")
+        import cv2
+        self.cv2, self.view, self.path = cv2, view, f"webcam {index}"
+        self.short, self.quality = short_side, int(quality)
+        api = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY       # MSMF often fails to open on Windows
+        self.cap = cv2.VideoCapture(int(index), api)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"webcam {index} does not open (in use by another app, or no such camera)")
+        if size:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+        self.cap.set(cv2.CAP_PROP_FPS, float(fps))
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or float(fps)        # DirectShow often reports 0
+        self.cond = threading.Condition()
+        self.jpeg, self.seq, self.size = None, 0, None
+        self.running = True
+
+    def run(self):
+        cv2 = self.cv2
+        try:
+            while self.running:
+                ok, img = self.cap.read()                                    # blocks until the camera's next frame
+                if not ok:
+                    time.sleep(0.05)
+                    continue
+                h, w = img.shape[:2]
+                tw, th = self._size(w, h)
+                if (tw, th) != (w, h):
+                    img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+                ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+                if ok:
+                    with self.cond:
+                        self.jpeg, self.seq, self.size = buf.tobytes(), self.seq + 1, (tw, th)
+                        self.cond.notify_all()
+        finally:
+            self.cap.release()
+
+
 def make_handler(cams):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -155,14 +202,27 @@ def main(argv=None):
     ap.add_argument("--short-side", type=int, default=1080, help="shrink frames to this shorter side (0 = as recorded)")
     ap.add_argument("--start-s", type=float, default=0.0, help="start this far into the videos")
     ap.add_argument("--quality", type=int, default=85, help="JPEG quality")
+    ap.add_argument("--webcam", help="serve camera(s) attached to this machine instead of videos: OpenCV index, e.g. 0 "
+                                     "or 0,1 (names webcam, webcam1, ...)")
+    ap.add_argument("--webcam-size", help="ask the webcam for this size, e.g. 1280x720 (default: its own)")
+    ap.add_argument("--fps", type=float, default=30.0, help="ask the webcam for this frame rate")
     a = ap.parse_args(argv)
-    paths = videos_for(a.clip, a.variant, a.views.split(",") if a.views else None)
-    t0 = time.monotonic() + 0.5
-    cams = {v: Camera(v, p, t0, a.start_s, a.short_side or None, a.quality) for v, p in paths.items()}
+    if a.webcam is not None:
+        size = tuple(int(x) for x in a.webcam_size.lower().split("x")) if a.webcam_size else None
+        idx = [int(x) for x in str(a.webcam).split(",")]
+        cams = {("webcam" if k == 0 else f"webcam{k}"): Webcam("webcam" if k == 0 else f"webcam{k}", i,
+                                                               a.short_side or None, a.quality, size, a.fps)
+                for k, i in enumerate(idx)}
+        paths = {v: c.path for v, c in cams.items()}
+    else:
+        paths = videos_for(a.clip, a.variant, a.views.split(",") if a.views else None)
+        t0 = time.monotonic() + 0.5
+        cams = {v: Camera(v, p, t0, a.start_s, a.short_side or None, a.quality) for v, p in paths.items()}
     for c in cams.values():
         c.start()
     srv = ThreadingServer((a.host, a.port), make_handler(cams))
-    print(f"fake cameras on port {a.port} (loop, shared clock, start {a.start_s:g} s):", flush=True)
+    print(f"fake cameras on port {a.port}" + ("" if a.webcam is not None else
+          f" (loop, shared clock, start {a.start_s:g} s)") + ":", flush=True)
     for v, p in paths.items():
         print(f"  {v}: http://localhost:{a.port}/{v}.mjpg  <- {p}", flush=True)
     try:

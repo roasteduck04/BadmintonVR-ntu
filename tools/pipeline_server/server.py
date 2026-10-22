@@ -47,6 +47,7 @@ NOW_PLAYING = "now_playing.json"
 UNITY_STATUS = "unity_status.json"
 UNITY_STALE_S = 3.0              # no heartbeat for this long = Unity is not in Play mode
 INPUT_FILE = "input.json"        # v0.8.4 Source tab (in the runs folder: machine-specific camera addresses)
+THUMB_W = 240                    # Test cameras preview width (px)
 # settings the warm-up depends on: changing one after the warm-up means warming up again
 WARM_PREFIXES = ("backend", "rtmpose.", "cpu.", "warmup.", "sync.offsets", "video_variant", "input.", "device")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
@@ -443,7 +444,8 @@ class Server:
         return ["input.kind=video"] + ([f"video_variant={d['video_variant']}"] if d.get("video_variant") else [])
 
     def test_cameras(self, cams) -> dict:
-        """One frame from every camera address: {view: {ok, size | error, ms}}."""
+        """One frame from every camera address: {view: {ok, size, ms, thumb (JPEG data URL) | error}}."""
+        import base64
         import cv2
         out = {}
         for v, url in (cams or {}).items():
@@ -456,9 +458,16 @@ class Server:
                 ok, img = cap.read() if cap.isOpened() else (False, None)
             finally:
                 cap.release()
-            out[v] = ({"ok": True, "size": [int(img.shape[1]), int(img.shape[0])],
-                       "ms": round(1000 * (time.perf_counter() - t))} if ok and img is not None
-                      else {"ok": False, "error": "no frames (address, port, firewall?)"})
+            if not ok or img is None:
+                out[v] = {"ok": False, "error": "no frames (address, port, firewall?)"}
+                continue
+            h, w = img.shape[:2]
+            ms = round(1000 * (time.perf_counter() - t))
+            s = THUMB_W / w
+            ok, buf = cv2.imencode(".jpg", cv2.resize(img, (THUMB_W, max(1, round(h * s))), interpolation=cv2.INTER_AREA),
+                                   [cv2.IMWRITE_JPEG_QUALITY, 75])
+            out[v] = {"ok": True, "size": [int(w), int(h)], "ms": ms,
+                      "thumb": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else None}
         return out
 
     # ------------------------------------------------------------------ v0.8.4 live engine
