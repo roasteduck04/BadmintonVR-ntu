@@ -261,16 +261,16 @@ def test_detector_may_stay_on_cuda_but_the_pose_model_must_build(tmp_path, monke
         pf.trt_models(Sol(), rc, batch=32, in_hw=(384, 288))
 
 
-def test_cpu_budget_splits_the_cores_and_is_off_by_default():
+def test_cpu_budget_splits_the_cores_and_is_on_by_default():
     from analysis.live import cpulimits
     cfg = {"views": ["a", "b", "c"], "workers": 2, "cpu": {"limits": True}}
     assert cpulimits.budget(cfg, n_cpu=48) == {"main": 6, "pose2d": 4, "decode": 4, "fit": 6, "cpus": 48}
     assert cpulimits.budget(cfg, n_cpu=8) == {"main": 1, "pose2d": 1, "decode": 1, "fit": 1, "cpus": 8}
     assert cpulimits.budget({**cfg, "cpu": {"limits": True, "fit_threads": 3}}, n_cpu=48)["fit"] == 3
     assert cpulimits.budget({**cfg, "cpu": {"limits": False}}) is None
-    off = live_config.load("singles_05x", preset="rtx5090", probe=_probe())
+    off = live_config.load("singles_05x", preset="rtx5090", overrides=["cpu.limits=false"], probe=_probe())
     assert off["cpu_budget"] is None and off["rtmpose"]["ep"] == "trt"          # lab preset: TensorRT on
-    on = live_config.load("singles_05x", preset="rtx5090", overrides=["cpu.limits=true"], probe=_probe())
+    on = live_config.load("singles_05x", preset="rtx5090", probe=_probe())      # v0.8.5: limits on by default
     assert set(on["cpu_budget"]) == {"main", "pose2d", "decode", "fit", "cpus"}
     import os
     before = os.environ.get("OMP_NUM_THREADS")

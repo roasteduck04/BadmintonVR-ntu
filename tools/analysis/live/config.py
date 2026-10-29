@@ -264,7 +264,8 @@ def resolve(c, probe=probe_sources) -> dict:
         raise ValueError("rtmpose.ep=trt needs rtmpose.engine=fast")
     if rp["engine"] == "rtmlib":
         fast_only = [k for k, dflt in (("decoder", "cv2"), ("decode_short_side", None), ("batch_views", False),
-                                       ("det", None), ("court_filter_m", None)) if rp.get(k, dflt) != dflt]
+                                       ("det", None), ("court_filter_m", None), ("det_trt", False),
+                                       ("det_async", False)) if rp.get(k, dflt) != dflt]
         if rp["model"] == "body_feet":
             fast_only.append("model=body_feet")
         if fast_only:

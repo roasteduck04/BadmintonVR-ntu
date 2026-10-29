@@ -17,3 +17,4 @@ pyyaml>=6.0                           # live-frames configs
 av>=12.0                              # PyAV: the fast live 2D video reader (rtmpose.decoder pyav, best_live / GPU presets)
 fastapi>=0.110                        # v0.8.2 pipeline server (tools/pipeline_server)
 uvicorn>=0.29
+onnx>=1.16                            # v0.8.5 rtmpose.det_trt: cuts the person detector before its NMS so TensorRT builds it

@@ -123,3 +123,24 @@ python tools/live_run.py campaign run --plan lab_5090_r2 --group unity --unity-p
 
 Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r2.zip` (laptop: `BadmintonVR\runs\`).
 
+---
+
+## Round 3 (v0.8.5, after round 2)
+
+Round 2 found the CUDA person detector (~65 ms, every 5th frame) caps 60 fps at ~39 frames/s. Round 3
+(`configs/live/campaign/lab_5090_r3.yaml`, 12 streams + 3 with Unity, ~20 min) tests the detector on TensorRT
+(`rtmpose.det_trt`: cut before its NMS, which TensorRT refused) and in its own thread (`rtmpose.det_async`), alone and
+together, the detector every 2nd / every frame, the `live_30` setting, and 28 s streams. The thread limits and late fits
+kept while behind are now the defaults. The first TensorRT detector run builds its engine (a minute or two, once).
+
+```bash
+cd ~/BadmintonVR && source ~/venv-pc/bin/activate && git pull
+pip install -r tools/requirements-pc.txt          # adds onnx (cuts the detector)
+python tools/live_run.py campaign run --plan lab_5090_r3 --group all --dry-run --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+python tools/live_run.py campaign run --plan lab_5090_r3 --group main --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+# then Unity in Play mode:
+python tools/live_run.py campaign run --plan lab_5090_r3 --group unity --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+```
+
+Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r3.zip` (laptop: `BadmintonVR\runs\`).
+

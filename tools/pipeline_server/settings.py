@@ -3,7 +3,7 @@
 The page renders FIELDS by group; a value the user changes becomes a `--set key=value` override of the live run.
 Defaults shown on the page come from the merged config (defaults <- clip <- machine preset <- settings preset), so
 nothing here repeats a default value. Settings presets (configs/live/settings/<name>.yaml) are flat {key: value} maps;
-`best_live` is the v0.8.1 result (docs/reports/v0.8.1-speed.md).
+`best_live` is the v0.8.1 result (docs/reports/v0.8.1-speed.md); `live_30` the v0.8.5 real-time 30 fps setting (lab round 2).
 
 Lengths of time are shown in FRAMES of the stream (fields with "frames": True; output_fps frames = 1 s) while the config
 keeps seconds: values_from() converts seconds -> frames for the page, overrides() / save_preset() convert back. A frames
@@ -21,7 +21,7 @@ from analysis.live import config as live_config
 
 SETTINGS_DIR = os.path.join(live_config.CONFIG_DIR, "settings")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
-BUILTIN = ("best_live", "pure_live", "laptop_realtime")     # shipped presets: Save as preset never overwrites them
+BUILTIN = ("best_live", "pure_live", "laptop_realtime", "live_30")     # shipped presets: Save as preset never overwrites them
 
 # group, key, label, kind, extra. kinds: choice (options), int, float, bool, optfloat (a number or off = null),
 # range (two floats). "live_only": only sent when the 2D comes from the video (backend live). "frames": the config value
@@ -61,18 +61,25 @@ FIELDS = [
      "help": "Fast = all people of a frame in one model call. The court filter and frame size need it."},
     {"group": "speed2d", "key": "rtmpose.det_every", "label": "Person detector every", "kind": "int", "unit": "frames",
      "live_only": True, "help": "In between, boxes come from the last poses. 5 is fast; 1 is the most careful."},
+    {"group": "speed2d", "key": "rtmpose.det_trt", "label": "Person detector on TensorRT", "kind": "bool", "live_only": True,
+     "help": "v0.8.5: the detector without its built-in box filter, so TensorRT can build it (same boxes). On CUDA it takes "
+             "~65 ms and caps 60 fps at ~39 frames/s (lab round 2). Needs TensorRT."},
+    {"group": "speed2d", "key": "rtmpose.det_async", "label": "Person detector in its own thread", "kind": "bool",
+     "live_only": True, "help": "v0.8.5: detector frames do not wait for it - they use the tracked boxes and its boxes are "
+                                "merged in when it finishes. A person walking in shows up a few frames later."},
     {"group": "speed2d", "key": "rtmpose.decode_short_side", "label": "Frame size", "kind": "choice", "live_only": True,
      "options": [[None, "full 4K"], [1080, "1080 px"], [720, "720 px"]],
      "help": "Shrink while decoding. 1080 costs ~1 px of 2D accuracy; 720 ~2 px for almost no gain."},
     {"group": "speed2d", "key": "rtmpose.ep", "label": "Pose model runs on", "kind": "choice", "live_only": True,
      "options": [["cuda", "CUDA"], ["trt", "TensorRT FP16 (needs TensorRT)"]],
-     "help": "TensorRT halves the pose model's time on the lab RTX 5090 at the same accuracy; the detector stays on CUDA."},
+     "help": "TensorRT halves the pose model's time on the lab RTX 5090 at the same accuracy. The person detector has its own "
+             "switch (Person detector on TensorRT)."},
     {"group": "speed2d", "key": "cpu.limits", "label": "Limit CPU threads per process", "kind": "bool",
-     "help": "Stops the 2D, decoding and body-fit processes fighting over the cores (lab: 2D 74 ms per frame in a stream "
-             "vs 21 ms alone)."},
+     "help": "Stops the 2D, decoding and body-fit processes fighting over the cores. On by default since v0.8.5 (lab round "
+             "2: 19 -> 27 fps and every fit on time; laptop unchanged)."},
     {"group": "speed2d", "key": "rtmpose.decoder", "label": "Video reader", "kind": "choice", "live_only": True,
      "options": [["pyav", "pyav"], ["cv2", "OpenCV"], ["ffmpeg", "ffmpeg"], ["nvcodec", "GPU (PyNvVideoCodec)"]],
-     "help": "pyav with 1080 px was fastest on the RTX 3060 PC."},
+     "help": "pyav with 1080 px is fastest (RTX 3060 PC, lab). GPU decoding was slower on the lab PC (77 vs 2.5 ms)."},
     {"group": "speed2d", "key": "rtmpose.model", "label": "2D model", "kind": "choice", "live_only": True,
      "options": [["wholebody", "wholebody (133 points)"], ["body_feet", "body + feet (faster, ~+1 cm)"],
                  ["body", "body only (17 points)"]],
@@ -124,8 +131,8 @@ FIELDS = [
     {"group": "fit", "key": "stream.late_policy", "label": "A late fit", "kind": "choice",
      "options": [["drop", "is dropped (delay stays short)"], ["use", "is waited for (delay grows)"],
                  ["behind", "is waited for only when the stream is behind anyway"]],
-     "help": "Real time: drop keeps the broadcast on time; use keeps the accuracy; behind (v0.8.3) keeps fits that cost "
-             "no extra delay (lab: dropped fits doubled the error, 2.6 vs 1.3 cm)."},
+     "help": "Real time: drop keeps the broadcast on time; use keeps the accuracy; behind (v0.8.3, the default since v0.8.5) "
+             "keeps fits that cost no extra delay (lab: dropped fits doubled the error, 2.6 vs 1.3 cm)."},
     {"group": "fit", "key": "stream.workers", "label": "Fit processes", "kind": "int",
      "help": "0 = in the main process. 2 = one per player."},
     # fallback

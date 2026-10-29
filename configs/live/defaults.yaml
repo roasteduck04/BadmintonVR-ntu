@@ -34,7 +34,8 @@ rtmpose:                        # live backend only (same model + settings as th
                                 # | body_feet (Halpe-26: body + 6 foot points; engine fast only)
   engine: rtmlib                # rtmlib = v0.8.0 (rtmlib PoseTracker, one pose call per person) | fast = batched
                                 # crops (all persons of a frame / of all cameras in one pose call), v0.8.1
-  decoder: cv2                  # engine fast: cv2 | pyav | ffmpeg | nvdec (ffmpeg + CUDA) | nvcodec (PyNvVideoCodec)
+  decoder: cv2                  # engine fast: cv2 | pyav | ffmpeg | nvdec (ffmpeg + CUDA) | nvcodec (PyNvVideoCodec;
+                                # lab round 2: 77 ms per frame vs pyav 2.5 ms - slower, not recommended)
   decode_short_side: null       # engine fast: shrink frames while decoding to this shorter side (px); null = full size
   decode_threads: 0             # engine fast, pyav / ffmpeg: decoder threads (0 = library default)
   batch_views: false            # engine fast: true = one process for every camera (frames of one output step batched)
@@ -45,6 +46,12 @@ rtmpose:                        # live backend only (same model + settings as th
   pad_batch: true               # engine fast: pad each pose call to 1/2/4/8/16/32 crops (a new input size is ~6x slower)
   ep: cuda                      # v0.8.3, engine fast: cuda | trt = TensorRT for the pose model (+ detector if it builds)
   trt_fp16: true                # ep trt: FP16 engines (lab: same 2D accuracy, pose model 18.5 -> 9.6 ms)
+  det_trt: false                # v0.8.5, engine fast, GPU: detector cut before its NMS and built on TensorRT, NMS in
+                                # NumPy (same boxes; analysis/live/det_split.py; needs tensorrt + onnx). Lab round 2:
+                                # the CUDA detector takes ~65 ms, the reason 60 fps stops at ~39 frames/s
+  det_async: false              # v0.8.5, engine fast: the detector in its own thread - detector frames use the
+                                # tracked boxes at once, its boxes are merged in when it finishes (a new person shows
+                                # up to ~det_every frames later)
   warmup: true                  # engine fast: run every padded size once before the clock starts
   cudnn_search: null            # engine fast: cuDNN algorithm search (null = ORT default EXHAUSTIVE | heuristic | default)
   queue_depth: 8                # frames a camera worker may run ahead of the scheduler
@@ -79,9 +86,10 @@ stream:
   max_iter: null                # solver iteration cap (null = the offline default, 40)
   solver_tol: 1.0e-4            # v0.8.1: least_squares ftol = xtol = gtol (null = SciPy 1e-8, the offline fit). With
   lsmr_maxiter: 20              # the LSMR cap (null = LSMR default) the fit is 4.1x cheaper per frame, +0.1 cm / -0.1 deg
-  late_policy: drop             # a window solved after its budget: drop = output the fallback (latency bounded)
+  late_policy: behind           # a window solved after its budget: drop = output the fallback (latency bounded)
                                 # | use = wait for it | behind (v0.8.3) = wait only while the stream is behind anyway
-                                # (its last frame arrived later than the budget), else drop
+                                # (its last frame arrived later than the budget), else drop. Default since v0.8.5 (lab
+                                # round 2: dropped late fits doubled the error; behind = drop while on time)
                                 # | use = wait and output the fit (latency grows when the fit is slower than real time)
   good_conf: {multi: 0.7, two_view: 0.45}   # body-length samples: triangulation confidence ...
   good_inliers: {multi: 3, two_view: 2}     # ... and inlier views
@@ -116,7 +124,8 @@ paths:
   sync_file: "{data_dir}/calib/{clip}_sync.json"
 
 cpu:                            # v0.8.3 (analysis/live/cpulimits.py): threads per process; auto splits the cores
-  limits: false                 # true = cap BLAS / OpenMP / OpenCV / decoder threads of every process
+  limits: true                  # true = cap BLAS / OpenMP / OpenCV / decoder threads of every process. Default since
+                                # v0.8.5 (lab round 2: 19 -> 27 fps, fits on time; laptop unchanged 0.94 / 0.93x)
   main_threads: auto
   pose2d_threads: auto
   decode_threads: auto

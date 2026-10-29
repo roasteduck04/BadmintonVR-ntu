@@ -29,6 +29,9 @@ Court filter (rtmpose.court_filter_m, metres; null = off): a detector box is kep
 feet) lands on the court floor within the 3D tracker's limits (pose_v2.COURT_X_MAX / COURT_Z_MAX) plus this margin,
 through the camera's calibration - bystanders and spectators never reach the pose model (boxes cut by the image's
 bottom edge are kept).
+v0.8.5 detector options (lab round 2: the CUDA detector, ~65 ms, capped 60 fps at ~39 frames/s): rtmpose.det_trt = the
+detector cut before its NMS and built on TensorRT, NMS in NumPy (analysis/live/det_split.py, same boxes);
+rtmpose.det_async = the detector in its own thread, its boxes merged into the tracked ones when it finishes (merge_boxes).
 Models: wholebody (133 keypoints) | body (COCO-17 -> slots 0-16) | body_feet (Halpe-26: body + 6 foot points -> slots
 0-22); rtmpose.mode picks the size (performance | balanced | lightweight), rtmpose.det overrides the detector.
 
@@ -517,6 +520,55 @@ def trt_models(sol, rcfg, batch, in_hw):
     return notes
 
 
+def split_detector(sol, rcfg):
+    """rtmpose.det_trt (v0.8.5): replace sol.det_model by the detector cut before its NMS (analysis.live.det_split),
+    built on TensorRT; the NMS runs in NumPy with the graph's own parameters (same boxes). Returns None on success,
+    else why the end2end detector stays on CUDA."""
+    from . import det_split
+    y = sol.det_model
+    root = os.path.expanduser(rcfg.get("trt_cache") or TRT_CACHE)
+    try:
+        path, params = det_split.cut_nms(y.onnx_model, os.path.join(root, "split"))
+    except Exception as e:  # noqa: BLE001 - e.g. no onnx package, an unexpected graph
+        return f"CUDA (could not cut the detector before its NMS: {type(e).__name__}: {e})"[:300]
+    try:
+        sess = trt_session(path, rcfg)
+    except TensorRTUnavailable as e:
+        return f"CUDA ({e})"
+    sol.det_model = det_split.SplitDetector(y, sess, params)
+    return None
+
+
+def box_iou(a, b):
+    """IoU of two x1 y1 x2 y2 boxes."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    inter = w * h
+    return float(inter / max((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter, 1e-9))
+
+
+def merge_boxes(det, tracked, iou_min=0.3):
+    """rtmpose.det_async: a detection that finished a few frames after its frame -> the boxes for the next frame. A
+    tracked box (from the latest poses, so newer than the detection) that a detection overlaps (IoU >= iou_min) stays;
+    a detection no tracked box overlaps is added (a person who came into view); a tracked box no detection confirms is
+    dropped (lost person or a box that drifted off), as a synchronous detection would replace it."""
+    det = [np.asarray(d, np.float32)[:4] for d in det]
+    out, used = [], set()
+    for tb in tracked:
+        best, bi = 0.0, -1
+        for i, db in enumerate(det):
+            if i not in used:
+                v = box_iou(tb, db)
+                if v > best:
+                    best, bi = v, i
+        if bi >= 0 and best >= iou_min:
+            used.add(bi)
+            out.append(np.asarray(tb, np.float32))
+    return out + [db for i, db in enumerate(det) if i not in used]
+
+
 def _shape_str(name, shape):
     return f"{name}:" + "x".join(str(int(d)) for d in shape)
 
@@ -555,7 +607,7 @@ class trt_lock:
     the others wait and then load the cached engines."""
 
     def __init__(self, rcfg):
-        self.on = rcfg.get("ep") == "trt"
+        self.on = rcfg.get("ep") == "trt" or bool(rcfg.get("det_trt"))
         self.path = os.path.expanduser(os.path.join(rcfg.get("trt_cache") or TRT_CACHE, ".build.lock"))
         self.fh = None
 
@@ -656,9 +708,11 @@ class FastPose:
         self.batch = max(1, int(rcfg.get("pose_batch", 32)))
         self.trt_version = None
         self.trt_notes = {}
+        det_trt = bool(rcfg.get("det_trt")) and device == "cuda"
         if self.ep == "trt":                  # pose model on TensorRT (required); detector too if TensorRT can build it
             self.trt_version = preload_tensorrt()
-            self.trt_notes = trt_models(self.sol, rcfg, self.batch, (self.in_h, self.in_w))
+            want = [m for m in (rcfg.get("trt_models") or ["det", "pose"]) if not (det_trt and m == "det")]
+            self.trt_notes = trt_models(self.sol, dict(rcfg, trt_models=want), self.batch, (self.in_h, self.in_w))
             self.providers = providers_of(self.sol)
         search = rcfg.get("cudnn_search")
         if search and device == "cuda" and self.ep != "trt":   # rebuild both sessions with this cuDNN algorithm search
@@ -667,11 +721,24 @@ class FastPose:
             self.det.session = ort.InferenceSession(self.det.onnx_model, providers=prov)
             self.pose.session = ort.InferenceSession(self.pose.onnx_model, providers=prov)
             self.providers = providers_of(self.sol)
+        if det_trt:                           # v0.8.5: the detector cut before its NMS, on TensorRT
+            self.trt_version = self.trt_version or preload_tensorrt()
+            note = split_detector(self.sol, rcfg)
+            if note:
+                self.trt_notes["det_model"] = note
+            else:
+                self.trt_notes.pop("det_model", None)
+            self.det = self.sol.det_model
+            self.providers = providers_of(self.sol)
+        self.det_async = bool(rcfg.get("det_async", False))      # v0.8.5: the detector in its own thread
+        self._det_pool = None
+        self.async_merges = 0
         self.sess = self.pose.session
         self.pad = bool(rcfg.get("pad_batch", True))
         self.in_name = self.sess.get_inputs()[0].name
         self.out_names = [o.name for o in self.sess.get_outputs()]
-        self.state = {}                  # view -> {"n": frames seen, "boxes": last boxes (full-frame px of this reader)}
+        self.state = {}                  # view -> {"n": frames seen, "boxes": last boxes (full-frame px of this reader),
+        #                                          "pending": async detection, "since": frames since it was started}
         cf = rcfg.get("court_filter_m")
         self.court = CourtFilter(load_cams(rcfg["_cam_paths"]), cf) if cf is not None and rcfg.get("_cam_paths") else None
         self.geom = {}                   # view -> (1 / reader scale, source height)
@@ -680,20 +747,50 @@ class FastPose:
     def set_view(self, view, scale, src_h):
         self.geom[view] = (1.0 / scale, src_h)
 
-    def boxes(self, view, img):
-        st = self.state.setdefault(view, {"n": 0, "boxes": []})
+    def _detect(self, view, img):
+        b = self.det(img)
+        boxes = [np.asarray(x, np.float32) for x in (b if b is not None else [])]
+        if self.court is not None and view in self.geom:
+            n0 = len(boxes)
+            boxes = self.court.keep(view, boxes, *self.geom[view])
+            self.filtered += n0 - len(boxes)
+        return boxes
+
+    def _detect_timed(self, view, img):
         t = time.monotonic_ns()
-        if st["n"] % self.det_every == 0 or len(st["boxes"]) == 0:
-            b = self.det(img)
-            boxes, detected = [np.asarray(x, np.float32) for x in (b if b is not None else [])], True
-            if self.court is not None and view in self.geom:
-                n0 = len(boxes)
-                boxes = self.court.keep(view, boxes, *self.geom[view])
-                self.filtered += n0 - len(boxes)
+        return self._detect(view, img), time.monotonic_ns() - t
+
+    def _state(self, view):
+        return self.state.setdefault(view, {"n": 0, "boxes": [], "pending": None, "since": 0})
+
+    def boxes(self, view, img):
+        """-> (boxes, detector ns, detected). det_async: on a detector frame the poses use the tracked boxes at once and
+        the frame goes to the detector thread; its boxes are merged in (merge_boxes) on the first frame after it
+        finishes, and the detector's own time is reported then. With no tracked box the detector runs here (it must)."""
+        st = self._state(view)
+        t = time.monotonic_ns()
+        if not self.det_async or not st["boxes"]:
+            if st["n"] % self.det_every == 0 or not st["boxes"]:
+                boxes, detected = self._detect(view, img), True
+                st["pending"], st["since"] = None, 0
+            else:
+                boxes, detected = list(st["boxes"]), False
+            dt = time.monotonic_ns() - t
         else:
-            boxes, detected = list(st["boxes"]), False
+            boxes, detected, dt = list(st["boxes"]), False, time.monotonic_ns() - t
+            fut = st["pending"]
+            if fut is not None and fut.done():
+                st["pending"] = None
+                found, dt = fut.result()
+                boxes, detected = merge_boxes(found, boxes), True
+                self.async_merges += 1
+            st["since"] += 1
+            if st["pending"] is None and st["since"] >= self.det_every:
+                if self._det_pool is None:
+                    self._det_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="detector")
+                st["pending"], st["since"] = self._det_pool.submit(self._detect_timed, view, img), 0
         st["n"] += 1
-        return boxes, time.monotonic_ns() - t, detected
+        return boxes, dt, detected
 
     def crops(self, img, boxes):
         out = []
@@ -754,7 +851,7 @@ class FastPose:
 
     def finish(self, view, kps):
         """Next frame's boxes for this view from this frame's poses (rtmlib pose_to_bbox, x1.25)."""
-        self.state.setdefault(view, {"n": 0, "boxes": []})["boxes"] = [self._p2b(k) for k in kps]
+        self._state(view)["boxes"] = [self._p2b(k) for k in kps]
 
     def to_raw(self, kps, scs, inv_scale):
         """(N, K, 2) model keypoints in reader pixels -> list of (133, 3) raw arrays in source pixels."""
@@ -932,7 +1029,8 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                                       "decode_size": [rd[v].out_w, rd[v].out_h],
                                       "video_size": [rd[v].src_w, rd[v].src_h], "video_to_calib": k_cal[v],
                                       "ep": engine.ep, "trt_version": engine.trt_version, "trt_notes": engine.trt_notes,
-                                      "batch_views": len(views) > 1, "model": engine.model}, **(extra or {}))))
+                                      "batch_views": len(views) > 1, "model": engine.model,
+                                      "det_async": engine.det_async}, **(extra or {}))))
 
     def wait_go():
         while not go_ev.wait(0.05):

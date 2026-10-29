@@ -9,7 +9,7 @@ elsewhere (the lab PC has no offline builds or offline 2D; the laptop scores qua
 Plan: configs/live/campaign/<name>.yaml (see lab_5090.yaml): clip, machine preset, settings defaults and tests. A test
 is a bench2d (the 2D step alone, as fast as possible) or a run (a whole simulated-live stream), with a settings preset
 (configs/live/settings/<name>.yaml, seconds), extra --set overrides, repeats, a group (main = Unity not playing, unity =
-Unity in Play mode and following each stream) and requirements (tensorrt, PyNvVideoCodec, video:<tag>) - a test whose
+Unity in Play mode and following each stream) and requirements (tensorrt, PyNvVideoCodec, onnx, video:<tag>) - a test whose
 requirement is missing is skipped with the reason, never failed.
 
 Folder: <runs>/campaign/<plan>/ (<runs> = the Unity project's runs/ with --unity-project, else ./runs): one folder per
@@ -112,6 +112,8 @@ def missing_requirement(req, plan, test) -> str | None:
         return trt_check()
     if req == "PyNvVideoCodec":
         return None if has_module("PyNvVideoCodec") else "PyNvVideoCodec is not installed"
+    if req == "onnx":                                  # v0.8.5 rtmpose.det_trt cuts the detector with it
+        return None if has_module("onnx") else "onnx is not installed (pip install -r tools/requirements-pc.txt)"
     if req.startswith("video:"):
         tag = req.split(":", 1)[1]
         try:

@@ -1,0 +1,16 @@
+_about: "Real time at 30 fps on a GPU PC (v0.8.5, lab round 2): 2D from the video, nearest-frame sync, sync file, fast 2D, fast fit, CPU thread limits, late fits kept while behind. Lab RTX 5090 with TensorRT: 0.96x real time, ~1 s behind, 1.6 cm."
+backend: live
+output_fps: 30
+pace: realtime
+sync.offsets: file
+sync.mode: nearest
+rtmpose.engine: fast
+rtmpose.decoder: pyav
+rtmpose.decode_short_side: 1080
+rtmpose.court_filter_m: 1.0
+rtmpose.det_every: 5
+cpu.limits: true
+stream.late_policy: behind
+stream.solver_tol: 1.0e-4
+stream.lsmr_maxiter: 20
+warmup.seconds: 1.0

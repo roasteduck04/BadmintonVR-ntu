@@ -423,6 +423,8 @@ def render_run(run_dir, log=print) -> str:
           + (f", decoder {cfg['rtmpose'].get('decoder')}, short side {cfg['rtmpose'].get('decode_short_side') or 'full'}, "
              f"{'one process for all cameras' if cfg['rtmpose'].get('batch_views') else 'one process per camera'}, "
              f"pose batch {cfg['rtmpose'].get('pose_batch')}"
+             + (", detector on TensorRT (cut before its NMS)" if cfg['rtmpose'].get('det_trt') else "")
+             + (", detector in its own thread" if cfg['rtmpose'].get('det_async') else "")
              if cfg['rtmpose'].get('engine') == 'fast' else ""), ""]
     if sync:
         L += ["**Auto sync** (after warm-up): " + ", ".join(
