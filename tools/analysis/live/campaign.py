@@ -142,7 +142,7 @@ def trt_check() -> str | None:
     return _TRT["result"]
 
 
-def unity_status(unity_dir) -> dict:
+def unity_status(unity_dir, _recheck=True) -> dict:
     if not unity_dir:
         return {"known": False}
     p = os.path.join(unity_dir, "runs", "unity_status.json")
@@ -152,6 +152,19 @@ def unity_status(unity_dir) -> dict:
     except (OSError, ValueError):
         return {"known": True, "in_play": False, "seen": False}
     age = time.time() - float(st.get("t", 0))
+    if bool(st.get("playing")) and abs(age) >= UNITY_STALE_S and _recheck:
+        # v0.8.5: Unity's stamp is on the Windows clock, this one on WSL's - they drift apart after the PC sleeps. A stamp
+        # that changes within ~1.5 s (Unity writes every second) is a live heartbeat whatever the clocks say.
+        time.sleep(1.5)
+        again = unity_status(unity_dir, _recheck=False)
+        try:
+            with open(p, "r", encoding="utf-8-sig") as fh:
+                t2 = float(json.load(fh).get("t", 0))
+        except (OSError, ValueError):
+            return again
+        if t2 != float(st.get("t", 0)):
+            return dict(again, in_play=bool(st.get("playing")), age_s=0.0, clock_offset_s=round(age, 1))
+        return again
     return {"known": True, "seen": True, "in_play": bool(st.get("playing")) and age < UNITY_STALE_S,
             "age_s": round(age, 1), "mode": st.get("mode")}
 
@@ -364,6 +377,8 @@ def run_row(test_dir, rec) -> dict:
            "fps_target": t.get("target_fps"), "fps": t.get("achieved_output_fps"), "x_realtime": t.get("realtime_factor"),
            "setup_s": t.get("setup_s"), "delay_p50_ms": _g(t, "stages", "e2e", "p50"),
            "delay_p90_ms": _g(t, "stages", "e2e", "p90"), "late_after_warmup": r.get("late_fraction_after_warmup"),
+           "lag_2d_ms_start_end": t.get("lag_2d_ms_start_end"), "keeps_up_2d": t.get("keeps_up_2d"),
+           "e2e_ms_start_end": t.get("e2e_ms_start_end"), "keeps_up": t.get("keeps_up"),
            "gpu_mean": _g(r, "gpu", "util_mean"), "cpu_mean": _g(r, "cpu", "cpu_mean"), "offsets": r.get("offsets")}
     refs = list((r.get("quality") or {}).keys())                 # the clip config's reference_clips, primary first
     nv = len(_g(r, "config", "views") or [])
@@ -394,6 +409,15 @@ def bench_row(test_dir, rec) -> dict:
             "feet_px": _g(parts, "feet", "median_px"), "body_p90_px": _g(parts, "body", "p90_px"),
             "matched": q.get("court_matched_frac") if q.get("court_matched_frac") is not None else q.get("matched_frac"),
             "providers": {v: (w or {}).get("providers") for v, w in (b.get("workers") or {}).items()}}
+
+
+def _lag(r, key="lag_2d_ms_start_end", ok="keeps_up_2d") -> str:
+    """'0.50 → 0.20 ✓' (keeps up) / '1.04 → 5.51 ✗' (grows: falls behind) / '–'."""
+    se = r.get(key)
+    if not se:
+        return "–"
+    mark = {True: " ✓", False: " ✗"}.get(r.get(ok), "")
+    return f"{se[0] / 1000:.2f} → {se[1] / 1000:.2f}{mark}"
 
 
 def _f(x, d=1, pct=False):
@@ -451,13 +475,15 @@ def report(src, out=None, log=print) -> str:
                  f"{_f(b.get('body_p90_px'), 1)} | {_f(b.get('matched'), pct=True)} | {_f(b.get('gpu_mean'), 0)}% | "
                  f"{b.get('status')}{(' — ' + str(b['reason'])) if b.get('reason') else ''} |")
     L += ["", "## Stage B — whole streams", "",
-          "| test | note | Unity | fps / target | × real time | setup s | delay p50 / p90 s | late | q3 MPJPE cm | q3 PA cm | "
-          "q3 knee ° | q5 MPJPE cm | swaps | GPU | CPU | status |",
-          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+          "| test | note | Unity | fps / target | × real time | 2D lag start → end s | delay start → end s | setup s | "
+          "delay p50 / p90 s | late | q3 MPJPE cm | q3 PA cm | q3 knee ° | q5 MPJPE cm | swaps | GPU | CPU | status |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in runs:
         dl = lambda k: None if r.get(k) is None else r[k] / 1000.0  # noqa: E731
         L.append(f"| {r['id']} | {r.get('note') or ''} | {'yes' if r.get('unity') else ''} | "
-                 f"{_f(r.get('fps'))} / {_f(r.get('fps_target'), 0)} | {_f(r.get('x_realtime'), 2)} | {_f(r.get('setup_s'))} | "
+                 f"{_f(r.get('fps'))} / {_f(r.get('fps_target'), 0)} | {_f(r.get('x_realtime'), 2)} | {_lag(r)} | "
+                 f"{_lag(r, 'e2e_ms_start_end', 'keeps_up')} | "
+                 f"{_f(r.get('setup_s'))} | "
                  f"{_f(dl('delay_p50_ms'), 2)} / {_f(dl('delay_p90_ms'), 2)} | {_f(r.get('late_after_warmup'), pct=True)} | "
                  f"{_f(r.get('q3_mpjpe_cm'), 2)} | {_f(r.get('q3_pa_cm'), 2)} | {_f(r.get('q3_knee_deg'))} | "
                  f"{_f(r.get('q5_mpjpe_cm'), 2)} | {r.get('q3_swaps') if r.get('q3_swaps') is not None else '–'} | "

@@ -43,3 +43,34 @@ def test_summary_counts_and_rates():
     assert abs(s["wall_s"] - 0.599) < 1e-9 and abs(s["realtime_factor"] - (4 / 30) / 0.599) < 1e-9
     assert s["first_frame_s"] == 0.5 and s["dropped_2d_frames"] == 1 and s["first_2d_call_ms"] == 18.0
     assert s["stages"]["e2e"]["p50"] == 500.0 and s["e2e_fitted"]["n"] == 2
+
+
+def _stream(n, lag_ms, e2e_ms):
+    """n steps at 60 fps whose 2D lag / output delay follow lag_ms(i) / e2e_ms(i)."""
+    ev = []
+    for s in range(n):
+        t = int(s * 16.7 * MS)
+        ev.append({"node": "runner", "ev": "frames", "step": s, "t_capture_ns": t, "t_avail_ns": t,
+                   "t_2d_done_ns": t + int(lag_ms(s) * MS), "t_push_ns": t + int(lag_ms(s) * MS),
+                   "views": {"a": {"decode_ms": 1.0, "infer_ms": 10.0, "wait_ms": 0.0, "dropped": 0, "n_frames": 1,
+                                   "n_dets": 2, "first_call": False}}})
+        ev.append({"node": "runner", "ev": "out", "step": s, "quality": 0, "t_capture_ns": t,
+                   "t_written_ns": t + int(e2e_ms(s) * MS), "write_ns": MS})
+    return ev
+
+
+def test_keeping_up_compares_the_start_and_the_end_of_the_stream():
+    """v0.8.5: x real time counts the start-up backlog; the 2D lag / delay at the start vs the end tells whether the
+    stream keeps up (2D side and whole pipeline separately)."""
+    cfg = {"ref_frames": list(range(100)), "fps": 60.0, "pace": "realtime"}
+    ev = _stream(100, lambda i: 500 - 4 * i, lambda i: 1500)          # backlog draining, delay steady
+    s = timing.summary(timing.step_rows(ev), ev, cfg)
+    assert s["lag_2d_ms_start_end"][0] > s["lag_2d_ms_start_end"][1] and s["keeps_up_2d"] and s["keeps_up"]
+    ev = _stream(100, lambda i: 50, lambda i: 1300 + 10 * i)          # 2D fine, output delay grows by 1 s
+    s = timing.summary(timing.step_rows(ev), ev, cfg)
+    assert s["keeps_up_2d"] and s["keeps_up"] is False
+    ev = _stream(100, lambda i: 1000 + 40 * i, lambda i: 2000 + 40 * i)
+    s = timing.summary(timing.step_rows(ev), ev, cfg)
+    assert s["keeps_up_2d"] is False and s["keeps_up"] is False
+    s = timing.summary(timing.step_rows(ev), ev, dict(cfg, pace="asfast"))
+    assert s["keeps_up"] is None and s["lag_2d_ms_start_end"] is not None   # no camera clock: no verdict

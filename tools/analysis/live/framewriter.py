@@ -7,6 +7,7 @@
      "players": [{"id", "side", "valid", "quality", "quality_name", "warmup", "late", "interpolated",
                   "forward_sign", "frame": <exactly one analysis-doc player frame, incl. causal facing>}]}
 <run>/unity_live_frames/latest.json     {"last_step", "n_written", "frame", "t_written_ns"} rewritten after every frame
+                           (background writer: at most every output.latest_every_s, and once at the end - v0.8.5)
 (v0.8.1 and older: <run>/live/manifest.json, <run>/live/frames/<step:06d>.json, <run>/live/latest.json; readers take both
 through frames_dir() / frame_files().)
 
@@ -143,6 +144,12 @@ class FrameWriter:
                        "frame_name": FRAME_NAME}
         atomic_write(os.path.join(self.dir, "manifest.json"), docmod.json_safe(man))
         self.on_written = on_written
+        # v0.8.5: latest.json is only the server's progress count (Unity follows the frame files), yet rewriting it after
+        # every frame doubled the file operations: from WSL into the Windows-side Unity folder a frame cost ~17 ms, so
+        # one writer topped out at ~58 frames/s and 60 fps streams fell behind (lab round 3). Throttled when writing in
+        # the background.
+        self.latest_every_s = float((cfg.get("output") or {}).get("latest_every_s", 0.25) or 0.0)
+        self._latest_t, self._latest_pending = 0.0, None
         self.q, self.thread, self.error = None, None, None
         if background:
             self.q = queue.Queue()
@@ -171,6 +178,9 @@ class FrameWriter:
             self.q.put(None)
             self.thread.join()
             self.thread = None
+        if self._latest_pending is not None and self.error is None:
+            atomic_write(os.path.join(self.dir, "latest.json"), self._latest_pending)
+            self._latest_pending = None
         if self.error is not None:
             raise self.error
 
@@ -208,8 +218,13 @@ class FrameWriter:
         if self.write_frames:
             self.bytes += atomic_write(os.path.join(self.dir, name), obj)
             self.n_written += 1
-            atomic_write(os.path.join(self.dir, "latest.json"),
-                         {"last_step": obj["step"], "n_written": self.n_written, "frame": name, "t_written_ns": t_w})
+            latest = {"last_step": obj["step"], "n_written": self.n_written, "frame": name, "t_written_ns": t_w}
+            now = time.monotonic()
+            if self.q is None or self.latest_every_s <= 0 or now - self._latest_t >= self.latest_every_s:
+                atomic_write(os.path.join(self.dir, "latest.json"), latest)
+                self._latest_t, self._latest_pending = now, None
+            else:
+                self._latest_pending = latest
         dt = time.perf_counter_ns() - t0
         self.write_ns.append(dt)
         if self.on_written is not None:

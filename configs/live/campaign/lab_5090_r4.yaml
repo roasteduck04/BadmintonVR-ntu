@@ -1,0 +1,49 @@
+# v0.8.5 round 4 on the lab RTX 5090 PC (docs/setup/lab-tests.md § Round 4), after round 3
+# (docs/reports/v0.8.3-lab-tests.md): with the TensorRT detector the 2D side keeps up at 60 fps, but the output delay
+# still grows (2.0 -> 3.4 s over 28 s) because writing a frame file from WSL into the Windows-side Unity folder cost
+# ~17 ms (two files per frame: the frame + latest.json). v0.8.5 now rewrites latest.json at most 4x a second, and the
+# rtx5090 preset has the TensorRT detector on. This round checks that 60 fps now keeps up end to end, and tries the
+# detector more often (better 2D: every frame gave 1.11 cm in round 3), a shorter fit window, more fit processes.
+#   python tools/live_run.py campaign run --plan lab_5090_r4 --group main  --unity-project <Unity project>  (Unity NOT playing)
+#   python tools/live_run.py campaign run --plan lab_5090_r4 --group unity --unity-project <Unity project>  (Unity in Play mode)
+# The built player: lab_5090_r4_player.yaml.
+name: lab_5090_r4
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+
+tests:
+  # ---------------------------------------------------------------- 60 fps, nearest sync, TensorRT detector (preset)
+  - {id: W01_reference, repeat: 2, note: "v0.8.5 lab defaults, 60 fps, nearest (round 3 T03: 52 fps, delay 1.3 -> 2.0 s)",
+     requires: [tensorrt, onnx], set: ["sync.mode=nearest"]}
+  - {id: W02_latest_every_frame, note: "latest.json after every frame again (the round-3 writer)", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "output.latest_every_s=0"]}
+  - {id: W03_no_frame_files, note: "no frame files at all (what writing costs)", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "output.frames=false"]}
+  - {id: W04_det3, note: "detector every 3rd frame", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.det_every=3"]}
+  - {id: W05_det2, note: "detector every 2nd frame", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.det_every=2"]}
+  - {id: W06_det1, note: "detector every frame (round 3 T06: 1.11 cm at 42 fps)", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.det_every=1"]}
+  - {id: W07_window05, note: "fit window 0.5 s (the delay is mostly the window)", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "stream.window_s=0.5"]}
+  - {id: W08_workers4, note: "4 fit processes", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "stream.workers=4"]}
+  # ---------------------------------------------------------------- 28 s
+  - {id: W09_long60, note: "60 fps over 2-30 s (round 3 T11: delay 2.0 -> 3.4 s)", timeout_s: 3600,
+     requires: [tensorrt, onnx], set: ["section_s=[2.0, 30.0]", "sync.mode=nearest"]}
+  - {id: W10_long60_det3, note: "60 fps, detector every 3rd, over 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "sync.mode=nearest", "rtmpose.det_every=3"]}
+  - {id: W11_long30, settings: live_30, note: "live_30 (now with the TensorRT detector) over 2-30 s", timeout_s: 3600,
+     requires: [tensorrt, onnx], set: ["section_s=[2.0, 30.0]"]}
+
+  # ---------------------------------------------------------------- with Unity in Play mode (the editor)
+  - {id: X01_ref_unity, group: unity, stage: X, note: "W01 with Unity", compare_to: W01_reference,
+     requires: [tensorrt, onnx], set: ["sync.mode=nearest"]}
+  - {id: X02_long60_unity, group: unity, stage: X, note: "W09 with Unity", compare_to: W09_long60, timeout_s: 3600,
+     requires: [tensorrt, onnx], set: ["section_s=[2.0, 30.0]", "sync.mode=nearest"]}
+  - {id: X03_long30_unity, group: unity, stage: X, settings: live_30, note: "W11 with Unity", compare_to: W11_long30,
+     timeout_s: 3600, requires: [tensorrt, onnx], set: ["section_s=[2.0, 30.0]"]}

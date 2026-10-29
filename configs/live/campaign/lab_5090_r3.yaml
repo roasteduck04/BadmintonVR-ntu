@@ -1,7 +1,7 @@
 # v0.8.5 round 3 on the lab RTX 5090 PC (docs/setup/lab-tests.md § Round 3): the detector off the critical path.
 # Round 2 (docs/reports/v0.8.3-lab-tests.md): 60 fps stops at ~39 frames/s because the CUDA person detector (~65 ms,
 # every 5th frame) sits in the 2D step. v0.8.5 defaults already include CPU thread limits + late fits kept while behind;
-# the rtx5090 preset has the TensorRT pose model.
+# the rtx5090 preset has the TensorRT pose model (and since round 3 the TensorRT detector: T01 / T02 switch it off).
 #   python tools/live_run.py campaign run --plan lab_5090_r3 --group main  --unity-project <Unity project>  (Unity NOT playing)
 #   python tools/live_run.py campaign run --plan lab_5090_r3 --group unity --unity-project <Unity project>  (Unity in Play mode)
 # "both" = rtmpose.det_trt (detector on TensorRT, cut before its NMS) + rtmpose.det_async (detector in its own thread).
@@ -15,9 +15,9 @@ defaults:
 tests:
   # ---------------------------------------------------------------- 60 fps, nearest sync, one change at a time
   - {id: T01_reference, repeat: 2, note: "v0.8.5 defaults, 60 fps, nearest (round 2 R05: 37.5 fps)", requires: [tensorrt],
-     set: ["sync.mode=nearest"]}
+     set: ["sync.mode=nearest", "rtmpose.det_trt=false"]}
   - {id: T02_async, note: "+ detector in its own thread", requires: [tensorrt],
-     set: ["sync.mode=nearest", "rtmpose.det_async=true"]}
+     set: ["sync.mode=nearest", "rtmpose.det_async=true", "rtmpose.det_trt=false"]}
   - {id: T03_dettrt, note: "+ detector on TensorRT", requires: [tensorrt, onnx],
      set: ["sync.mode=nearest", "rtmpose.det_trt=true"]}
   - {id: T04_both, repeat: 2, note: "+ both", requires: [tensorrt, onnx],
@@ -31,7 +31,8 @@ tests:
   - {id: T08_both_interp, note: "both, interpolated sync (the best_live default)", requires: [tensorrt, onnx],
      set: ["rtmpose.det_trt=true", "rtmpose.det_async=true"]}
   # ---------------------------------------------------------------- 30 fps (the live_30 setting)
-  - {id: T09_live30, settings: live_30, note: "live_30 as shipped (round 2 R13: 28.9 / 30 fps)", requires: [tensorrt]}
+  - {id: T09_live30, settings: live_30, note: "live_30 as shipped (round 2 R13: 28.9 / 30 fps)", requires: [tensorrt],
+     set: ["rtmpose.det_trt=false"]}
   - {id: T10_live30_both, settings: live_30, note: "live_30 + both", requires: [tensorrt, onnx],
      set: ["rtmpose.det_trt=true", "rtmpose.det_async=true"]}
   # ---------------------------------------------------------------- 28 s
@@ -42,7 +43,7 @@ tests:
   - {id: U01_both_unity, group: unity, stage: U, note: "T04 with Unity", compare_to: T04_both, requires: [tensorrt, onnx],
      set: ["sync.mode=nearest", "rtmpose.det_trt=true", "rtmpose.det_async=true"]}
   - {id: U02_live30_unity, group: unity, stage: U, settings: live_30, note: "T09 with Unity", compare_to: T09_live30,
-     requires: [tensorrt]}
+     requires: [tensorrt], set: ["rtmpose.det_trt=false"]}
   - {id: U03_long60_unity, group: unity, stage: U, note: "T11 with Unity", compare_to: T11_long60_both, timeout_s: 3600,
      requires: [tensorrt, onnx],
      set: ["section_s=[2.0, 30.0]", "sync.mode=nearest", "rtmpose.det_trt=true", "rtmpose.det_async=true"]}

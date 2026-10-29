@@ -424,6 +424,10 @@ function showTiming(t) {
     ["Streaming", `${t.written} / ${t.steps} frames in ${fmt(t.wall_s)} s for ${fmt(t.section_s)} s of video`],
     ["Speed", `${fmt(t.achieved_fps)} frames/s of ${fmt(t.target_fps, 0)} → ${fmt(t.realtime_factor, 2)}× real time`],
     ["Delay (capture → file)", `median ${ms(e.p50)}, p90 ${ms(e.p90)}, worst ${ms(e.max)}`],
+    ["Keeping up", !t.lag_2d_ms_start_end || t.keeps_up == null ? "–"
+      : `delay ${ms((t.e2e_ms_start_end || [])[0])} → ${ms((t.e2e_ms_start_end || [])[1])}, 2D lag ${ms(t.lag_2d_ms_start_end[0])} → ${ms(t.lag_2d_ms_start_end[1])} from start to end: ` +
+        (t.keeps_up ? "keeps up with the cameras (× real time also counts the start-up backlog and the fit's tail)"
+          : t.keeps_up_2d ? "the 2D keeps up, but the delay grows (the body fit falls behind)" : "falls behind (the 2D lag grows)")],
     ["First frame file", `${fmt(t.first_frame_s, 2)} s after the clock started${t.first_2d_call_ms != null ? ` (first 2D call ${ms(t.first_2d_call_ms)})` : ""}`],
     ["Late fits after warm-up", t.late_after_warmup == null ? "–" : `${Math.round(t.late_after_warmup * 100)} %`],
     ["Dropped 2D frames", t.dropped_2d_frames ?? "–"],
@@ -450,7 +454,8 @@ function showUnity(u) {
   } else {
     pill.className = "pill bad";
     pill.textContent = "Unity: not in Play mode";
-    $("#unity-detail").textContent = u && u.seen ? `Not in Play mode (last heartbeat ${fmt(u.age_s, 0)} s ago). Press Play in Unity.` : "No heartbeat yet: open the project in Unity and press Play.";
+    $("#unity-detail").textContent = (u && u.seen ? `Not in Play mode (last heartbeat ${fmt(u.age_s, 0)} s ago). Press Play in Unity.`
+      : "No heartbeat yet: open the project in Unity and press Play.") + (u && u.path ? ` Heartbeat file: ${u.path}` : "");
   }
 }
 

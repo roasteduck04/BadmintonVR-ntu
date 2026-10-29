@@ -1,0 +1,18 @@
+# v0.8.5 round 4, part 2: the same Unity tests as lab_5090_r4 (X01-X03) with a BUILT Unity player instead of the editor
+# (docs/setup/lab-tests.md § Round 4). The player follows <its folder>/runs (ServerFollower: the folder above
+# <name>_Data), so the campaign is pointed at the build folder:
+#   python tools/live_run.py campaign run --plan lab_5090_r4_player --group unity --unity-project <build folder>
+name: lab_5090_r4_player
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 3600
+
+tests:
+  - {id: P01_ref_player, group: unity, stage: P, note: "W01 with the built player", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest"]}
+  - {id: P02_long60_player, group: unity, stage: P, note: "W09 with the built player", requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "sync.mode=nearest"]}
+  - {id: P03_long30_player, group: unity, stage: P, settings: live_30, note: "W11 with the built player",
+     requires: [tensorrt, onnx], set: ["section_s=[2.0, 30.0]"]}

@@ -162,7 +162,9 @@ def run_timing(run_dir) -> dict:
                first_2d_call_ms=t.get("first_2d_call_ms"), dropped_2d_frames=t.get("dropped_2d_frames"),
                late_after_warmup=r.get("late_fraction_after_warmup"), pace=cfg.get("pace"),
                backend=cfg.get("backend"), solve_ms=t.get("solve_ms"),
-               e2e=st_.get("e2e"),
+               e2e=st_.get("e2e"), lag_2d_ms_start_end=t.get("lag_2d_ms_start_end"),
+               e2e_ms_start_end=t.get("e2e_ms_start_end"), keeps_up=t.get("keeps_up"),
+               keeps_up_2d=t.get("keeps_up_2d"),
                stages=[{"key": k, "label": lab, **{q: (st_.get(k) or {}).get(q) for q in ("p50", "p90", "p99", "max", "mean")}}
                        for k, lab in STAGE_LABELS
                        if st_.get(k) and not (cfg.get("backend") == "cached" and k in ("decode", "infer"))])
@@ -228,6 +230,7 @@ class Server:
         self.jobs = jobmod.JobManager()
         self._np_lock = threading.Lock()
         self.warm_request = None         # {clip, warm: {key: value}} of the last warm-up sent to the engine
+        self._beat = {"t": None, "mono": 0.0}   # last heartbeat stamp seen + when (this process's monotonic clock)
 
     # ------------------------------------------------------------------ catalogue
     @property
@@ -336,15 +339,29 @@ class Server:
 
     # ------------------------------------------------------------------ Unity heartbeat
     def unity_status(self) -> dict:
-        """Unity's heartbeat (runs/unity_status.json, written every second in Play mode by ServerFollower)."""
+        """Unity's heartbeat (runs/unity_status.json, written every second in Play mode by ServerFollower).
+
+        Its age is measured by the stamp CHANGING, on this process's monotonic clock - not by comparing Unity's stamp
+        (Windows clock) with this clock: in WSL the two drift apart (seconds to minutes after the PC sleeps), which made a
+        live Unity look stopped. Only the first reading falls back to the wall clocks; a stamp that changes is fresh."""
         p = self.runs / UNITY_STATUS
         try:
-            with open(p, "r", encoding="utf-8") as fh:
+            with open(p, "r", encoding="utf-8-sig") as fh:
                 st_ = json.load(fh)
         except (OSError, ValueError):
-            return {"in_play": False, "seen": False}
-        age = time.time() - float(st_.get("t", 0))
-        st_.update(seen=True, age_s=round(age, 1), in_play=bool(st_.get("playing")) and age < UNITY_STALE_S)
+            return {"in_play": False, "seen": False, "path": str(p)}
+        t = float(st_.get("t", 0) or 0)
+        now = time.monotonic()
+        wall_age = time.time() - t
+        if t != self._beat["t"]:
+            self._beat = {"t": t, "mono": now, "changed": self._beat["t"] is not None}
+        if self._beat.get("changed"):            # seen it change: its age on this process's clock, whatever the clocks
+            age = now - self._beat["mono"]
+            st_.update(age_s=round(age, 1), clock_offset_s=round(wall_age - age, 1))
+        else:                                    # not changed since this server started: only the wall clocks can tell
+            age = abs(wall_age)                  # a stamp far in the "future" is as unknown as an old one
+            st_.update(age_s=round(wall_age, 1), clock_offset_s=None)
+        st_.update(seen=True, in_play=bool(st_.get("playing")) and age < UNITY_STALE_S, path=str(p))
         return st_
 
     # ------------------------------------------------------------------ stream

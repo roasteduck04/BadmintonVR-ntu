@@ -108,6 +108,8 @@ output:
   copy_to_analysis_dir: false   # also copy the final doc into paths.analysis_dir (Unity)
   round_decimals: 5
   background_writer: true       # write frame files on a separate thread (the loop does not wait for the disk)
+  latest_every_s: 0.25          # v0.8.5, background writer: rewrite latest.json (the server's progress count) at most
+                                # this often instead of after every frame (0 = every frame). Unity reads the frame files
 
 report:
   reference_clips: []           # offline builds to compare against (first = primary); default set by the clip file

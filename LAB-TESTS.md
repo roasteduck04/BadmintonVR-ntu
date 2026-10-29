@@ -144,3 +144,35 @@ python tools/live_run.py campaign run --plan lab_5090_r3 --group unity --unity-p
 
 Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r3.zip` (laptop: `BadmintonVR\runs\`).
 
+---
+
+## Round 4 (v0.8.5, after round 3)
+
+Round 3: with the TensorRT detector the 2D side keeps up at 60 fps, but the output delay still grows (writing each
+frame file from WSL into the Windows-side Unity folder took ~17 ms, two files per frame). v0.8.5 now rewrites
+`latest.json` at most 4x a second and the rtx5090 preset has the TensorRT detector on. Round 4
+(`configs/live/campaign/lab_5090_r4.yaml`, 12 streams + 3 with the Unity editor, ~25 min) checks 60 fps end to end and
+tries the detector every 3rd / 2nd / every frame, a 0.5 s fit window and 4 fit processes. The summary has two new
+columns: the 2D lag and the delay at the start and the end of each stream (✓ = keeps up, ✗ = grows).
+
+```bash
+cd ~/BadmintonVR && source ~/venv-pc/bin/activate && git pull
+python tools/live_run.py campaign run --plan lab_5090_r4 --group main --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+# then the Unity editor in Play mode:
+python tools/live_run.py campaign run --plan lab_5090_r4 --group unity --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+```
+
+**Built player (part 2, `lab_5090_r4_player`)**: the editor costs 6-13 %; this measures a built player instead.
+
+1. Unity: **File → Build Profiles → Windows** (scene `Assets/badminton.unity` in the list) → **Build** into a new folder
+   `C:\Users\sports_1\BadmintonVR-build`. Then PowerShell: `mkdir C:\Users\sports_1\BadmintonVR-build\runs`
+   (the player writes its heartbeat and reads the streams there: the folder above `<name>_Data`).
+2. Close the editor's Play mode, start `BadmintonVR-build\<name>.exe` (windowed is fine) and leave it in front.
+3. Ubuntu:
+
+```bash
+python tools/live_run.py campaign run --plan lab_5090_r4_player --group unity --unity-project /mnt/c/Users/sports_1/BadmintonVR-build
+```
+
+Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r4.zip` and
+`C:\Users\sports_1\BadmintonVR-build\runs\campaign\lab_5090_r4_player.zip` (laptop: `BadmintonVR\runs\`).

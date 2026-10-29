@@ -395,6 +395,14 @@ def render_run(run_dir, log=print) -> str:
          f"({_f(T['realtime_factor'], 2)}× real time).",
          f"- **Latency** (capture → frame file): median {_f((T['stages']['e2e'] or {}).get('p50'), 0)} ms, "
          f"p90 {_f((T['stages']['e2e'] or {}).get('p90'), 0)} ms; first frame after {_f(T['first_frame_s'], 2)} s.",
+         ] + ([
+         f"- **Keeping up:** 2D lag {_f(T['lag_2d_ms_start_end'][0], 0)} → {_f(T['lag_2d_ms_start_end'][1], 0)} ms and delay "
+         f"{_f((T.get('e2e_ms_start_end') or [None, None])[0], 0)} → {_f((T.get('e2e_ms_start_end') or [None, None])[1], 0)} ms "
+         f"from the first to the last fifth of the stream: "
+         + ("**keeps up with the cameras** (× real time also counts the start-up backlog and the fit's tail)."
+            if T.get('keeps_up') else "**2D keeps up, but the output delay grows** (the body fit falls behind)."
+            if T.get('keeps_up_2d') else "**falls behind** (the 2D lag grows).")] if T.get("lag_2d_ms_start_end") and T.get("keeps_up") is not None
+         else []) + [
          f"- **Frames:** " + ", ".join(f"{QN.get(k, k)} {v} ({v / n_out:.0%})" for k, v in sorted(qc.items()))
          + (f"; after warm-up {late_frac:.0%} late/fallback." if late_frac is not None else ""),
          ]

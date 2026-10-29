@@ -109,6 +109,18 @@ def pct(x, qs=(50, 90, 99)):
     return out
 
 
+KEEP_UP_MS = 250.0       # v0.8.5: the 2D lag may grow this much from the first to the last fifth and still "keep up"
+
+
+def start_end(vals):
+    """[median of the first fifth, median of the last fifth] of a per-step series (None if under 10 values)."""
+    v = [x for x in vals if x is not None and np.isfinite(x)]
+    if len(v) < 10:
+        return None
+    q = max(1, len(v) // 5)
+    return [float(np.median(v[:q])), float(np.median(v[-q:]))]
+
+
 def windows(events) -> list:
     return sorted((e for e in events if e.get("ev") == "window"), key=lambda w: w["start"])
 
@@ -148,4 +160,13 @@ def summary(rows, events, cfg) -> dict:
            "first_2d_call_ms": next((r["infer"] for r in rows if r["first_call"]), None)}
     fitted = [r for r in rows if r["quality"] == 0]
     out["e2e_fitted"] = pct([r["e2e"] for r in fitted])
+    # v0.8.5 steady state: "x real time" counts the start-up backlog and the fit's tail, so a stream that keeps up with
+    # the cameras can read 0.87x. The 2D lag (capture -> all cameras' 2D in) at the start vs the end tells: it stays
+    # (or shrinks) when the stream keeps up, it grows when it falls behind.
+    out["lag_2d_ms_start_end"] = start_end([r["wait_2d"] for r in rows])
+    out["e2e_ms_start_end"] = start_end([r["e2e"] for r in rows])
+    lag, e2e = out["lag_2d_ms_start_end"], out["e2e_ms_start_end"]
+    rt = cfg.get("pace") == "realtime"
+    out["keeps_up_2d"] = (lag[1] <= lag[0] + KEEP_UP_MS) if lag and rt else None      # the 2D side alone
+    out["keeps_up"] = (e2e[1] <= e2e[0] + KEEP_UP_MS) if e2e and rt else None         # the whole pipeline (output delay)
     return out

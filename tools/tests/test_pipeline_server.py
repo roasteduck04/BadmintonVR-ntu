@@ -174,7 +174,8 @@ def test_compare_reads_numeric_text_as_numbers(tmp_path):
 def test_stream_start_checks_that_unity_is_in_play_mode(tmp_path, monkeypatch):
     s, c = _app(tmp_path)
     monkeypatch.setattr(s.jobs, "start", lambda job: job)
-    assert c.get("/api/unity").json() == {"in_play": False, "seen": False}
+    u0 = c.get("/api/unity").json()
+    assert u0["in_play"] is False and u0["seen"] is False and u0["path"].endswith("unity_status.json")
     r = c.post("/api/stream/start", json={"oneshot": True, "clip": "singles_05x", "preset": "laptop_realtime"})
     assert r.status_code == 409 and r.json()["detail"]["code"] == "unity_not_playing"
     hb = s.runs / "unity_status.json"
@@ -186,6 +187,21 @@ def test_stream_start_checks_that_unity_is_in_play_mode(tmp_path, monkeypatch):
     assert u["in_play"] is True and u["mode"] == "broadcast"
     assert c.post("/api/stream/start", json={"oneshot": True, "clip": "singles_05x", "preset": "laptop_realtime"}).status_code == 200
     hb.write_text(json.dumps({"v": 1, "playing": False, "t": time.time()}), encoding="utf-8")   # Play mode ended
+    assert c.get("/api/unity").json()["in_play"] is False
+
+
+def test_unity_heartbeat_survives_a_clock_offset(tmp_path):
+    """WSL's clock and Windows' drift apart after the PC sleeps: a heartbeat whose stamp keeps changing is live even when
+    it looks minutes old (or in the future) by the wall clocks; one that stops changing goes stale."""
+    s, c = _app(tmp_path)
+    hb = s.runs / "unity_status.json"
+    off = -120.0                                         # Unity's clock 2 min behind this one
+    hb.write_text("﻿" + json.dumps({"playing": True, "t": time.time() + off, "mode": "idle"}), encoding="utf-8")
+    assert c.get("/api/unity").json()["in_play"] is False          # first look: cannot tell yet
+    hb.write_text(json.dumps({"playing": True, "t": time.time() + off + 1, "mode": "idle"}), encoding="utf-8")
+    u = c.get("/api/unity").json()
+    assert u["in_play"] is True and abs(u["clock_offset_s"] - 119) < 3   # it changed: live
+    s._beat["mono"] -= 10                                # no new stamp for 10 s
     assert c.get("/api/unity").json()["in_play"] is False
 
 

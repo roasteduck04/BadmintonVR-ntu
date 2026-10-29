@@ -20,7 +20,9 @@ YOLOX_M = os.path.expanduser(os.path.join("~", ".cache", "rtmlib", "hub", "check
 def test_defaults_limit_threads_and_keep_late_fits_while_behind():
     c = live_config.load("singles_05x", preset="rtx5090", probe=_probe())
     assert c["cpu"]["limits"] is True and c["stream"]["late_policy"] == "behind"
-    assert c["rtmpose"]["det_trt"] is False and c["rtmpose"]["det_async"] is False
+    assert c["rtmpose"]["det_trt"] is True and c["rtmpose"]["det_async"] is False     # lab preset: TensorRT detector
+    c3 = live_config.load("singles_05x", preset="rtx3060", probe=_probe())
+    assert c3["rtmpose"]["det_trt"] is False and c3["cpu"]["limits"] is True
 
 
 def test_detector_options_need_the_fast_engine():
@@ -178,3 +180,27 @@ def test_sync_detector_unchanged_without_det_async():
         flags.append(d)
         e.finish("v", [np.array([[10, 10], [90, 190]], np.float32)])
     assert flags == [True, False, False, False, False, True, False, False, False, False, True]
+
+
+# ------------------------------------------------------------------------------------------------ frame writer
+def test_background_writer_throttles_latest_json_but_writes_every_frame(tmp_path, monkeypatch):
+    """v0.8.5: latest.json (the server's progress count) at most every latest_every_s; every frame file still lands and
+    the final latest.json names the last frame."""
+    import json
+    from analysis.live import framewriter as fw
+    cfg = {"source_fps": 60.0, "skeleton": "smpl-24", "facing_window": 8, "fps": 60.0, "stride": 1, "views": ["a", "b"],
+           "time_ref": "a", "offsets": {"a": 0.0, "b": 0.0}, "ref_frames": list(range(40)), "warmup_steps": 0,
+           "output": {"latest_every_s": 10.0}}
+    w = fw.FrameWriter(str(tmp_path), cfg, {"schema_version": "4.1"}, {"P1": "near"}, background=True)
+    monkeypatch.setattr(w, "frame_obj", lambda o, t=None: {"v": 1, "step": o["step"], "players": []})
+    latest_writes = []
+    real = fw.atomic_write
+    monkeypatch.setattr(fw, "atomic_write", lambda p, obj, **k: (latest_writes.append(obj) if p.endswith("latest.json")
+                                                                 else None) or real(p, obj, **k))
+    for s in range(40):
+        w.submit({"step": s})
+    w.close()
+    d = tmp_path / fw.FRAMES_DIR
+    assert len(list(d.glob("frame_*.json"))) == 40
+    assert len(latest_writes) <= 2                                       # first frame + the final one
+    assert json.loads((d / "latest.json").read_text(encoding="utf-8"))["last_step"] == 39
