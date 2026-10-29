@@ -1,0 +1,151 @@
+"""Round-5 experiment hooks (test branch only), attached by tools/experiments/sitecustomize.py when the live modules load.
+Each is off unless its config key is set (keys pass through the live config untouched):
+
+- rtmpose.exp_int8=true (or a path): the pose model as an INT8 QDQ model built by tools/experiments/int8_calib.py,
+  run by TensorRT with INT8 enabled (FP16 for whatever stays unquantized). Needs rtmpose.ep=trt.
+- rtmpose.exp_stagger=N: each camera runs the pose model on every Nth frame only, cameras offset from each other (so at
+  every step 1/N of the cameras are fresh); in between, each person's keypoints are carried forward at their last
+  velocity (frames from a new detection always run the model). Needs one process per camera (batch_views false).
+- output.exp_socket=udp://host:port: frame files go out as UDP datagrams instead of files (manifest and latest.json stay
+  files) - what writing costs; Unity does not receive them in this test (tools/experiments/frame_receiver.py does).
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+
+import numpy as np
+
+INT8_DIR = os.path.join("~", ".cache", "badmintonvr", "int8")
+
+
+def int8_path(onnx_model) -> str:
+    base = os.path.splitext(os.path.basename(str(onnx_model)))[0]
+    return os.path.expanduser(os.path.join(INT8_DIR, f"{base}.int8qdq.onnx"))
+
+
+def attach(name, module):
+    if name == "analysis.live.pose2d_fast":
+        _attach_pose2d(module)
+    elif name == "analysis.live.framewriter":
+        _attach_framewriter(module)
+
+
+# ------------------------------------------------------------------------------------------------ INT8 + stagger
+def _attach_pose2d(m):
+    orig_trt_models, orig_trt_session = m.trt_models, m.trt_session
+
+    def trt_models(sol, rcfg, batch, in_hw):
+        want = rcfg.get("exp_int8")
+        if want:
+            q = want if isinstance(want, str) else int8_path(sol.pose_model.onnx_model)
+            if not os.path.exists(q):
+                raise RuntimeError(f"exp_int8: no INT8 pose model {q} - run tools/experiments/int8_calib.py first")
+            sol.pose_model.onnx_model = q
+        return orig_trt_models(sol, rcfg, batch, in_hw)
+
+    def trt_session(onnx_path, rcfg, shapes=None):
+        if str(onnx_path).endswith(".int8qdq.onnx"):
+            return _int8_session(m, onnx_path, rcfg, shapes)
+        return orig_trt_session(onnx_path, rcfg, shapes)
+
+    m.trt_models, m.trt_session = trt_models, trt_session
+
+    F = m.FastPose
+    orig_init, orig_boxes, orig_infer = F.__init__, F.boxes, F.infer
+
+    def __init__(self, rcfg, device):
+        orig_init(self, rcfg, device)
+        n = int(rcfg.get("exp_stagger") or 1)
+        if n > 1 and rcfg.get("batch_views"):
+            print("exp_stagger needs one process per camera (rtmpose.batch_views false): off", flush=True)
+            n = 1
+        self._exp_stagger = n
+        self._exp_order = {v: i for i, v in enumerate(sorted((rcfg.get("_cam_paths") or {}).keys()))}
+        self._exp_hist, self._exp_cur = {}, None
+        self.exp_predicted = self.exp_fresh = 0
+
+    def boxes(self, view, img):
+        out = orig_boxes(self, view, img)
+        self._exp_cur = (view, self.state[view]["n"] - 1, bool(out[2]))
+        return out
+
+    def infer(self, crops):
+        n_st, cur = getattr(self, "_exp_stagger", 1), self._exp_cur
+        if n_st > 1 and cur is not None and crops:
+            view, n, detected = cur
+            h = self._exp_hist.get(view) or []
+            if h and n <= h[-1][0]:                       # a new session restarted the frame count
+                h = self._exp_hist[view] = []
+            off = self._exp_order.get(view, 0) % n_st
+            if not detected and (n + off) % n_st != 0 and h and len(h[-1][1]) == len(crops):
+                n1, k1, s1 = h[-1]
+                vel = 0.0
+                if len(h) >= 2 and len(h[-2][1]) == len(k1):
+                    n0, k0, _ = h[-2]
+                    vel = (k1 - k0) / float(n1 - n0)
+                self.exp_predicted += len(crops)
+                return (k1 + vel * (n - n1)).astype(np.float32), s1.copy()
+        kps, scs = orig_infer(self, crops)
+        if n_st > 1 and cur is not None:
+            view, n, detected = cur
+            h = [] if detected else self._exp_hist.get(view, [])   # a new detection may reorder people
+            h.append((n, kps.copy(), scs.copy()))
+            self._exp_hist[view] = h[-2:]
+        self.exp_fresh += len(crops)
+        return kps, scs
+
+    F.__init__, F.boxes, F.infer = __init__, boxes, infer
+
+
+def _int8_session(m, onnx_path, rcfg, shapes):
+    """pose2d_fast.trt_session with INT8 on (explicit QDQ quantization; FP16 for the rest)."""
+    import onnxruntime as ort
+    cache = os.path.expanduser(os.path.join(rcfg.get("trt_cache") or m.TRT_CACHE, "int8"))
+    os.makedirs(cache, exist_ok=True)
+    opts = {"trt_fp16_enable": "True", "trt_int8_enable": "True", "trt_engine_cache_enable": "True",
+            "trt_engine_cache_path": cache, "trt_timing_cache_enable": "True", "trt_timing_cache_path": cache,
+            "trt_max_workspace_size": str(int(rcfg.get("trt_workspace_gb", 4)) << 30)}
+    if shapes:
+        opts["trt_profile_min_shapes"] = ",".join(m._shape_str(n, s[0]) for n, s in shapes.items())
+        opts["trt_profile_opt_shapes"] = ",".join(m._shape_str(n, s[1]) for n, s in shapes.items())
+        opts["trt_profile_max_shapes"] = ",".join(m._shape_str(n, s[2]) for n, s in shapes.items())
+    prov = [("TensorrtExecutionProvider", opts), "CUDAExecutionProvider", "CPUExecutionProvider"]
+    try:
+        sess = ort.InferenceSession(onnx_path, providers=prov)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e).strip().splitlines()[-1] if str(e).strip() else type(e).__name__
+        raise m.TensorRTUnavailable(f"TensorRT could not build the INT8 model {os.path.basename(onnx_path)}: {msg[:300]}")
+    if sess.get_providers()[:1] != ["TensorrtExecutionProvider"]:
+        raise m.TensorRTUnavailable(f"onnxruntime could not use TensorRT for the INT8 model (got {sess.get_providers()})")
+    return sess
+
+
+# ------------------------------------------------------------------------------------------------ socket output
+_SOCKS = {}          # frame folder -> (socket, address)
+
+
+def _attach_framewriter(m):
+    F = m.FrameWriter
+    orig_init, orig_aw = F.__init__, m.atomic_write
+
+    def __init__(self, run_dir, cfg, *a, **k):
+        orig_init(self, run_dir, cfg, *a, **k)
+        url = (cfg.get("output") or {}).get("exp_socket")
+        if url:
+            if not str(url).startswith("udp://"):
+                raise ValueError(f"output.exp_socket must be udp://host:port, got {url!r}")
+            host, port = str(url)[6:].rsplit(":", 1)
+            _SOCKS[os.path.normcase(os.path.abspath(self.dir))] = (socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+                                                                   (host, int(port)))
+
+    def atomic_write(path, obj, **kw):
+        s = _SOCKS.get(os.path.normcase(os.path.abspath(os.path.dirname(path))))
+        if s is not None and os.path.basename(path).startswith("frame_"):
+            text = json.dumps(obj, allow_nan=False, separators=(",", ":"))
+            s[0].sendto(text.encode("utf-8"), s[1])
+            return len(text)
+        return orig_aw(path, obj, **kw)
+
+    F.__init__, m.atomic_write = __init__, atomic_write

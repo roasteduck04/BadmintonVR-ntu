@@ -1,0 +1,66 @@
+# Round 5 (TEST BRANCH test/r5-experiments only): fewer resources, better quality. Run with the experiment hooks:
+#   PYTHONPATH="$PWD/tools/experiments" python tools/live_run.py campaign run --plan lab_5090_r5 --group main --unity-project <Unity project>
+# (tools/experiments/README.md). Questions:
+#   A  a smaller input for the same pose model (rtmpose.mode=balanced: RTMW-x at 256x192 instead of 384x288)
+#   B  more cameras (4, 5) - paid for with A?
+#   C  an INT8 pose model on TensorRT (rtmpose.exp_int8; build it first with tools/experiments/int8_calib.py)
+#   D  staggered cameras: the pose model on every 2nd frame per camera, cameras offset (rtmpose.exp_stagger=2)
+#   F  frames sent over a local UDP socket instead of written as files (output.exp_socket)
+# Lab defaults (v0.8.5): TensorRT pose model + detector, CPU thread limits, late fits kept while behind. Quality: q5 (vs
+# the 5-camera offline build) compares every camera set fairly; q3 is only meaningful for the original 3 cameras.
+name: lab_5090_r5
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+  seconds: 10                   # bench2d only
+
+tests:
+  # ---------------------------------------------------------------- A: the 2D step alone, vs the offline 2D (3 cameras)
+  - {id: A01_perf, kind: bench2d, note: "pose model 384x288 (now)", requires: [tensorrt, onnx]}
+  - {id: A02_balanced, kind: bench2d, note: "same model at 256x192 (balanced)", requires: [tensorrt, onnx],
+     set: ["rtmpose.mode=balanced"]}
+  - {id: A03_int8, kind: bench2d, note: "INT8 pose model", requires: [tensorrt, onnx], set: ["rtmpose.exp_int8=true"]}
+  - {id: A04_stagger2, kind: bench2d, note: "pose model every 2nd frame per camera", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_stagger=2"]}
+
+  # ---------------------------------------------------------------- whole streams, 60 fps, nearest sync, 3 cameras
+  - {id: Y01_perf_3cam, note: "reference (round 4 W01)", requires: [tensorrt, onnx], set: ["sync.mode=nearest"]}
+  - {id: Y02_balanced_3cam, note: "A: balanced", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.mode=balanced"]}
+  - {id: Y03_int8_3cam, note: "C: INT8", requires: [tensorrt, onnx], set: ["sync.mode=nearest", "rtmpose.exp_int8=true"]}
+  - {id: Y04_stagger_3cam, note: "D: stagger 2", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.exp_stagger=2"]}
+  - {id: Y05_socket_3cam, note: "F: frames over UDP, no frame files", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "output.exp_socket=udp://127.0.0.1:8899"]}
+  - {id: Y06_perf_3back, note: "B: back, back-left, back-right instead", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "views=[back_051, backleft_051, backright_051]"]}
+  # ---------------------------------------------------------------- 4 and 5 cameras
+  - {id: Y07_perf_4cam, note: "B: 4 cameras (no front-right)", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "views=[back_051, backleft_051, backright_051, frontleft_051]"]}
+  - {id: Y08_balanced_4cam, note: "A+B: balanced, 4 cameras", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.mode=balanced", "views=[back_051, backleft_051, backright_051, frontleft_051]"]}
+  - {id: Y09_perf_5cam, note: "B: 5 cameras", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Y10_balanced_5cam, note: "A+B: balanced, 5 cameras", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.mode=balanced",
+           "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Y11_int8_5cam, note: "B+C: INT8, 5 cameras", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.exp_int8=true",
+           "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Y12_stagger_5cam, note: "B+D: stagger 2, 5 cameras", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.exp_stagger=2",
+           "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  # ---------------------------------------------------------------- 30 fps, 5 cameras
+  - {id: Y13_live30_perf_5cam, settings: live_30, note: "30 fps, 5 cameras", requires: [tensorrt, onnx],
+     set: ["views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Y14_live30_balanced_5cam, settings: live_30, note: "30 fps, balanced, 5 cameras", requires: [tensorrt, onnx],
+     set: ["rtmpose.mode=balanced", "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  # ---------------------------------------------------------------- 28 s
+  - {id: Y15_long_perf_5cam, note: "60 fps, 5 cameras, 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "sync.mode=nearest",
+           "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Y16_long_balanced_5cam, note: "60 fps, balanced, 5 cameras, 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "sync.mode=nearest", "rtmpose.mode=balanced",
+           "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
