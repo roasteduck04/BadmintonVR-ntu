@@ -1,0 +1,27 @@
+# Round 5b (TEST BRANCH test/r5-experiments only): the 5 balanced streams of round 5 again, now with the balanced score
+# map (tools/experiments/score_map_wb.json, applied by hooks.py whenever rtmpose.mode=balanced). In round 5 every
+# balanced keypoint failed the score gates (wholebody scores were passed through unchanged, balanced scores are ~5.5x
+# lower), so no player was acquired and those results were invalid. Same tests and ids as lab_5090_r5, plus the
+# reference Y01 again for a same-session comparison. Run with the experiment hooks:
+#   PYTHONPATH="$PWD/tools/experiments" python tools/live_run.py campaign run --plan lab_5090_r5b --group main --unity-project <Unity project>
+name: lab_5090_r5b
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+
+tests:
+  - {id: Y01_perf_3cam, note: "reference (round 4 W01, round 5 Y01)", requires: [tensorrt, onnx], set: ["sync.mode=nearest"]}
+  - {id: Y02_balanced_3cam, note: "A: balanced", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.mode=balanced"]}
+  - {id: Y08_balanced_4cam, note: "A+B: balanced, 4 cameras", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.mode=balanced", "views=[back_051, backleft_051, backright_051, frontleft_051]"]}
+  - {id: Y10_balanced_5cam, note: "A+B: balanced, 5 cameras", requires: [tensorrt, onnx],
+     set: ["sync.mode=nearest", "rtmpose.mode=balanced",
+           "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Y14_live30_balanced_5cam, settings: live_30, note: "30 fps, balanced, 5 cameras", requires: [tensorrt, onnx],
+     set: ["rtmpose.mode=balanced", "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Y16_long_balanced_5cam, note: "60 fps, balanced, 5 cameras, 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "sync.mode=nearest", "rtmpose.mode=balanced",
+           "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}

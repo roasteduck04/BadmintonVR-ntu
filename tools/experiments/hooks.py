@@ -8,6 +8,10 @@ Each is off unless its config key is set (keys pass through the live config unto
   velocity (frames from a new detection always run the model). Needs one process per camera (batch_views false).
 - output.exp_socket=udp://host:port: frame files go out as UDP datagrams instead of files (manifest and latest.json stay
   files) - what writing costs; Unity does not receive them in this test (tools/experiments/frame_receiver.py does).
+
+Always on (a fix, not an option): wholebody at a smaller input (rtmpose.mode=balanced) gets its raw scores mapped onto
+the wholebody-performance scale with tools/experiments/score_map_wb.json (score_map_fit.py) - pose2d_fast.score_to_wb
+passes wholebody through unchanged, which left every round-5 balanced stream without a single player.
 """
 from __future__ import annotations
 
@@ -18,6 +22,26 @@ import socket
 import numpy as np
 
 INT8_DIR = os.path.join("~", ".cache", "badmintonvr", "int8")
+SCORE_MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "score_map_wb.json")
+
+
+def load_score_maps(path=SCORE_MAP) -> dict:
+    """{"wholebody/<mode>": [(lo, hi, x quantiles, y quantiles), ...]} per keypoint group."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    return {k: [(g["range"][0], g["range"][1], np.asarray(g["x"], np.float32), np.asarray(g["y"], np.float32))
+                for g in v["groups"].values()] for k, v in doc.items()}
+
+
+def map_scores(groups, s):
+    """Raw scores (..., 133) of a smaller wholebody input on the wholebody-performance raw scale."""
+    s = np.asarray(s, np.float32)
+    out = s.copy()
+    for lo, hi, x, y in groups:
+        out[..., lo:hi] = np.interp(s[..., lo:hi], x, y)
+    return out
 
 
 def int8_path(onnx_model) -> str:
@@ -34,6 +58,14 @@ def attach(name, module):
 
 # ------------------------------------------------------------------------------------------------ INT8 + stagger
 def _attach_pose2d(m):
+    orig_score, maps = m.score_to_wb, load_score_maps()
+
+    def score_to_wb(model, mode, s):
+        g = maps.get(f"{model}/{mode}") if model == "wholebody" else None
+        return map_scores(g, s) if g else orig_score(model, mode, s)
+
+    m.score_to_wb = score_to_wb               # to_raw and sources.py look it up on the module at call time
+
     orig_trt_models, orig_trt_session = m.trt_models, m.trt_session
 
     def trt_models(sol, rcfg, batch, in_hw):
