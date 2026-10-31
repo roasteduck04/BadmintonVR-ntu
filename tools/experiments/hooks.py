@@ -9,6 +9,10 @@ Each is off unless its config key is set (keys pass through the live config unto
 - output.exp_socket=udp://host:port: frame files go out as UDP datagrams instead of files (manifest and latest.json stay
   files) - what writing costs; Unity does not receive them in this test (tools/experiments/frame_receiver.py does).
 
+Round 6 (racket + shuttle, rs_stream.py): rtmpose.exp_racket=det|wrist|both and/or rtmpose.exp_shuttle=true run the
+racket / shuttle models in the 2D processes after the pose model and a 3D process next to the runner; results go to
+<run>/racket_shuttle.jsonl, nothing else changes. Settings: rs_stream.settings().
+
 Always on (a fix, not an option): wholebody at a smaller input (rtmpose.mode=balanced) gets its raw scores mapped onto
 the wholebody-performance scale with tools/experiments/score_map_wb.json (score_map_fit.py) - pose2d_fast.score_to_wb
 passes wholebody through unchanged, which left every round-5 balanced stream without a single player.
@@ -52,8 +56,101 @@ def int8_path(onnx_model) -> str:
 def attach(name, module):
     if name == "analysis.live.pose2d_fast":
         _attach_pose2d(module)
+        _attach_rs_worker(module)
     elif name == "analysis.live.framewriter":
         _attach_framewriter(module)
+        _attach_rs_writer(module)
+    elif name == "analysis.live.sources":
+        _attach_rs_sources(module)
+
+
+# ------------------------------------------------------------------------------------------------ racket + shuttle
+def _attach_rs_worker(m):
+    """2D processes: the racket / shuttle models after the pose model, on the same decoded frame (rs_stream.RS2D)."""
+    import rs_stream
+    F = m.FastPose
+    orig_init, orig_warm, orig_boxes = F.__init__, F.warmup, F.boxes
+
+    def __init__(self, rcfg, device):
+        orig_init(self, rcfg, device)
+        self._rs = rs_stream.RS2D.maybe(rcfg, device, self.ep)
+
+    def warmup(self, img_hw=(1080, 1920)):
+        out = orig_warm(self, img_hw)
+        if getattr(self, "_rs", None) is not None:
+            s = self._rs.warmup(img_hw)
+            print(f"racket/shuttle models warmed up in {s:.1f} s ({self._rs.providers})", flush=True)
+        return out
+
+    def boxes(self, view, img):
+        if getattr(self, "_rs", None) is not None:
+            self._rs.stash(view, img)
+        return orig_boxes(self, view, img)
+
+    F.__init__, F.warmup, F.boxes = __init__, warmup, boxes
+    orig_session = m._run_session
+
+    def _run_session(engine, readers, k_cal, views, plans, origins, fps, t0_ns, realtime, put, stop_ev, ctl, step_s,
+                     rcfg):
+        rs = getattr(engine, "_rs", None)
+        if rs is None:
+            return orig_session(engine, readers, k_cal, views, plans, origins, fps, t0_ns, realtime, put, stop_ev,
+                                ctl, step_s, rcfg)
+        rs.begin_session()
+        inv = {v: k_cal[v] / readers[v].scale for v in views}
+        return orig_session(engine, readers, k_cal, views, plans, origins, fps, t0_ns, realtime, rs.wrap_put(put, inv),
+                            stop_ev, ctl, step_s, rcfg)
+
+    m._run_session = _run_session              # fast_worker looks it up on the module at call time
+
+
+def _attach_rs_sources(m):
+    """Main process: hand every delivered frame's racket / shuttle 2D to the run's 3D process."""
+    import rs_stream
+    S = m.VideoRtmlibSource
+    orig_try, orig_get = S.try_get, S.get
+
+    def try_get(self, view, frame, wait_s=0.002):
+        got = orig_try(self, view, frame, wait_s)
+        if rs_stream.CURRENT is not None:
+            rs_stream.CURRENT.on_2d(view, got)
+        return got
+
+    def get(self, view, frame, timeout_s=600):
+        got = orig_get(self, view, frame, timeout_s)
+        if rs_stream.CURRENT is not None:
+            rs_stream.CURRENT.on_2d(view, got)
+        return got
+
+    S.try_get, S.get = try_get, get
+
+
+def _attach_rs_writer(m):
+    """Main process: one racket / shuttle 3D process per run (started with the run's FrameWriter, fed each written
+    frame, closed with it)."""
+    import rs_stream
+    F = m.FrameWriter
+    orig_init, orig_write, orig_close = F.__init__, F._write, F.close
+
+    def __init__(self, run_dir, cfg, header_doc, *a, **k):
+        orig_init(self, run_dir, cfg, header_doc, *a, **k)
+        self._rs_sink = rs_stream.RSSink(run_dir, cfg, header_doc) if rs_stream.settings(cfg.get("rtmpose")) else None
+
+    def _write(self, o, t_capture_ns=None):
+        out = orig_write(self, o, t_capture_ns)
+        if getattr(self, "_rs_sink", None) is not None:
+            self._rs_sink.on_frame(o, out[0])
+        return out
+
+    def close(self):
+        try:
+            orig_close(self)
+        finally:
+            if getattr(self, "_rs_sink", None) is not None:
+                self._rs_sink.close()
+                self._rs_sink = None
+
+    F.__init__, F._write, F.close = __init__, _write, close
 
 
 # ------------------------------------------------------------------------------------------------ INT8 + stagger

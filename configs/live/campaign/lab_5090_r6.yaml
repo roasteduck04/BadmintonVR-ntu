@@ -1,0 +1,60 @@
+# Round 6 (TEST BRANCH test/r5-experiments only): racket + shuttle in the live stream, time and quality, nothing added
+# to the server or the Unity frames. The models (tools/experiments/models: RacketVision racket detector + our fine-tuned
+# racket keypoint model + TrackNetV3, exported to ONNX by rs_export.py) run inside the 2D processes after the pose model,
+# on TensorRT FP16 unless a test says cuda; their 3D runs in a process next to the runner and goes to
+# <run>/racket_shuttle.jsonl (scored on the laptop by tools/experiments/rs_report.py against the offline racket / shuttle).
+# Run with the experiment hooks:
+#   PYTHONPATH="$PWD/tools/experiments" python tools/live_run.py campaign run --plan lab_5090_r6 --group main --unity-project <Unity project>
+# Keys (rs_stream.settings): rtmpose.exp_racket off|det|wrist|both, exp_racket_det_every N, exp_racket_flip,
+# exp_racket_box [k, push], exp_racket_ep; rtmpose.exp_shuttle, exp_shuttle_stride, exp_shuttle_weights average|weight,
+# exp_shuttle_ep; exp_rs_async; exp_shuttle3d arc|tri (3D settings need no lab run: every run records its 2D in
+# rs_inputs.jsonl.gz and tools/experiments/rs_replay.py run replays the 3D on the laptop with other settings).
+# Racket defaults: second tight pass on (exp_racket_refine), Gauss-Newton racket / shuttle solvers.
+name: lab_5090_r6
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+  set: ["sync.mode=nearest"]
+
+tests:
+  - {id: Z01_pose_only, note: "reference: pose only (round 5 Y01)", requires: [tensorrt, onnx]}
+  # racket: how the boxes are found
+  - {id: Z02_racket_det, note: "racket: detector every frame + keypoints (offline way)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=det"]}
+  - {id: Z03_racket_det3, note: "racket: detector every 3rd frame, wrist boxes between", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=det", "rtmpose.exp_racket_det_every=3"]}
+  - {id: Z04_racket_wrist, note: "racket: wrist boxes only, no detector", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist"]}
+  - {id: Z05_racket_both, note: "racket: detector + wrist boxes every frame", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=both"]}
+  - {id: Z06_racket_wrist_noflip, note: "racket: wrist boxes, no flip test (half the model work)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_racket_flip=false"]}
+  - {id: Z06b_racket_wrist_norefine, note: "racket: wrist boxes, no second tight pass", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_racket_refine=false"]}
+  - {id: Z07_racket_wrist_wide, note: "racket: wider wrist boxes (2.0 racket lengths)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_racket_box=[2.0, 0.3]"]}
+  - {id: Z08_racket_det_cuda, note: "racket: detector every frame on CUDA (TensorRT's comparison)", requires: [onnx],
+     set: ["rtmpose.exp_racket=det", "rtmpose.exp_racket_ep=cuda"]}
+  # shuttle: how often TrackNet runs
+  - {id: Z09_shuttle_s8, note: "shuttle: TrackNet every 8 frames per camera", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_stride=8"]}
+  - {id: Z10_shuttle_s4, note: "shuttle: every 4 frames (overlapping, averaged)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_stride=4"]}
+  - {id: Z11_shuttle_s1, note: "shuttle: every frame, positional weights (offline way)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_stride=1", "rtmpose.exp_shuttle_weights=weight"]}
+  - {id: Z12_shuttle_s8_cuda, note: "shuttle: every 8 frames on CUDA (TensorRT's comparison)", requires: [onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_ep=cuda"]}
+  # everything together
+  - {id: Z14_all_wrist, note: "pose + racket (wrist) + shuttle (every 8)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true"]}
+  - {id: Z15_all_det3, note: "pose + racket (detector every 3rd) + shuttle (every 8)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=det", "rtmpose.exp_racket_det_every=3", "rtmpose.exp_shuttle=true"]}
+  - {id: Z16_all_wrist_async, note: "Z14 with racket / shuttle in their own thread (pose not held back)",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true", "rtmpose.exp_rs_async=true"]}
+  - {id: Z17_all_live30_5cam, settings: live_30, note: "30 fps, 5 cameras, pose + racket (wrist) + shuttle",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true",
+                                       "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Z18_long_all_wrist, note: "Z14 over 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true"]}

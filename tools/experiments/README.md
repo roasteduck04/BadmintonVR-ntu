@@ -44,6 +44,57 @@ separate project if A-D are not enough.
 - **F UDP:** same delay as files (1.30 s median both) since the v0.8.5 writer fix: no gain.
 - 3 cameras, current setup (Y01) reproduces round 4: 57 fps, delay 1.30 s, q3 1.39 cm.
 
+## Round 6: racket + shuttle in the live stream (time and quality, nothing added to the server or Unity frames)
+
+Files (all new): `rs_nets.py` (the three networks in plain PyTorch, layer names = the checkpoints), `rs_export.py`
+(-> `models/*.onnx`, normalisation inside each graph; `check` vs the stored offline 2D), `rs_live.py` (pre / post
+processing in NumPy + OpenCV, onnxruntime CPU / CUDA / TensorRT), `rs_stream.py` (2D inside the live 2D processes, 3D
+in a process next to the runner -> `<run>/racket_shuttle.jsonl`), `rs_bench.py` (models alone, CUDA vs TensorRT),
+`rs_check2d.py` (laptop: what each way of finding the racket costs in 2D), `rs_replay.py` (the 3D again on a run's
+recorded 2D or on the offline stored 2D, in seconds), `rs_report.py` (scores runs against the offline racket /
+shuttle). Hooks in `hooks.py` (also `analysis.live.sources` now).
+
+Models (`models/`, MIT licences): RacketVision RTMDet-M racket detector (Hugging Face linfeng302/RacketVision-Models
+`epoch_300.pth`; 104 MB ONNX, committed in two parts that `rs_live.model_path` joins), our fine-tuned RTMPose-M racket
+keypoint model (`data/racket_finetune_run/best_final_epoch_60.pth`, the offline "bootstrap" racket), TrackNetV3
+(`TrackNet_best.pt`). Laptop check of the exported models against the stored offline results (back_051):
+racket keypoints on the guide boxes 0.004 px median (54 rackets), detector + keypoints: all 95 offline detector
+candidates found, 0.02 px median - i.e. exact; TrackNet (8-frame windows, no InpaintNet, background from 240 frames)
+16 px median at 4K vs the stored TrackNetV3 + InpaintNet (which ran every frame with positional weights).
+
+Speed-up options looked at: TensorRT FP16 for all three (this round); no racket detector - boxes from the live wrists
+(`wrist`); TrackNet once per 8 frames per camera instead of every frame (`exp_shuttle_stride`). Not built: TrackNetV4
+(motion attention, +0.4 F1, slower), TrackNetV5-Lite (2.6 M parameters, weights not confirmed public), a smaller
+racket model (RTMPose-S/T trained on our 9.4k auto labels; needs GPU training).
+
+Laptop results (2026-10-31, CPU):
+- 2D, what finding the racket costs (`rs_check2d.py`, back_051, 30 frames, 60 offline rackets, 4K px): the live
+  1080p alone 0.35 px; no flip test 0.91 px; detector 70 % found, 2.8 px (2.3 px with the second tight pass);
+  wrist boxes 57-75 % found, 4.5-17 px (best 1.2 racket lengths pushed 0.3 along the forearm: 73 %, 4.5 px;
+  3.5 px with the second pass) -> the second pass (`exp_racket_refine`) is on by default.
+- 3D on the offline stored 2D (`rs_replay.py offline`, 3 cameras, frames 300-900, RacketVision detector 2D) vs the
+  offline 5-camera racket / shuttle: near player's racket 94 % of frames, grip 2.3 cm, head 3.4 cm, shaft 3.1 deg;
+  far player 52 % (its racket is mostly seen by one of these cameras), head 8.5 cm, shaft 10 deg; shuttle 63 % of
+  the offline frames, 10.5 cm median.
+- 3D speed: it first took 39 ms (racket) + 40 ms (shuttle) per frame on the laptop. Now Gauss-Newton with analytic
+  derivatives for both (scipy's numerical derivatives were ~90 % of the time), one solve from the last frame's racket,
+  at most 8 short starts otherwise, a failed full fit not retried for 3 steps -> racket ~16 ms median for two
+  players incl. the other-hand fallback, shuttle ~1.5 ms (`exp_racket3d_solver=scipy` = the offline solver, ~2x).
+  2-camera shuttle points need 8 deg between the rays and <= 12 px (p90 111 -> 70 cm for 68 -> 63 % coverage).
+- Racket hand: chosen each frame (the hand whose projection has racket handles nearest; switch only when the other
+  is clearly nearer; the other hand if the fit fails) - a hand locked by its label went wrong for the far player,
+  whose arms the live pose sometimes swaps (replay of a live stream: P2 7 % -> 87 % of frames, head 38 -> 9 cm).
+- Live CPU streams (3 cameras, 30 fps; wrist + shuttle, detector every 3rd + shuttle): everything runs end to end
+  (laptop smoke tests of 15-30 frames after the warm-up, not quality results; replayed with the final 3D: both
+  rackets 87 % of frames, head ~9.5 cm, shaft ~9 deg; shuttle 14 cm, 4.4 cm one frame later - the offline shuttle
+  file's timeline sits one frame off the live / pose24 one, so the report also gives the best whole-frame shift).
+  With `exp_rs_async` on the laptop CPU the racket / shuttle thread fell far behind the pose and its results came
+  after their frames were written (nothing fitted): the 3D now waits up to 1.5 s for a frame's 2D, and the thread
+  drops its oldest step beyond 30 waiting (`worker.dropped` in rs_summary.json); the lab GPU decides.
+
+Every run also records its 3D inputs (`rs_inputs.jsonl.gz`), so 3D settings are compared on the laptop afterwards
+(`rs_replay.py run <run> --set shuttle3d=tri ...`) instead of in more lab runs.
+
 ## Lab PC
 
 ```bash
@@ -63,6 +114,19 @@ python tools/live_run.py campaign run --plan lab_5090_r5b --group main --unity-p
 ```
 
 Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r5b.zip`.
+
+Round 6 (racket + shuttle; models alone ~5 min, then 18 streams ~25 min; can follow round 5b in the same terminal):
+
+```bash
+U=/mnt/c/Users/sports_1/BadmintonVR-unity
+python tools/experiments/rs_bench.py --out $U/runs/campaign/lab_5090_r6/rs_bench_3cam
+python tools/experiments/rs_bench.py --views 5 --out $U/runs/campaign/lab_5090_r6/rs_bench_5cam
+python tools/live_run.py campaign run --plan lab_5090_r6 --group main --unity-project $U
+```
+
+The first `rs_bench` builds the three TensorRT engines (a few minutes, cached for the streams). Copy back
+`C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r6.zip` (it includes the bench folders); on the laptop:
+`python tools/experiments/rs_report.py <zip>` plus `campaign report` for the pose columns.
 
 Unity not in Play mode (this round measures the PC). Copy back
 `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r5.zip` and `~/.cache/badmintonvr/int8/*.json`

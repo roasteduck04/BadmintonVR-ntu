@@ -9,7 +9,7 @@ import importlib.abc
 import importlib.machinery
 import sys
 
-_TARGETS = {"analysis.live.pose2d_fast", "analysis.live.framewriter"}
+_TARGETS = {"analysis.live.pose2d_fast", "analysis.live.framewriter", "analysis.live.sources"}
 
 
 class _Loader(importlib.abc.Loader):
