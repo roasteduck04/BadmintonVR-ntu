@@ -1,0 +1,5 @@
+# racket_det.onnx is committed in parts (GitHub refuses files over 100 MB); rs_live.model_path() joins them here
+racket_det.onnx
+*.tmp
+check_*.json
+check2d_*.json

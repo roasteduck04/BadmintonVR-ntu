@@ -1,0 +1,55 @@
+{
+ "racket_det": {
+  "file": "racket_det.onnx",
+  "input": [
+   1,
+   3,
+   640,
+   640
+  ],
+  "outputs": [
+   "boxes",
+   "scores"
+  ],
+  "source": "models/racketvision/epoch_300.pth",
+  "source_sha256": "e6ad74371259d844b11529a64b09052edaec4277ce9ebeeca64d77b9131a19cd",
+  "onnx_sha256": "3741d5a905fd100b731b8de08bac717ced3c6f3404f54385c7989ae553bfd2f6",
+  "mb": 104.3,
+  "torch_vs_onnx_max_abs": 8.392333984375e-05
+ },
+ "racket_pose": {
+  "file": "racket_pose.onnx",
+  "input": [
+   1,
+   3,
+   256,
+   256
+  ],
+  "outputs": [
+   "simcc_x",
+   "simcc_y"
+  ],
+  "source": "data/racket_finetune_run/best_final_epoch_60.pth",
+  "source_sha256": "6744b0fb57115c4871e02569860ca3d58c27fa5db86f80e395ea0034dd9aea72",
+  "onnx_sha256": "ccbf4063ce0506b92c3c787703af2b6d9170f1eda73174ac194b07f7e528fb97",
+  "mb": 50.3,
+  "torch_vs_onnx_max_abs": 2.0563602447509766e-06
+ },
+ "tracknet": {
+  "file": "tracknet.onnx",
+  "input": [
+   1,
+   27,
+   288,
+   512
+  ],
+  "outputs": [
+   "heatmaps"
+  ],
+  "source": "models/tracknetv3/ckpts/TrackNet_best.pt",
+  "source_sha256": "df867641a02712b021f04548ff4b1208ddfdb47f629ab2094ceb978667e83b1a",
+  "onnx_sha256": "eec63f6f4ac9379ab4cfdcdf33d35ab73933d6db64b83b5ba6ff983748c53675",
+  "mb": 43.3,
+  "torch_vs_onnx_max_abs": 5.438923835754395e-07
+ }
+}
