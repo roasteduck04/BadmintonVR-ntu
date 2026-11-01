@@ -1,0 +1,79 @@
+# Rounds 6 + 7 in one lab session (TEST BRANCH test/r5-experiments = round-6 experiments + v0.8.6 merged):
+#  - round 6 (Z..): racket + shuttle in the live stream (tools/experiments hooks, ONNX models on TensorRT), singles_05x;
+#    racket / shuttle results in <run>/racket_shuttle.jsonl, scored on the laptop by tools/experiments/rs_report.py
+#  - round 7 (D..): doubles in the live stream (four players), on the three doubles clips (tests set their own clip)
+#  - Z19: racket + shuttle on a doubles clip (four players with rackets)
+# Run with the experiment hooks on PYTHONPATH (the doubles tests set no exp_* key, so the hooks leave them alone):
+#   PYTHONPATH="$PWD/tools/experiments" python tools/live_run.py campaign run --plan lab_5090_r67 --group main --unity-project <Unity project>
+# Separate plans with the same tests: lab_5090_r6.yaml, lab_5090_r7.yaml.
+name: lab_5090_r67
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+  set: ["sync.mode=nearest"]
+
+tests:
+  # ================================================================ round 6: racket + shuttle (singles_05x)
+  - {id: Z01_pose_only, note: "reference: pose only (round 5 Y01)", requires: [tensorrt, onnx]}
+  # racket: how the boxes are found
+  - {id: Z02_racket_det, note: "racket: detector every frame + keypoints (offline way)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=det"]}
+  - {id: Z03_racket_det3, note: "racket: detector every 3rd frame, wrist boxes between", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=det", "rtmpose.exp_racket_det_every=3"]}
+  - {id: Z04_racket_wrist, note: "racket: wrist boxes only, no detector", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist"]}
+  - {id: Z05_racket_both, note: "racket: detector + wrist boxes every frame", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=both"]}
+  - {id: Z06_racket_wrist_noflip, note: "racket: wrist boxes, no flip test (half the model work)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_racket_flip=false"]}
+  - {id: Z06b_racket_wrist_norefine, note: "racket: wrist boxes, no second tight pass", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_racket_refine=false"]}
+  - {id: Z07_racket_wrist_wide, note: "racket: wider wrist boxes (2.0 racket lengths)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_racket_box=[2.0, 0.3]"]}
+  - {id: Z08_racket_det_cuda, note: "racket: detector every frame on CUDA (TensorRT's comparison)", requires: [onnx],
+     set: ["rtmpose.exp_racket=det", "rtmpose.exp_racket_ep=cuda"]}
+  # shuttle: how often TrackNet runs
+  - {id: Z09_shuttle_s8, note: "shuttle: TrackNet every 8 frames per camera", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_stride=8"]}
+  - {id: Z10_shuttle_s4, note: "shuttle: every 4 frames (overlapping, averaged)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_stride=4"]}
+  - {id: Z11_shuttle_s1, note: "shuttle: every frame, positional weights (offline way)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_stride=1", "rtmpose.exp_shuttle_weights=weight"]}
+  - {id: Z12_shuttle_s8_cuda, note: "shuttle: every 8 frames on CUDA (TensorRT's comparison)", requires: [onnx],
+     set: ["rtmpose.exp_shuttle=true", "rtmpose.exp_shuttle_ep=cuda"]}
+  # everything together
+  - {id: Z14_all_wrist, note: "pose + racket (wrist) + shuttle (every 8)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true"]}
+  - {id: Z15_all_det3, note: "pose + racket (detector every 3rd) + shuttle (every 8)", requires: [tensorrt, onnx],
+     set: ["rtmpose.exp_racket=det", "rtmpose.exp_racket_det_every=3", "rtmpose.exp_shuttle=true"]}
+  - {id: Z16_all_wrist_async, note: "Z14 with racket / shuttle in their own thread (pose not held back)",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true", "rtmpose.exp_rs_async=true"]}
+  - {id: Z17_all_live30_5cam, settings: live_30, note: "30 fps, 5 cameras, pose + racket (wrist) + shuttle",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true",
+                                       "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: Z18_long_all_wrist, note: "Z14 over 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true"]}
+  - {id: Z19_doubles_racket_shuttle, clip: doubles_2sides, note: "doubles + racket (wrist) + shuttle, 4 fit workers",
+     requires: [tensorrt, onnx], set: ["stream.workers=4", "rtmpose.exp_racket=wrist", "rtmpose.exp_shuttle=true"]}
+  # ================================================================ round 7: doubles (four players)
+  # doubles_2sides: both halves in play
+  - {id: D01_2s_3cam, clip: doubles_2sides, note: "doubles, 3 cameras, 60 fps", requires: [tensorrt, onnx]}
+  - {id: D02_2s_3cam_w4, clip: doubles_2sides, note: "D01 with 4 fit workers (four bodies)", requires: [tensorrt, onnx], set: ["stream.workers=4"]}
+  - {id: D03_2s_3cam_live30, clip: doubles_2sides, settings: live_30, note: "doubles, 3 cameras, 30 fps", requires: [tensorrt, onnx]}
+  - {id: D04_2s_4cam_w4, clip: doubles_2sides, note: "doubles, 4 cameras, 60 fps, 4 workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4", "views=[back_31, backleft_31, backright_31, frontleft_31]"]}
+  - {id: D05_2s_5cam_live30_w4, clip: doubles_2sides, settings: live_30, note: "doubles, 5 cameras, 30 fps, 4 workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4", "views=[back_31, backleft_31, backright_31, frontleft_31, frontright_31]"]}
+  - {id: D06_2s_3cam_det3, clip: doubles_2sides, note: "D01 with the person detector every 3rd frame (four players move more)",
+     requires: [tensorrt, onnx], set: ["rtmpose.det_every=3"]}
+  - {id: D07_2s_long, clip: doubles_2sides, note: "D01 over 2-22 s", timeout_s: 3600, requires: [tensorrt, onnx], set: ["section_s=[2.0, 22.0]"]}
+  # the other doubles clips
+  - {id: D11_1side_3cam, clip: doubles_1side, note: "doubles, one side, 3 cameras, 60 fps", requires: [tensorrt, onnx]}
+  - {id: D12_1side_3cam_w4, clip: doubles_1side, note: "D11 with 4 fit workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4"]}
+  - {id: D21_4a_3cam, clip: doubles_2sides_4angle, note: "doubles, 4-angle session, 3 cameras, 60 fps",
+     requires: [tensorrt, onnx]}
+  - {id: D22_4a_4cam_w4, clip: doubles_2sides_4angle, note: "all 4 cameras, 4 workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4", "views=[back_41, backright_41, frontleft_41, frontright_41]"]}

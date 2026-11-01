@@ -115,18 +115,26 @@ python tools/live_run.py campaign run --plan lab_5090_r5b --group main --unity-p
 
 Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r5b.zip`.
 
-Round 6 (racket + shuttle; models alone ~5 min, then 18 streams ~25 min; can follow round 5b in the same terminal):
+Rounds 6 + 7 in one session (`lab_5090_r67`: 18 racket / shuttle streams on singles_05x, 11 doubles streams on the three
+doubles clips, 1 doubles + racket + shuttle; models alone ~5 min, then ~60 min). This branch now also holds v0.8.6
+(doubles, the new server page). The doubles videos must be in the WSL clone first:
 
 ```bash
+cd ~/BadmintonVR && source ~/venv-pc/bin/activate && git fetch && git checkout test/r5-experiments && git pull
+export PYTHONPATH="$PWD/tools/experiments"
+for d in "1 side" "2 sides" "2 sides (4 angle)"; do mkdir -p "data/15-08/doubles/$d" && cp -n "/mnt/c/Users/sports_1/BadmintonVR/data/15-08/doubles/$d/"*.mov "data/15-08/doubles/$d/"; done
 U=/mnt/c/Users/sports_1/BadmintonVR-unity
-python tools/experiments/rs_bench.py --out $U/runs/campaign/lab_5090_r6/rs_bench_3cam
-python tools/experiments/rs_bench.py --views 5 --out $U/runs/campaign/lab_5090_r6/rs_bench_5cam
-python tools/live_run.py campaign run --plan lab_5090_r6 --group main --unity-project $U
+python tools/experiments/rs_bench.py --out $U/runs/campaign/lab_5090_r67/rs_bench_3cam
+python tools/experiments/rs_bench.py --views 5 --out $U/runs/campaign/lab_5090_r67/rs_bench_5cam
+python tools/live_run.py campaign run --plan lab_5090_r67 --group main --unity-project $U
 ```
 
 The first `rs_bench` builds the three TensorRT engines (a few minutes, cached for the streams). Copy back
-`C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r6.zip` (it includes the bench folders); on the laptop:
-`python tools/experiments/rs_report.py <zip>` plus `campaign report` for the pose columns.
+`C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r67.zip` (it includes the bench folders); on the laptop:
+`python tools/experiments/rs_report.py <zip>` plus `campaign report` for the pose columns (doubles quality: the offline
+4-player builds are in the archive folder). The separate plans `lab_5090_r6` / `lab_5090_r7` hold the same tests.
+Laptop check of the merge: racket / shuttle 3D on the stored doubles_2sides 2D fits all four rackets (P1-P3 80-97 %,
+P4 32 % of 300 frames) at ~26 ms per frame (four players; Z19 shows whether it keeps up at 60 fps).
 
 Unity not in Play mode (this round measures the PC). Copy back
 `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r5.zip` and `~/.cache/badmintonvr/int8/*.json`
