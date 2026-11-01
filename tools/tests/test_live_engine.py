@@ -191,17 +191,31 @@ def _server(tmp_path):
 def test_server_input_save_validate_and_sets(tmp_path):
     srv, s = _server(tmp_path)
     assert s.get_input()["kind"] == "video" and s.input_sets() == ["input.kind=video"]
-    d = s.set_input({"kind": "camera", "fps": 30, "max_minutes": 2, "cameras": {"back_051": "rtsp://pi:8554/cam"}})
-    assert d["kind"] == "camera" and (tmp_path / "runs" / "input.json").exists()
+    # v0.8.6: the clip + the chosen angles
+    d = s.set_input({"kind": "video", "clip": "singles_05x", "views": ["back_051", "backleft_051", "frontright_051"]})
+    assert d["clip"] == "singles_05x" and (tmp_path / "runs" / "input.json").exists()
+    assert s.input_sets() == ["input.kind=video", "views=[back_051, backleft_051, frontright_051]"]
+    # live cameras named by the user (the v0.8.4 {view: url} form is still read)
+    d = s.set_input({"kind": "camera", "clip": "singles_05x", "fps": 30, "max_minutes": 2,
+                     "cameras": [{"name": "cam1", "url": "rtsp://pi1:8554/cam", "use": True},
+                                 {"name": "cam2", "url": "rtsp://pi2:8554/cam", "use": True},
+                                 {"name": "cam3", "url": "", "use": True}]})
+    assert d["kind"] == "camera" and [c["use"] for c in d["cameras"]] == [True, True, False]
     sets = s.input_sets()
-    assert "input.kind=camera" in sets and "input.fps=30.0" in sets
-    assert json.loads(next(x for x in sets if x.startswith("input.cameras="))[len("input.cameras="):]) == \
-        {"back_051": "rtsp://pi:8554/cam"}
+    assert "input.kind=camera" in sets and "input.fps=30.0" in sets and "views=[cam1, cam2]" in sets
+    assert "sync.offsets=auto" in sets
+    assert json.loads(next(x for x in sets if x.startswith("input.cameras="))[len("input.cameras="):]) ==         {"cam1": "rtsp://pi1:8554/cam", "cam2": "rtsp://pi2:8554/cam"}
+    assert s.set_input({"kind": "camera", "cameras": {"back_051": "rtsp://a/x", "backleft_051": "rtsp://b/x"}})["cameras"][0]         == {"name": "back_051", "url": "rtsp://a/x", "use": True}
     from fastapi import HTTPException
-    with pytest.raises(HTTPException):
-        s.set_input({"kind": "camera", "cameras": {"back_051": "just-a-name"}})
-    with pytest.raises(HTTPException):
-        s.set_input({"kind": "webcam"})
+    for bad in ({"kind": "camera", "cameras": {"back_051": "just-a-name", "b": "rtsp://b/x"}},     # not an address
+                {"kind": "camera", "cameras": [{"name": "cam1", "url": "rtsp://a/x"}]},              # one camera only
+                {"kind": "camera", "cameras": [{"name": "../x", "url": "rtsp://a/x"}, {"name": "c2", "url": "rtsp://b/x"}]},
+                {"kind": "video", "clip": "singles_05x", "views": ["back_051"]},                      # one angle only
+                {"kind": "video", "clip": "singles_05x", "views": ["back_11", "back_051"]},           # another clip's angle
+                {"kind": "video", "clip": "nope", "views": []},
+                {"kind": "webcam"}):
+        with pytest.raises(HTTPException):
+            s.set_input(bad)
 
 
 def test_server_stream_needs_a_matching_warm_up(tmp_path, monkeypatch):

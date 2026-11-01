@@ -7,169 +7,184 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header>
-  <div class="brand">BadmintonVR <span>live</span></div>
-  <nav id="tabs">
-    <button data-tab="source">0 Source</button>
-    <button data-tab="calibrate">1 Calibrate</button>
-    <button data-tab="stream" class="on">2 Stream</button>
+<div class="app">
+  <!-- ======================================================== sidebar: the three steps + status -->
+  <nav class="side" id="steps">
+    <div class="brand">BadmintonVR <span>live</span></div>
+    <button class="step on" data-step="source"><span class="num">1</span><span class="sl">Source</span><span class="st" id="st-source"></span></button>
+    <button class="step" data-step="calibrate"><span class="num">2</span><span class="sl">Calibrate</span><span class="st" id="st-calib"></span></button>
+    <button class="step" data-step="stream"><span class="num">3</span><span class="sl">Stream</span><span class="st" id="st-stream"></span></button>
+    <div class="grow"></div>
+    <div class="status">
+      <div id="unity" class="pill" title="Unity's heartbeat (runs/unity_status.json)">Unity: …</div>
+      <div id="engine" class="pill" title="the live engine: models loaded once, players warmed up once, then any number of streams">Engine: off</div>
+      <div id="machine" class="pill" title="machine preset"></div>
+    </div>
   </nav>
-  <div class="topright">
-    <div id="unity" class="pill" title="Unity's heartbeat (runs/unity_status.json)">Unity: …</div>
-    <div id="machine" class="pill" title="machine preset"></div>
-    <div id="engine" class="pill" title="the live engine: models loaded once, players warmed up once, then any number of streams">Engine: off</div>
-    <button id="warm" class="big">1 Warm up</button>
-    <button id="start" class="primary big" disabled>2 Start streaming to Unity</button>
-    <button id="stop" class="danger" disabled>Stop</button>
-  </div>
-</header>
 
-<div id="confirm" class="banner" hidden>
-  <span id="confirm-msg"></span>
-  <button id="confirm-anyway" class="ghost">Start anyway</button>
-  <button id="confirm-cancel" class="ghost">Cancel</button>
-</div>
-
-<main>
-  <!-- ======================================================== stream -->
-  <section id="tab-stream" class="tab on">
-    <div class="cols">
-      <div class="col-settings">
-        <div class="card">
-          <div class="row">
-            <label class="lab">Clip <select id="clip"></select></label>
-            <label class="lab">Settings preset <select id="preset"></select></label>
-          </div>
-          <p id="source-line" class="source"></p>
-          <p id="clip-info" class="muted"></p>
-          <p id="preset-about" class="muted"></p>
-          <div class="row tight">
-            <button id="reset" class="ghost" title="back to the preset's values">Reset to preset</button>
-            <input id="save-name" placeholder="new preset name" maxlength="40">
-            <button id="save" class="ghost">Save as preset</button>
-            <span id="changed" class="muted"></span>
-          </div>
-        </div>
-        <div id="groups"></div>
-
-        <details class="group" id="past">
-          <summary>Past streams<span class="gh">Speed, accuracy against the offline build, swaps; compare and replay</span></summary>
-          <div class="pad">
-            <div class="row tight spread">
-              <span class="muted">Tick two or more to compare (first = baseline; budget +0.5 cm / +1°, no swaps).</span>
-              <span><button id="compare-btn" class="ghost small" disabled>Compare selected</button>
-                <button id="refresh-runs" class="ghost small">Refresh</button></span>
-            </div>
-            <div class="table-wrap"><table id="runs">
-              <thead><tr><th></th><th>Stream</th><th>Frames</th><th>fps</th><th>× real time</th><th>Late</th>
-                <th>MPJPE cm</th><th>Knee °</th><th>Swaps</th><th title="models + videos, before the first frame">Setup s</th>
-                <th title="median delay from capture to frame file">Delay s</th><th></th></tr></thead>
-              <tbody></tbody>
-            </table></div>
-            <div id="compare-box" hidden>
-              <div class="row spread"><h3>Compare</h3><button id="compare-close" class="ghost small">Close</button></div>
-              <div class="table-wrap"><table id="compare"></table></div>
-            </div>
-            <div id="report-box" hidden>
-              <div class="row spread"><h3 id="report-title">Report</h3><button id="report-close" class="ghost small">Close</button></div>
-              <pre id="report"></pre>
-            </div>
-          </div>
-        </details>
-      </div>
-
-      <div class="col-run">
-        <div class="card sticky">
-          <h2>Simulated live broadcast</h2>
-          <p class="muted">The videos are played as if the cameras were live. Every frame goes through 2D pose, 3D and the
-            body fit the moment it arrives, and its JSON file appears in the run's <code>unity_live_frames/</code> folder;
-            Unity shows each pose as soon as its file lands.</p>
-          <div id="job" class="job idle">
-            <div class="job-title" id="job-title">Idle</div>
-            <ol class="phases" id="phases"></ol>
-            <div class="bar" id="bar"><div id="bar-fill"></div><span id="bar-text"></span></div>
-            <div class="stats" id="job-stats"></div>
-            <div class="stats folder"><span id="job-folder"></span>
-              <button class="small ghost" id="open-folder" hidden title="open the frame folder in Explorer">Open folder</button></div>
-            <div class="err" id="job-err"></div>
-            <details><summary>Log</summary><pre id="job-log"></pre></details>
-          </div>
-          <div class="np">
-            <div class="lab">Engine</div>
-            <div id="engine-detail" class="muted">Off. Step 1 "Warm up" loads the 2D models and picks the players once;
-              step 2 then streams from that warm state as often as you like.</div>
-            <div class="row tight"><button id="engine-off" class="ghost small" disabled>Shut down the engine</button></div>
-          </div>
-          <div class="np">
-            <div class="lab">Unity</div>
-            <div id="unity-detail" class="muted">…</div>
-          </div>
-          <div class="np" id="timebox" hidden>
-            <div class="lab">Time report <span id="time-name" class="muted"></span></div>
-            <div id="time-body"></div>
-          </div>
-        </div>
-      </div>
+  <main class="main">
+    <div id="confirm" class="banner" hidden>
+      <span id="confirm-msg"></span>
+      <button id="confirm-anyway" class="btn">Start anyway</button>
+      <button id="confirm-cancel" class="btn">Cancel</button>
     </div>
-  </section>
 
-  <!-- ======================================================== source -->
-  <section id="tab-source" class="tab">
-    <div class="card">
-      <h2>Where the frames come from</h2>
-      <p class="muted">For now the clip's recorded videos; later live cameras (e.g. Raspberry Pis) that send their frames
-        over the network. Calibrate every camera (tab 1) for the frames it really sends. After changing the source,
-        warm up again (step 1).</p>
-      <div class="row">
-        <label class="radio"><input type="radio" name="kind" value="video" checked> Video files</label>
-        <label class="radio"><input type="radio" name="kind" value="camera"> Cameras (stream address per camera)</label>
-      </div>
-      <div id="src-video">
-        <h3>Videos of <span id="src-clip"></span></h3>
-        <div class="table-wrap"><table id="src-videos"><thead><tr><th>Camera</th><th>Video</th></tr></thead><tbody></tbody></table></div>
-        <label class="lab">Video size <select id="src-variant"></select></label>
-        <p class="muted">Smaller copies are made with <code>python tools/live_run.py transcode --clip &lt;clip&gt; --short-side 720</code>
-          (the lab tests found 720p costs about 1 cm for little speed).</p>
-      </div>
-      <div id="src-camera" hidden>
-        <h3>Camera addresses</h3>
-        <div class="table-wrap"><table id="src-cams"><thead><tr><th>Camera</th><th>Stream address</th><th>Test</th></tr></thead><tbody></tbody></table></div>
+    <!-- ====================================================== 1 Source -->
+    <section id="step-source" class="panel">
+      <div class="head"><h2>1 · Source</h2><p>Where the frames come from</p></div>
+      <div class="card">
         <div class="row">
-          <label class="lab">Frames per second <input id="src-fps" type="number" min="1" max="240" step="1" value="60"></label>
-          <label class="lab">Longest stream (minutes) <input id="src-mins" type="number" min="0.1" max="60" step="0.5" value="5"></label>
-          <button id="src-test" class="ghost">Test cameras</button>
+          <label class="field">Clip <select id="src-clip"></select></label>
+          <div class="seg" id="src-kind">
+            <button class="segb on" data-kind="video">Recorded videos</button>
+            <button class="segb" data-kind="camera">Live broadcast (cameras)</button>
+          </div>
         </div>
-        <p class="muted">Any address OpenCV / FFmpeg can open: <code>rtsp://pi1:8554/cam</code>, <code>http://pi1:8080/stream.mjpg</code>,
-          <code>tcp://pi1:5000</code>, <code>udp://@:5000</code>. Without cameras: <code>python tools/fake_camera.py --clip singles_05x</code>
-          plays the videos as live cameras on <code>http://&lt;this PC&gt;:8090/&lt;camera&gt;.mjpg</code>. Frames are time-stamped
-          when they arrive (network delay varies 10-50 ms; the warm-up estimates the camera offsets).</p>
-      </div>
-      <div class="row tight"><button id="src-save" class="primary">Save source</button><span id="src-msg" class="muted"></span></div>
-    </div>
-  </section>
+        <p class="hint" id="src-clip-note"></p>
 
-  <!-- ======================================================== calibrate -->
-  <section id="tab-calibrate" class="tab">
-    <div class="card">
-      <div class="row spread"><h2>Court calibration</h2>
-        <span class="muted">Pick a camera on the left, click court points on the frame (pick the point on the court
-          diagram first; 6+ points spread over the court). <b>Save</b> finds the field of view from the clicks and writes
-          <code>data/calib/&lt;camera&gt;_cam.json</code> (the old one is archived). Below 15 px is good; the red line on
-          the frame shows the worst click. Calibrate again whenever a camera moves.</span></div>
-      <iframe id="calib-frame" title="court calibrator" loading="lazy"></iframe>
-    </div>
-    <div class="card">
-      <h2>Camera sync (fixed cameras)</h2>
-      <p class="muted">The stream lines the cameras up in time. With <b>sync file</b> (best_live) it uses offsets measured
-        once from the clip's offline build; with <b>auto</b> it estimates them in the first 2 s (1–2 frames off).</p>
-      <div class="table-wrap"><table id="sync">
-        <thead><tr><th>Clip</th><th>Cameras calibrated</th><th>Sync file</th><th>Offsets (frames)</th><th></th></tr></thead>
-        <tbody></tbody></table></div>
-    </div>
-  </section>
-</main>
+        <div id="src-video">
+          <div class="row"><label class="field">Video size <select id="src-variant"></select></label></div>
+          <p class="hint">Tick the angles to use: only these are calibrated (step 2) and streamed (step 3). 3 angles keep
+            real time at 60 fps; 4–5 are more accurate and slower.</p>
+          <div class="angles" id="src-angles"></div>
+        </div>
+
+        <div id="src-camera" hidden>
+          <p class="hint">One row per camera. The names are yours (each names its calibration file,
+            <code>data/calib/&lt;name&gt;_cam.json</code>); the clip above only sets the game type and the stream
+            settings. <b>Test</b> grabs one frame from every camera.</p>
+          <div class="table-wrap"><table class="tbl" id="src-cams">
+            <thead><tr><th>Use</th><th>Name</th><th>Stream address</th><th>Test</th><th>Calibration</th><th></th></tr></thead>
+            <tbody></tbody></table></div>
+          <div class="row">
+            <button id="src-add" class="btn">+ Add camera</button>
+            <button id="src-test" class="btn">Test cameras</button>
+            <label class="field inline">Frames per second <input id="src-fps" type="number" min="1" max="240" step="1" value="60"></label>
+            <label class="field inline">Longest stream (min) <input id="src-mins" type="number" min="0.1" max="60" step="0.5" value="5"></label>
+          </div>
+          <p class="hint small">Any address OpenCV / FFmpeg opens: <code>rtsp://pi1:8554/cam</code>, <code>http://pi1:8080/stream.mjpg</code>,
+            <code>tcp://pi1:5000</code>, <code>udp://@:5000</code>. Without cameras: <code>python tools/fake_camera.py --clip singles_05x</code>
+            plays the videos as cameras on <code>http://&lt;this PC&gt;:8090/&lt;view&gt;.mjpg</code>. The warm-up measures the camera offsets.</p>
+        </div>
+
+        <div class="row end"><span id="src-msg" class="muted"></span><button id="src-save" class="btn primary">Save source</button></div>
+      </div>
+    </section>
+
+    <!-- ====================================================== 2 Calibrate -->
+    <section id="step-calibrate" class="panel" hidden>
+      <div class="head"><h2>2 · Calibrate</h2><p id="cal-sub">Court points per camera</p></div>
+      <div class="card">
+        <div class="cams" id="cal-cams"></div>
+        <div class="calib">
+          <div class="framebox">
+            <div class="canvas-wrap" id="cal-wrap"><canvas id="cal-canvas"></canvas><div id="cal-loading" class="overlay" hidden>Loading the frame…</div></div>
+            <div class="row small">
+              <button id="cal-undo" class="btn" title="Z">Undo</button>
+              <button id="cal-clear" class="btn">Clear</button>
+              <button id="cal-fit" class="btn">Fit view</button>
+              <button id="cal-frame" class="btn">Another frame…</button>
+              <span class="muted">Pick a point on the court diagram, then click it on the frame. Wheel zooms, drag moves.
+                6+ points spread over the court; below 15 px is good.</span>
+            </div>
+          </div>
+          <div class="cside">
+            <svg id="cal-court" viewBox="0 0 150 280" role="img" aria-label="court diagram"></svg>
+            <p class="small" id="cal-next"></p>
+            <div class="table-wrap pts"><table class="tbl" id="cal-pts"><thead><tr><th>Point</th><th>px</th><th>err</th><th></th></tr></thead><tbody></tbody></table></div>
+            <div class="readout"><div><span class="muted">FOV</span> <b id="cal-fov">–</b></div><div><span class="muted">RMS</span> <b id="cal-rms">–</b></div></div>
+            <button id="cal-save" class="btn primary wide" title="S">Save coordinates (finds FOV)</button>
+            <p class="tiny muted" id="cal-path"></p>
+          </div>
+        </div>
+      </div>
+      <div class="card" id="sync-card">
+        <h3>Camera sync (recorded videos)</h3>
+        <p class="hint">The stream lines the cameras up in time. With <b>sync file</b> (best_live) it uses offsets measured once
+          from the clip's offline build; with <b>auto</b> it estimates them in the warm-up (1–2 frames off).</p>
+        <div class="table-wrap"><table class="tbl" id="sync">
+          <thead><tr><th>Clip</th><th>Angles calibrated</th><th>Sync file</th><th>Offsets (frames)</th><th></th></tr></thead>
+          <tbody></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ====================================================== 3 Stream -->
+    <section id="step-stream" class="panel" hidden>
+      <div class="head"><h2>3 · Stream</h2><p>Warm up once, then stream as often as you like</p></div>
+      <div class="card warnbox" id="stream-blocked" hidden></div>
+      <div class="card">
+        <div class="row">
+          <label class="field">Settings preset <select id="preset"></select></label>
+          <div class="grow"></div>
+          <button id="warm" class="btn">1 Warm up</button>
+          <button id="start" class="btn primary" disabled>2 Start streaming to Unity</button>
+          <button id="stop" class="btn danger" disabled>Stop</button>
+        </div>
+        <p id="source-line" class="source"></p>
+        <p id="clip-info" class="muted"></p>
+        <p id="preset-about" class="muted"></p>
+        <div id="job" class="job idle">
+          <div class="job-title" id="job-title">Idle</div>
+          <ol class="phases" id="phases"></ol>
+          <div class="bar" id="bar"><div id="bar-fill"></div><span id="bar-text"></span></div>
+          <div class="stats" id="job-stats"></div>
+          <div class="stats folder"><span id="job-folder"></span>
+            <button class="btn small" id="open-folder" hidden title="open the frame folder in Explorer">Open folder</button></div>
+          <div class="err" id="job-err"></div>
+          <details><summary>Log</summary><pre id="job-log"></pre></details>
+        </div>
+        <div class="np-grid">
+          <div class="np"><div class="lab">Engine</div>
+            <div id="engine-detail" class="muted">Off. "Warm up" loads the 2D models and picks the players once; "Start"
+              then streams from that warm state as often as you like.</div>
+            <button id="engine-off" class="btn small" disabled>Shut down the engine</button></div>
+          <div class="np"><div class="lab">Unity</div><div id="unity-detail" class="muted">…</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row spread"><h3>Settings</h3>
+          <div class="row tight">
+            <button id="reset" class="btn small" title="back to the preset's values">Reset to preset</button>
+            <input id="save-name" placeholder="new preset name" maxlength="40">
+            <button id="save" class="btn small">Save as preset</button>
+            <span id="changed" class="muted"></span>
+          </div></div>
+        <div id="groups"></div>
+      </div>
+
+      <div class="card" id="timebox" hidden>
+        <h3>Time report <span id="time-name" class="muted"></span></h3>
+        <div id="time-body"></div>
+      </div>
+
+      <details class="card" id="past">
+        <summary><b>Past streams</b> <span class="muted">speed, accuracy against the offline build, swaps; compare and replay</span></summary>
+        <div class="row tight spread">
+          <span class="muted">Tick two or more to compare (first = baseline; budget +0.5 cm / +1°, no swaps).</span>
+          <span><button id="compare-btn" class="btn small" disabled>Compare selected</button>
+            <button id="refresh-runs" class="btn small">Refresh</button></span>
+        </div>
+        <div class="table-wrap"><table class="tbl" id="runs">
+          <thead><tr><th></th><th>Stream</th><th>Frames</th><th>fps</th><th>× real time</th><th>Late</th>
+            <th>MPJPE cm</th><th>Knee °</th><th>Swaps</th><th title="models + videos, before the first frame">Setup s</th>
+            <th title="median delay from capture to frame file">Delay s</th><th></th></tr></thead>
+          <tbody></tbody></table></div>
+        <div id="compare-box" hidden>
+          <div class="row spread"><h3>Compare</h3><button id="compare-close" class="btn small">Close</button></div>
+          <div class="table-wrap"><table class="tbl" id="compare"></table></div>
+        </div>
+        <div id="report-box" hidden>
+          <div class="row spread"><h3 id="report-title">Report</h3><button id="report-close" class="btn small">Close</button></div>
+          <pre id="report"></pre>
+        </div>
+      </details>
+    </section>
+  </main>
+</div>
 
 <div id="toast" hidden></div>
 <script src="/static/app.js"></script>
+<script src="/static/calib.js"></script>
 </body>
 </html>

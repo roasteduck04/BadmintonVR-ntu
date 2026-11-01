@@ -1,0 +1,6 @@
+# singles_1x (15-08 session, 1x lens), simulated live on 3 cameras (the page's Source step can pick others).
+clip: singles_1x
+views: [back_11, backright_11, frontleft_11]
+section_s: [2.0, 12.0]          # 10 s of the 15.7 s clip
+report:
+  reference_clips: [singles_1x]   # 5-camera offline build (when it is in the analysis folder)

@@ -83,8 +83,14 @@ The Unity project needs the new viewer scripts (server follower, live broadcast 
   copy "$src\start-pipeline-server.bat" "$dst\"
   ```
 
-  If `Assets\Scripts\Analysis\AnalysisViewerUI.cs` is still in the Unity project, move it out of `Assets` (it is the
-  retired old viewer).
+  robocopy never removes retired scripts, so the old IMGUI viewer (`AnalysisViewerUI.cs`) and other leftovers keep
+  drawing their old panels. Check and clean up from WSL (close Unity first; nothing is deleted, the leftovers move to
+  `<project>\_archive_old_scripts\<date>\`):
+
+  ```bash
+  cd ~/BadmintonVR && python tools/unity_checks/stale_scripts.py --unity-project /mnt/c/Users/<you>/BadmintonVR-unity
+  python tools/unity_checks/stale_scripts.py --unity-project /mnt/c/Users/<you>/BadmintonVR-unity --archive --update
+  ```
 
 ## 5. Unity: open and press Play
 

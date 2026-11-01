@@ -1,8 +1,9 @@
-// BadmintonVR live page (v0.8.2): 1 Calibrate, 2 Stream. Plain JS, no build step.
+// BadmintonVR live page (v0.8.6): sidebar steps 1 Source, 2 Calibrate (calib.js), 3 Stream. Plain JS, no build step.
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const state = { schema: null, base: {}, values: {}, clips: [], presets: [], info: null, polling: null, unity: null };
+const state = { schema: null, base: {}, values: {}, clips: [], presets: [], info: null, polling: null, unity: null,
+  input: null, camCalib: {}, step: "source" };
 
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
@@ -20,105 +21,160 @@ function toast(msg, ms = 4000) {
 
 const fmt = (v, d = 1) => (v === null || v === undefined || Number.isNaN(Number(v)) ? "–" : Number(v).toFixed(d));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// back_051 -> "Back", backleft_11 -> "Back left"; live camera names stay as they are
+function pretty(v) {
+  const m = /^(back|front)(left|right)?_\d+$/.exec(v);
+  return m ? (m[1][0].toUpperCase() + m[1].slice(1)) + (m[2] ? " " + m[2] : "") : v;
+}
+const currentClip = () => (state.input && state.input.clip) || (state.clips[0] && state.clips[0].name);
+const clipOf = (name) => state.clips.find((c) => c.name === name);
+const usedCams = () => ((state.input && state.input.cameras) || []).filter((c) => c.use && c.url);
+function chosenViews(c) {
+  const inp = state.input || {};
+  return inp.clip === c.name && inp.views && inp.views.length ? inp.views : c.live_views;
+}
+function streamBlocked() { const c = clipOf(currentClip()); return !!(c && !c.streamable); }
+function calChip(rms, calibrated) {
+  if (!calibrated) return `<span class="chip">not calibrated</span>`;
+  if (rms == null) return `<span class="chip ok">calibrated</span>`;
+  return `<span class="chip ${rms > 15 ? "warn" : "ok"}">${fmt(rms)} px</span>`;
+}
 
-// ------------------------------------------------------------------ tabs
-document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
-  document.querySelectorAll("#tabs button").forEach((x) => x.classList.toggle("on", x === b));
-  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.id === "tab-" + b.dataset.tab));
-  if (b.dataset.tab === "source") loadSource();
-  if (b.dataset.tab === "calibrate") openCalibrate();
-  if (b.dataset.tab === "stream") loadSettings();          // a new calibration / sync file shows in the clip line
-}));
+// ------------------------------------------------------------------ steps
+function showStep(step) {
+  state.step = step;
+  document.querySelectorAll("#steps .step").forEach((x) => x.classList.toggle("on", x.dataset.step === step));
+  document.querySelectorAll(".panel").forEach((p) => (p.hidden = p.id !== "step-" + step));
+  if (step === "source") loadSource();
+  if (step === "calibrate") Calib.open();
+  if (step === "stream") loadSettings();          // a new calibration / sync file shows in the clip line
+}
+document.querySelectorAll("#steps .step").forEach((b) => b.addEventListener("click", () => showStep(b.dataset.step)));
 
-// ------------------------------------------------------------------ 0 Source
+function sidebar() {
+  const inp = state.input || {}, c = clipOf(currentClip());
+  if (!c) return;
+  const cam = inp.kind === "camera";
+  const views = cam ? usedCams().map((x) => x.name) : chosenViews(c);
+  $("#st-source").textContent = `${c.label.replace(/ \(.*\)$/, "")} · ${views.length} ${cam ? "cams" : "angles"}`;
+  const ncal = views.filter((v) => (cam ? state.camCalib[v] : c.calibrated[v])).length;
+  $("#st-calib").textContent = `${ncal} / ${views.length}`;
+}
+
+// ------------------------------------------------------------------ 1 Source
+const src = { kind: "video", clip: null, views: {}, cams: [], calib: {} };   // the form while editing
+
 async function loadSource() {
-  const clip = $("#clip").value;
   try {
-    const [inp, cams, vars] = await Promise.all([api("/api/input"), api("/calib/api/cameras"),
-      api(`/api/input/variants?clip=${encodeURIComponent(clip)}`)]);
-    const c = state.clips.find((x) => x.name === clip) || { views: [] };
-    $("#src-clip").textContent = clip;
-    document.querySelectorAll('input[name="kind"]').forEach((r) => (r.checked = r.value === inp.kind));
-    showSourceKind(inp.kind);
-    const byView = Object.fromEntries(cams.map((x) => [x.view, x]));
-    $("#src-videos tbody").innerHTML = c.views.map((v) => {
-      const cam = byView[v] || {};
-      const vid = cam.input === "camera" ? "(camera source active)" : (cam.video || "–");
-      return `<tr><td class="name">${v}</td><td class="name">${vid}${cam.has_video === false ? ' <span class="badc">missing</span>' : ""}</td></tr>`;
-    }).join("");
+    [state.input, state.clips] = await Promise.all([api("/api/input"), api("/api/clips")]);
+  } catch (e) { toast("source: " + e.message); return; }
+  const inp = state.input;
+  src.kind = inp.kind; src.clip = inp.clip;
+  src.views = { [inp.clip]: inp.views && inp.views.length ? [...inp.views] : null };
+  src.cams = (inp.cameras && inp.cameras.length ? inp.cameras : [1, 2, 3].map((i) => ({ name: `cam${i}`, url: "", use: true })))
+    .map((c) => ({ ...c }));
+  $("#src-clip").innerHTML = state.clips.map((c) => `<option value="${c.name}">${esc(c.label)}${c.streamable ? "" : " — calibrate only"}</option>`).join("");
+  $("#src-clip").value = src.clip;
+  $("#src-fps").value = inp.fps; $("#src-mins").value = inp.max_minutes;
+  $("#src-msg").textContent = "";
+  await camCalibStatus();
+  renderSourceKind(); await renderClip();
+  sidebar();
+}
+
+async function camCalibStatus() {
+  // calibration of the live cameras in use (by name), for the table and the sidebar
+  if ((state.input || {}).kind !== "camera") { state.camCalib = {}; return; }
+  try {
+    const cams = await api("/calib/api/source-cameras");
+    state.camCalib = Object.fromEntries(cams.filter((c) => c.calibrated).map((c) => [c.view, c.rms ?? 0]));
+  } catch (e) { state.camCalib = {}; }
+}
+
+function renderSourceKind() {
+  document.querySelectorAll("#src-kind .segb").forEach((b) => b.classList.toggle("on", b.dataset.kind === src.kind));
+  $("#src-video").hidden = src.kind !== "video"; $("#src-camera").hidden = src.kind !== "camera";
+  renderCams();
+}
+document.querySelectorAll("#src-kind .segb").forEach((b) => b.addEventListener("click", () => { src.kind = b.dataset.kind; renderSourceKind(); }));
+
+async function renderClip() {
+  const c = clipOf(src.clip);
+  if (!c) return;
+  $("#src-clip-note").textContent = `${c.mode === "doubles" ? "Doubles" : "Singles"}, ${c.views.length} cameras recorded.` +
+    (c.streamable ? "" : " Calibrate only for now: the live tracker handles singles (doubles is a separate piece of work).");
+  const want = src.views[c.name] || c.live_views;
+  let calib = {};
+  try { (await api(`/calib/api/cameras?clip=${encodeURIComponent(c.name)}`)).forEach((x) => (calib[x.view] = x)); } catch (e) { /* statuses only */ }
+  $("#src-angles").innerHTML = c.views.map((v) => {
+    const on = want.includes(v), k = calib[v] || {};
+    return `<label class="angle${on ? " on" : ""}"><input type="checkbox" data-view="${v}"${on ? " checked" : ""}>
+      <img class="thumb" loading="lazy" alt="" src="/calib/thumbs/${encodeURIComponent(v)}.jpg">
+      <div class="arow"><span class="aname">${pretty(v)}</span>${calChip(k.rms, k.calibrated)}</div></label>`;
+  }).join("");
+  $("#src-angles").querySelectorAll("input").forEach((i) => i.addEventListener("change", () => {
+    i.closest(".angle").classList.toggle("on", i.checked);
+    src.views[c.name] = [...$("#src-angles").querySelectorAll("input:checked")].map((x) => x.dataset.view);
+  }));
+  $("#src-angles").querySelectorAll("img").forEach((im) => im.addEventListener("error", () => (im.style.visibility = "hidden"), { once: true }));
+  try {
+    const vars = await api(`/api/input/variants?clip=${encodeURIComponent(c.name)}`);
     $("#src-variant").innerHTML = [`<option value="">as recorded</option>`]
       .concat((vars.variants || []).map((t) => `<option value="${t}">${t} copies</option>`)).join("");
-    $("#src-variant").value = inp.video_variant || "";
-    $("#src-cams tbody").innerHTML = c.views.map((v) => `<tr><td class="name">${v}</td>
-      <td><input data-cam="${v}" placeholder="rtsp://… or http://…/stream.mjpg" value="${(inp.cameras || {})[v] || ""}"></td>
-      <td class="muted" data-test="${v}">–</td></tr>`).join("");
-    $("#src-fps").value = inp.fps; $("#src-mins").value = inp.max_minutes;
-    $("#src-msg").textContent = "";
-  } catch (e) { toast("source: " + e.message); }
+  } catch (e) { $("#src-variant").innerHTML = `<option value="">as recorded</option>`; }
+  $("#src-variant").value = (state.input && state.input.video_variant) || "";
 }
-function showSourceKind(kind) { $("#src-video").hidden = kind !== "video"; $("#src-camera").hidden = kind !== "camera"; }
-document.querySelectorAll('input[name="kind"]').forEach((r) => r.addEventListener("change", () => showSourceKind(r.value)));
-function sourceForm() {
-  const kind = (document.querySelector('input[name="kind"]:checked') || {}).value || "video";
-  const cameras = {};
-  document.querySelectorAll("#src-cams input[data-cam]").forEach((i) => { if (i.value.trim()) cameras[i.dataset.cam] = i.value.trim(); });
-  return { kind, cameras, fps: Number($("#src-fps").value), max_minutes: Number($("#src-mins").value),
-    video_variant: $("#src-variant").value || null };
+$("#src-clip").addEventListener("change", () => { src.clip = $("#src-clip").value; renderClip(); });
+
+function renderCams() {
+  $("#src-cams tbody").innerHTML = src.cams.map((c, i) => `<tr>
+    <td><input type="checkbox" data-i="${i}" data-f="use"${c.use ? " checked" : ""}></td>
+    <td><input class="nm" data-i="${i}" data-f="name" value="${esc(c.name)}" maxlength="40"></td>
+    <td><input class="addr" data-i="${i}" data-f="url" value="${esc(c.url)}" placeholder="rtsp://… or http://…/stream.mjpg"></td>
+    <td class="test" data-test="${esc(c.name)}">–</td>
+    <td>${c.name in state.camCalib ? calChip(state.camCalib[c.name], true) : calChip(null, false)}</td>
+    <td><button class="btn small" data-del="${i}" title="remove this camera">×</button></td></tr>`).join("");
 }
-$("#src-save").addEventListener("click", async () => {
-  try {
-    const d = await api("/api/input", sourceForm());
-    $("#src-msg").textContent = `Saved: ${d.kind === "camera" ? Object.keys(d.cameras).length + " camera streams" : "video files" + (d.video_variant ? " (" + d.video_variant + ")" : "")}. Warm up again before streaming.`;
-    loadSettings();
-  } catch (e) { toast(e.message, 7000); }
+$("#src-cams").addEventListener("input", (ev) => {
+  const t = ev.target, i = Number(t.dataset.i);
+  if (!t.dataset.f || Number.isNaN(i)) return;
+  src.cams[i][t.dataset.f] = t.type === "checkbox" ? t.checked : t.value.trim();
+});
+$("#src-cams").addEventListener("click", (ev) => {
+  const d = ev.target.dataset && ev.target.dataset.del;
+  if (d === undefined) return;
+  src.cams.splice(Number(d), 1); renderCams();
+});
+$("#src-add").addEventListener("click", () => {
+  let n = src.cams.length + 1;
+  while (src.cams.some((c) => c.name === `cam${n}`)) n++;
+  src.cams.push({ name: `cam${n}`, url: "", use: true }); renderCams();
 });
 $("#src-test").addEventListener("click", async () => {
-  const f = sourceForm();
-  document.querySelectorAll("[data-test]").forEach((td) => (td.textContent = f.cameras[td.dataset.test] ? "testing…" : "–"));
+  const cams = Object.fromEntries(src.cams.filter((c) => c.url).map((c) => [c.name, c.url]));
+  document.querySelectorAll("#src-cams [data-test]").forEach((td) => (td.textContent = cams[td.dataset.test] ? "testing…" : "–"));
   try {
-    const r = await api("/api/input/test", { cameras: f.cameras });
+    const r = await api("/api/input/test", { cameras: cams });
     Object.entries(r).forEach(([v, x]) => {
-      const td = document.querySelector(`[data-test="${v}"]`);
+      const td = document.querySelector(`#src-cams [data-test="${CSS.escape(v)}"]`);
       if (!td) return;
-      td.className = x.ok ? "good" : "badc";
+      td.className = "test " + (x.ok ? "good" : "badc");
       td.textContent = x.ok ? `✓ ${x.size[0]}×${x.size[1]} (${x.ms} ms)` : `✗ ${x.error}`;
       if (x.thumb) { const img = document.createElement("img"); img.src = x.thumb; img.className = "cam-thumb"; td.append(img); }
     });
   } catch (e) { toast(e.message, 7000); }
 });
-
-// ------------------------------------------------------------------ 1 Calibrate
-function openCalibrate() {
-  const f = $("#calib-frame");
-  if (!f.src) f.src = "/calibrate";
-  loadSync();
-}
-
-async function loadSync() {
+$("#src-save").addEventListener("click", async () => {
+  const c = clipOf(src.clip);
+  const body = { kind: src.kind, clip: src.clip, views: src.views[src.clip] || c.live_views,
+    video_variant: $("#src-variant").value || null, cameras: src.cams, fps: Number($("#src-fps").value), max_minutes: Number($("#src-mins").value) };
   try {
-    const [rows, cams] = await Promise.all([api("/api/sync"), api("/calib/api/cameras")]);
-    const tb = $("#sync tbody"); tb.innerHTML = "";
-    rows.forEach((r) => {
-      const cc = cams.filter((c) => c.clip === r.clip), done = cc.filter((c) => c.calibrated);
-      const bad = done.filter((c) => (c.rms || 0) > 15).length;
-      const s = r.sync;
-      const offs = s ? Object.entries(s.offsets).map(([v, o]) => `${v.replace(/_\d+$/, "")} ${o >= 0 ? "+" : ""}${o}`).join(", ") : "–";
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td class="name">${r.clip}</td>
-        <td class="${done.length === cc.length ? (bad ? "warnc" : "good") : "badc"}">${done.length} / ${cc.length}${bad ? ` (${bad} over 15 px)` : ""}</td>
-        <td>${s ? `${s.made || ""} · from ${s.source || "?"}` : '<span class="muted">none</span>'}</td>
-        <td>${offs}</td>
-        <td><button class="small" data-sync="${r.clip}" ${r.has_build ? "" : 'disabled title="no offline build of this clip"'}>${s ? "Remake" : "Make"} from the offline build</button></td>`;
-      tb.appendChild(tr);
-    });
-  } catch (e) { toast("sync: " + e.message); }
-}
-
-document.addEventListener("click", async (ev) => {
-  const c = ev.target.dataset && ev.target.dataset.sync;
-  if (!c) return;
-  try { const d = await api("/api/sync", { clip: c }); toast(`Sync file for ${c} written${d.archived ? " (old one archived)" : ""}.`); loadSync(); }
-  catch (e) { toast(e.message, 7000); }
+    state.input = await api("/api/input", body);
+    await camCalibStatus(); renderCams(); sidebar();
+    const what = state.input.kind === "camera" ? `${usedCams().length} live cameras` : `${c.label}, ${state.input.views.length} angles`;
+    $("#src-msg").textContent = `Saved: ${what}. Calibrate them (step 2), then warm up again (step 3).`;
+  } catch (e) { toast(e.message, 7000); }
 });
 
 // ------------------------------------------------------------------ settings form
@@ -197,9 +253,10 @@ function renderForm() {
 function sourceLine() {
   const v = state.values;
   const cam = state.input && state.input.kind === "camera";
-  const src = cam ? `live camera streams (${Object.keys(state.input.cameras || {}).length} cameras, tab 0 Source)`
+  const src = cam ? `live camera streams (${usedCams().length} cameras, step 1)`
     : v.backend === "live" ? "straight from the videos (2D pose on the GPU, frame by frame)" : "the stored 2D files (this machine has no NVIDIA GPU)";
-  $("#source-line").innerHTML = `<b>Source:</b> ${src} · ${v.output_fps} fps · ${v.pace === "realtime" ? "real time (camera clock)" : "as fast as possible"}`;
+  $("#source-line").innerHTML = v.output_fps ? `<b>Source:</b> ${src} · ${v.output_fps} fps · ${v.pace === "realtime" ? "real time (camera clock)" : "as fast as possible"}`
+    : `<b>Source:</b> ${src}`;
 }
 
 function setValue(key, v) {
@@ -230,9 +287,17 @@ function markChanged() {
 }
 
 async function loadSettings() {
-  const clip = $("#clip").value, preset = $("#preset").value;
+  const clip = currentClip(), preset = $("#preset").value;
   if (!clip) return;
-  try { state.input = await api("/api/input"); } catch (e) { state.input = null; }
+  try { state.input = await api("/api/input"); } catch (e) { /* keep the last one */ }
+  const c = state.clips.find((x) => x.name === clip);
+  const blocked = c && !c.streamable;
+  $("#stream-blocked").hidden = !blocked;
+  if (blocked) $("#stream-blocked").innerHTML = `<b>${c.label}</b> can be calibrated but not streamed yet: ${c.mode === "doubles"
+    ? "the live player tracker handles singles only (the doubles tracker is a separate piece of work)" : "it has no live config"}.
+    Pick a singles clip in step 1 to stream.`;
+  $("#warm").disabled = !!blocked;
+  if (blocked) { $("#groups").innerHTML = ""; $("#clip-info").textContent = ""; sourceLine(); return; }
   try {
     const d = await api(`/api/settings?clip=${encodeURIComponent(clip)}&preset=${encodeURIComponent(preset)}`);
     state.base = d.values; state.values = JSON.parse(JSON.stringify(d.values));
@@ -240,10 +305,14 @@ async function loadSettings() {
   } catch (e) { toast("settings: " + e.message); }
   const p = state.presets.find((x) => x.name === preset);
   $("#preset-about").textContent = p ? p.about : "";
-  const c = state.clips.find((x) => x.name === clip);
   if (c) {
-    const bits = [`${c.views.length} cameras (${c.views.join(", ")})`, c.section_s ? `section ${c.section_s[0]}–${c.section_s[1] ?? "end"} s` : "",
-      c.calibrated ? "calibrated" : "NOT calibrated (tab 1)", c.sync_file ? "sync file present" : "no sync file"];
+    const cam = state.input && state.input.kind === "camera";
+    const views = cam ? usedCams().map((x) => x.name) : chosenViews(c);
+    const ncal = views.filter((v) => c.calibrated[v] || (cam && state.camCalib[v])).length;
+    const bits = [`${c.label}: ${views.length} ${cam ? "cameras" : "angles"} (${views.map(pretty).join(", ")})`,
+      !cam && c.section_s ? `section ${c.section_s[0]}–${c.section_s[1] ?? "end"} s` : "",
+      ncal === views.length ? "all calibrated" : `${views.length - ncal} not calibrated (step 2)`,
+      cam ? "offsets measured in the warm-up" : c.sync_file ? "sync file present" : "no sync file"];
     $("#clip-info").textContent = bits.filter(Boolean).join(" · ");
   }
 }
@@ -256,13 +325,12 @@ async function loadPresets(select) {
   await loadSettings();
 }
 
-$("#clip").addEventListener("change", loadSettings);
 $("#preset").addEventListener("change", loadSettings);
 $("#reset").addEventListener("click", () => { state.values = JSON.parse(JSON.stringify(state.base)); renderForm(); });
 $("#save").addEventListener("click", async () => {
   const name = $("#save-name").value.trim().toLowerCase();
   try {
-    await api("/api/presets", { name, values: state.values, about: `saved from the page for ${$("#clip").value}` });
+    await api("/api/presets", { name, values: state.values, about: `saved from the page for ${currentClip()}` });
     await loadPresets(name); toast(`Preset ${name} saved (configs/live/settings/${name}.yaml).`);
   } catch (e) { toast(e.message, 6000); }
 });
@@ -272,7 +340,7 @@ async function start(force) {
   $("#confirm").hidden = true;
   try {
     $("#start").disabled = true;
-    const j = await api("/api/stream/start", { clip: $("#clip").value, preset: $("#preset").value, values: state.values, force: !!force });
+    const j = await api("/api/stream/start", { clip: currentClip(), preset: $("#preset").value, values: state.values, force: !!force });
     showJob(j);
     toast(state.unity && state.unity.in_play ? "Streaming — Unity shows each pose as its file lands." : "Streaming — Unity can join any time (press Play).", 5000);
     pollJob();
@@ -286,7 +354,7 @@ async function start(force) {
 async function warmup() {
   try {
     $("#warm").disabled = true;
-    showJob(await api("/api/engine/warmup", { clip: $("#clip").value, preset: $("#preset").value, values: state.values }));
+    showJob(await api("/api/engine/warmup", { clip: currentClip(), preset: $("#preset").value, values: state.values }));
     toast("Warming up: the models load once, then the first frames pick the players.", 5000);
     pollJob();
   } catch (e) { $("#warm").disabled = false; toast(e.message, 8000); }
@@ -304,15 +372,16 @@ function showEngine(j) {
   const pill = $("#engine"), det = $("#engine-detail");
   $("#engine-off").disabled = !eng;
   if (!eng) {
-    pill.className = "pill"; pill.textContent = "Engine: off";
-    $("#warm").disabled = false; $("#warm").textContent = "1 Warm up";
+    pill.className = "pill"; pill.textContent = "Engine: off"; $("#st-stream").textContent = "";
+    $("#warm").disabled = streamBlocked(); $("#warm").textContent = "1 Warm up";
     det.textContent = 'Off. Step 1 "Warm up" loads the 2D models and picks the players once; step 2 then streams from that warm state as often as you like.';
     return null;
   }
   const busy = ["starting", "cold", "loading", "warming", "streaming"].includes(eng.state);
   pill.className = "pill " + (eng.state === "ready" ? "warm" : busy ? "busy" : "");
   pill.textContent = `Engine: ${ENGINE_WORDS[eng.state] || eng.state}`;
-  $("#warm").disabled = busy;
+  $("#st-stream").textContent = eng.state === "streaming" ? "streaming" : eng.warm ? "warm" : "";
+  $("#warm").disabled = busy || streamBlocked();
   $("#warm").textContent = eng.warm ? "1 Warm up again" : "1 Warm up";
   const w = eng.warm;
   const bits = [`${eng.clip} · ${eng.preset}`];
@@ -551,11 +620,13 @@ document.addEventListener("click", async (ev) => {
 // ------------------------------------------------------------------ start
 (async function init() {
   try {
-    [state.info, state.schema, state.clips] = await Promise.all([api("/api/info"), api("/api/schema"), api("/api/clips")]);
-    $("#machine").textContent = state.info.machine === "laptop-cached" ? "laptop: stored 2D" : `GPU: ${state.info.machine}`;
+    [state.info, state.schema, state.clips, state.input] = await Promise.all([api("/api/info"), api("/api/schema"),
+      api("/api/clips"), api("/api/input")]);
+    $("#machine").textContent = state.info.machine === "laptop-cached" ? "Machine: laptop (stored 2D)" : `Machine: ${state.info.machine}`;
     $("#machine").title = `machine preset ${state.info.machine}\nUnity project ${state.info.unity_project}\nruns ${state.info.runs_dir}`;
-    const s = $("#clip"); s.innerHTML = "";
-    state.clips.forEach((c) => { const o = document.createElement("option"); o.value = c.name; o.textContent = c.name; s.appendChild(o); });
+    await camCalibStatus();
+    sidebar();
+    await loadSource();
     await loadPresets();
     pollJob();
     api("/api/runs").then((runs) => { const r = runs.find((x) => x.has_report); if (r && $("#timebox").hidden) loadTiming(r.name); }).catch(() => {});

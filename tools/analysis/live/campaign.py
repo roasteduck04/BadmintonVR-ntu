@@ -85,7 +85,8 @@ def load_plan(path) -> dict:
                 "set": list(dflt.get("set") or []) + list(t.get("set") or []),
                 "seconds": t.get("seconds", dflt.get("seconds") if kind == "bench2d" else None),
                 "requires": list(t.get("requires") or []), "timeout_s": float(t.get("timeout_s", dflt.get("timeout_s", 1800))),
-                "note": t.get("note", ""), "compare_to": t.get("compare_to")}
+                "note": t.get("note", ""), "compare_to": t.get("compare_to"),
+                "clip": t.get("clip", p["clip"])}           # v0.8.6: a test may run another clip than the plan's
         if base["group"] not in ("main", "unity"):
             raise ValueError(f"{t['id']}: group must be main or unity")
         n = int(t.get("repeat", 1))
@@ -117,7 +118,8 @@ def missing_requirement(req, plan, test) -> str | None:
     if req.startswith("video:"):
         tag = req.split(":", 1)[1]
         try:
-            live_config.load(plan["clip"], preset=plan["machine"], overrides=[f"video_variant={tag}"])
+            live_config.load(test.get("clip") or plan["clip"], preset=plan["machine"],
+                             overrides=[f"video_variant={tag}"])
         except ValueError as e:
             return f"no {tag} videos ({str(e).splitlines()[0][:160]})"
         return None
@@ -193,12 +195,13 @@ def argv_for(test, plan, test_dir, python=None) -> list:
     py = python or sys.executable
     lr = os.path.join(TOOLS, "live_run.py")
     sets = settings_sets(test["settings"]) + list(test["set"])
+    clip = test.get("clip") or plan["clip"]
     if test["kind"] == "bench2d":
-        argv = [py, lr, "bench2d", "--clip", plan["clip"], "--preset", plan["machine"], "--run-dir", test_dir]
+        argv = [py, lr, "bench2d", "--clip", clip, "--preset", plan["machine"], "--run-dir", test_dir]
         if test.get("seconds"):
             argv += ["--seconds", str(test["seconds"])]
     else:
-        argv = [py, lr, "run", "--clip", plan["clip"], "--preset", plan["machine"], "--run-dir", test_dir]
+        argv = [py, lr, "run", "--clip", clip, "--preset", plan["machine"], "--run-dir", test_dir]
     for s in sets:
         argv += ["--set", s]
     return argv

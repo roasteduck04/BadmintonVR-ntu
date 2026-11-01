@@ -51,6 +51,9 @@ THUMB_W = 240                    # Test cameras preview width (px)
 # settings the warm-up depends on: changing one after the warm-up means warming up again
 WARM_PREFIXES = ("backend", "rtmpose.", "cpu.", "warmup.", "sync.offsets", "video_variant", "input.", "device")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
+CAM_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")         # live camera names name their calibration files
+CLIP_LABELS = {"singles_1x": "Singles 1x", "singles_05x": "Singles 0.5x", "doubles_1side": "Doubles, one side",
+               "doubles_2sides": "Doubles, two sides", "doubles_2sides_4angle": "Doubles, two sides (4 angles)"}
 
 
 def detect_machine() -> str:
@@ -240,19 +243,26 @@ class Server:
         return want if want in names else (names[0] if names else "")
 
     def clips(self) -> list:
-        """Clips with a live config (configs/live/<clip>.yaml): cameras, section, and what exists for them."""
+        """v0.8.6: every recorded clip of the pose24 registry (the Source step's dropdown): its cameras, the live config's
+        default cameras and section when it has one (configs/live/<clip>.yaml = streamable), what exists for it."""
+        from analysis.pose24 import config as p24config
         cdir = self.repo / live_config.CONFIG_DIR
+        data = self.repo / "data"
         out = []
-        for f in sorted(cdir.glob("*.yaml")):
-            if f.name == "defaults.yaml":
+        for name, e in p24config.load_registry().items():
+            if "base" in e:
                 continue
-            with open(f, "r", encoding="utf-8") as fh:
-                c = yaml.safe_load(fh) or {}
-            name = c.get("clip") or f.stem
-            views = list(c.get("views") or [])
-            data = self.repo / "data"
-            out.append({"name": name, "views": views, "section_s": c.get("section_s"),
-                        "calibrated": all((data / "calib" / f"{v}_cam.json").exists() for v in views),
+            views = list(e.get("views") or [])
+            cf = cdir / f"{name}.yaml"
+            c = {}
+            if cf.exists():
+                with open(cf, "r", encoding="utf-8") as fh:
+                    c = yaml.safe_load(fh) or {}
+            mode = e.get("mode", "singles")
+            out.append({"name": name, "label": CLIP_LABELS.get(name, name), "mode": mode, "views": views,
+                        "live_views": list(c.get("views") or views), "section_s": c.get("section_s"),
+                        "streamable": bool(c) and (mode == "singles" or c.get("mode") == mode),
+                        "calibrated": {v: (data / "calib" / f"{v}_cam.json").exists() for v in views},
                         "stored_2d": all((data / "pose2d" / f"{v}_kp2d.json").exists() for v in views),
                         "sync_file": (data / "calib" / f"{name}_sync.json").exists()})
         return out
@@ -366,8 +376,10 @@ class Server:
 
     # ------------------------------------------------------------------ stream
     def start_stream(self, clip, preset=None, values=None, force=False) -> dict:
-        if clip not in [c["name"] for c in self.clips()]:
-            raise HTTPException(400, f"no live config for clip {clip!r}")
+        c = next((x for x in self.clips() if x["name"] == clip), None)
+        if c is None or not c["streamable"]:
+            raise HTTPException(400, f"{clip!r} cannot stream yet (no live config for it; doubles need the doubles "
+                                     f"tracker): it can still be calibrated")
         if not force and not self.unity_status().get("in_play"):
             raise HTTPException(409, {"code": "unity_not_playing",
                                       "message": "Unity is not in Play mode. Press Play in Unity, or start anyway "
@@ -407,23 +419,59 @@ class Server:
 
     # ------------------------------------------------------------------ v0.8.4 Source tab
     def get_input(self) -> dict:
+        """The Source step: {kind video|camera, clip, views (chosen angles of the clip), video_variant, cameras [{name,
+        url, use}] (live broadcast; names are the user's, default cam1, cam2, ...), fps, max_minutes}. v0.8.4 files
+        ({view: url} cameras, no clip) are read too."""
         p = self.runs / INPUT_FILE
-        d = {"kind": "video", "fps": 60, "max_minutes": 5, "cameras": {}, "video_variant": None}
+        d = {"kind": "video", "clip": None, "views": [], "fps": 60, "max_minutes": 5, "cameras": [], "video_variant": None}
         try:
             with open(p, "r", encoding="utf-8") as fh:
                 d.update(json.load(fh) or {})
         except (OSError, ValueError):
             pass
+        if isinstance(d.get("cameras"), dict):
+            d["cameras"] = [{"name": k, "url": v, "use": True} for k, v in d["cameras"].items()]
+        names = [c["name"] for c in self.clips()]
+        if d.get("clip") not in names:
+            d["clip"] = "singles_05x" if "singles_05x" in names else (names[0] if names else None)
         return d
+
+    def used_cameras(self, d=None) -> dict:
+        d = d or self.get_input()
+        return {c["name"]: c["url"] for c in d.get("cameras") or [] if c.get("use", True) and c.get("url")}
 
     def set_input(self, d) -> dict:
         kind = d.get("kind", "video")
         if kind not in ("video", "camera"):
             raise HTTPException(400, "kind must be video or camera")
-        cams = {str(k): str(v).strip() for k, v in (d.get("cameras") or {}).items() if str(v).strip()}
-        bad = [v for v, u in cams.items() if "://" not in u]
+        clips = {c["name"]: c for c in self.clips()}
+        clip = d.get("clip") or self.get_input()["clip"]
+        if clip not in clips:
+            raise HTTPException(400, f"unknown clip {clip!r} (one of {sorted(clips)})")
+        views = [str(v) for v in d.get("views") or []]
+        bad = [v for v in views if v not in clips[clip]["views"]]
         if bad:
-            raise HTTPException(400, f"not a stream address (rtsp://, http://, tcp://, udp://...): {bad}")
+            raise HTTPException(400, f"{bad} are not angles of {clip}")
+        if kind == "video" and len(views) < 2:
+            raise HTTPException(400, "pick at least 2 angles (3D needs two cameras)")
+        raw = d.get("cameras") or []
+        if isinstance(raw, dict):
+            raw = [{"name": k, "url": v, "use": True} for k, v in raw.items()]
+        cams, seen = [], set()
+        for c in raw:
+            name, url = str(c.get("name") or "").strip(), str(c.get("url") or "").strip()
+            if not name and not url:
+                continue
+            if not CAM_NAME.match(name):
+                raise HTTPException(400, f"camera name {name!r}: letters, digits, _ or - (it names the calibration file)")
+            if name in seen:
+                raise HTTPException(400, f"camera name {name!r} is used twice")
+            if url and "://" not in url:
+                raise HTTPException(400, f"{name}: not a stream address (rtsp://, http://, tcp://, udp://...)")
+            seen.add(name)
+            cams.append({"name": name, "url": url, "use": bool(c.get("use", True)) and bool(url)})
+        if kind == "camera" and sum(c["use"] for c in cams) < 2:
+            raise HTTPException(400, "use at least 2 cameras with a stream address (3D needs two cameras)")
         try:
             fps, mins = float(d.get("fps", 60)), float(d.get("max_minutes", 5))
         except (TypeError, ValueError):
@@ -433,7 +481,8 @@ class Server:
         vv = d.get("video_variant") or None
         if vv is not None and not re.match(r"^[A-Za-z0-9_-]{1,20}$", str(vv)):
             raise HTTPException(400, "bad video_variant")
-        out = {"kind": kind, "fps": fps, "max_minutes": mins, "cameras": cams, "video_variant": vv}
+        out = {"kind": kind, "clip": clip, "views": views, "fps": fps, "max_minutes": mins, "cameras": cams,
+               "video_variant": vv}
         atomic_json(self.runs / INPUT_FILE, out)
         return out
 
@@ -454,11 +503,16 @@ class Server:
         return [t for t in tags if t and all(os.path.exists(live_config.variant_video(v, t)) for v in vids)]
 
     def input_sets(self) -> list:
+        """--set arguments for the Source step: the chosen angles (video) or the live cameras, named by the user, with
+        their offsets estimated in the warm-up (a clip's sync file is for its recorded videos only)."""
         d = self.get_input()
         if d["kind"] == "camera":
-            return ["input.kind=camera", "input.cameras=" + json.dumps(d["cameras"]), f"input.fps={d['fps']}",
-                    f"input.max_minutes={d['max_minutes']}", "video_variant=null"]
-        return ["input.kind=video"] + ([f"video_variant={d['video_variant']}"] if d.get("video_variant") else [])
+            cams = self.used_cameras(d)
+            return ["input.kind=camera", "input.cameras=" + json.dumps(cams), f"views=[{', '.join(cams)}]",
+                    f"input.fps={d['fps']}", f"input.max_minutes={d['max_minutes']}", "video_variant=null",
+                    "sync.offsets=auto"]
+        out = ["input.kind=video"] + ([f"video_variant={d['video_variant']}"] if d.get("video_variant") else [])
+        return out + ([f"views=[{', '.join(d['views'])}]"] if d.get("views") else [])
 
     def test_cameras(self, cams) -> dict:
         """One frame from every camera address: {view: {ok, size, ms, thumb (JPEG data URL) | error}}."""
@@ -514,8 +568,10 @@ class Server:
 
     def _request(self, clip, preset, values):
         """(cfg, overrides, fps, src) of a page request, frames converted to seconds (as start_stream does)."""
-        if clip not in [c["name"] for c in self.clips()]:
-            raise HTTPException(400, f"no live config for clip {clip!r}")
+        c = next((x for x in self.clips() if x["name"] == clip), None)
+        if c is None or not c["streamable"]:
+            raise HTTPException(400, f"{clip!r} cannot stream yet (no live config for it; doubles need the doubles "
+                                     f"tracker): it can still be calibrated")
         cfg = self.merged(clip, preset)
         base = dict(cfg, output_fps=(values or {}).get("output_fps", cfg.get("output_fps")))
         vals = st.values_from(base)
@@ -710,7 +766,7 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
     @app.post("/api/input/test")
     async def input_test(request: Request):
         b = await request.json()
-        return server.test_cameras(b.get("cameras") or server.get_input().get("cameras") or {})
+        return server.test_cameras(b.get("cameras") or server.used_cameras())
 
     @app.get("/api/job")
     def job_status():

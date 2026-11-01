@@ -1,0 +1,13 @@
+{
+ "clip": "singles_1x",
+ "time_ref": "back_11",
+ "offsets": {
+  "back_11": 0.0,
+  "backleft_11": 0.7,
+  "backright_11": -1.1,
+  "frontleft_11": 0.7,
+  "frontright_11": -0.7
+ },
+ "source": "singles_1x_pose24.analysis.json",
+ "made": "2026-11-01 21:20"
+}

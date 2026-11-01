@@ -13,8 +13,6 @@ namespace BadmintonVR.Analysis
         public bool master = true;
         public bool showStats = true, showProvenance = true, showStatus = true;
         public bool showWarnings = true, colorByConfidence = true, showAxes = true, showLog = false;
-        [Tooltip("Draw the stats and toggle boxes in the screen corners (IMGUI). Off while the UI Toolkit viewer is up: it shows the same text and toggles in its Debug section")]
-        public bool drawPanels = true;
 
         [Header("Stroke Bubble")]
         public float bubbleDuration = 1.0f;
@@ -35,7 +33,7 @@ namespace BadmintonVR.Analysis
         readonly List<StrokeBubble> _bubbles = new List<StrokeBubble>();
         int _lastFrame = -1;
         Texture2D _whiteTex;
-        GUIStyle _statsStyle, _logStyle, _bubbleStyle;
+        GUIStyle _bubbleStyle;
 
         void Reset() => player = GetComponent<AnalysisPlayer>();
         void Awake()
@@ -219,39 +217,7 @@ namespace BadmintonVR.Analysis
 
             DrawStrokeBubbles(doc);
 
-            if (!drawPanels || UiPointerGuard.ViewerOwnsScreen) { UiPointerGuard.Clear(this); return; }
-
-            var tp = new Rect(Screen.width - 190, 8, 182, 176);
-            UiPointerGuard.Set(this, tp);        // the toggle box (the stats box is read-only)
-            GUI.Box(tp, "debug [H]");
-            GUILayout.BeginArea(new Rect(tp.x + 8, tp.y + 22, tp.width - 16, tp.height - 28));
-            showStats      = GUILayout.Toggle(showStats, " stats / fps");
-            showProvenance = GUILayout.Toggle(showProvenance, " provenance");
-            showStatus     = GUILayout.Toggle(showStatus, " shuttle/stroke");
-            showWarnings   = GUILayout.Toggle(showWarnings, " contract warnings");
-            colorByConfidence = GUILayout.Toggle(colorByConfidence, " confidence colour (skeleton skin)");
-            showAxes       = GUILayout.Toggle(showAxes, " world axes");
-            showLog        = GUILayout.Toggle(showLog, " log console");
-            GUILayout.EndArea();
-
-            string stats = StatsText();
-
-            if (_statsStyle == null)
-            {
-                _statsStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, fontSize = 18, richText = false };
-                _statsStyle.normal.textColor = Color.white;
-            }
-            GUI.Box(new Rect(8, 8, 540, 260), stats, _statsStyle);
-
-            if (showLog && _log.Count > 0)
-            {
-                if (_logStyle == null)
-                {
-                    _logStyle = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.LowerLeft, fontSize = 14 };
-                    _logStyle.normal.textColor = new Color(0.8f, 0.9f, 1f);
-                }
-                GUI.Box(new Rect(8, 276, 560, 140), string.Join("\n", _log), _logStyle);
-            }
+            UiPointerGuard.Clear(this);      // v0.8.6: the corner panels moved to the viewer's Debug section (old code: _archive/unity-imgui-viewer/)
         }
 
         /// <summary>The stats text (one line per item) for the toggles that are on: fps, clip, skins, cv state, producers,

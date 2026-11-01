@@ -1,0 +1,13 @@
+{
+ "clip": "doubles_2sides",
+ "time_ref": "back_31",
+ "offsets": {
+  "back_31": 0.0,
+  "backleft_31": -4.6,
+  "backright_31": -4.1,
+  "frontleft_31": -0.5,
+  "frontright_31": -1.5
+ },
+ "source": "doubles_2sides_pose24.analysis.json",
+ "made": "2026-11-01 22:03"
+}

@@ -1,0 +1,9 @@
+# doubles_1side (15-08 session, doubles on one side of the net), simulated live on 3 cameras (the page's Source step can pick others).
+# v0.8.6: doubles = four players, P1 / P2 on the near half, P3 / P4 on the far half (live tracker mode doubles).
+# frontright_21 is left out: its calibration is known to be broken (players ~2000 px off).
+clip: doubles_1side
+mode: doubles                   # read by the pipeline server (streamable doubles clip)
+views: [back_21, backright_21, frontleft_21]
+section_s: [2.0, 12.0]          # 10 s
+report:
+  reference_clips: [doubles_1side]   # offline 4-player build (when it is in the analysis folder)

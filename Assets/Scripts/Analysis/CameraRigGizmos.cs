@@ -131,13 +131,7 @@ namespace BadmintonVR.Analysis
             var cam = Camera.main;
             if (cv == null || cam == null) return;
             if (_label == null) { _label = new GUIStyle(GUI.skin.label) { fontSize = 13 }; }
-            if (_look >= 0)
-            {
-                if (UiPointerGuard.ViewerOwnsScreen) return;     // the viewer's top bar shows the look-through banner
-                var c = cv.cameras[_look];
-                GUI.Label(new Rect(12, 8, 700, 22), $"looking through {c.name}  ({c.width}×{c.height}, vfov {c.vfov_deg:F1}°)  —  Esc to return", _label);
-                return;
-            }
+            if (_look >= 0) return;          // the viewer's top bar shows the look-through banner (v0.8.6: old corner text archived)
             if (!show || !showLabels) return;
             for (int v = 0; v < cv.V; v++)
             {

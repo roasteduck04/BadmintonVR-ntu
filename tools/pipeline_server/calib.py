@@ -2,7 +2,9 @@
 pose24 clip registry instead of serve_calibrator.py's hard-coded camera table, plus the sync file for fixed cameras.
 
     /calibrate                  the calibrator page (its /api and /frames paths rewritten to /calib/...)
-    /calib/api/cameras          every camera of every full registry clip: video, frame, saved calibration
+    /calib/api/cameras          every camera of every full registry clip (?clip= one clip): video, frame, calibration
+    /calib/api/source-cameras   v0.8.6: only the cameras the Source step chose (ticked angles / live cameras in use)
+    /calib/thumbs/<view>.jpg    a small copy of the primary frame
     /calib/api/clips            {group: {clip, mode}}         /calib/api/court-points   {name: [x, z]}
     /calib/frames/<file>        a frame image (grabbed with OpenCV at t = 1 s the first time; WSL has no ffmpeg)
     POST /calib/api/auto-fov    best field of view for the clicked points
@@ -48,33 +50,62 @@ class Calib:
     def registry(self):
         return {c: e for c, e in p24config.load_registry().items() if "base" not in e}
 
-    def cameras(self):
+    def entry(self, view, video, clip, mode, group=None, url=None):
+        """One camera for the page: its frame source, the saved calibration (points, where they land, FOV, RMS)."""
+        calib = os.path.join(self.calib_dir, f"{view}_cam.json")
+        cam = {"view": view, "video": url or video, "group": group or clip, "clip": clip, "mode": mode,
+               "camera": view.rsplit("_", 1)[0] if url is None else view, "phone": "", "fov_deg": DEFAULT_FOV,
+               "has_video": bool(url) or (bool(video) and os.path.exists(os.path.join(self.repo, video))),
+               "has_frame": os.path.exists(os.path.join(self.frames_dir, f"{view}.jpg")),
+               "calibrated": os.path.exists(calib)}
+        if url:
+            cam["input"] = "camera"
+        if cam["calibrated"]:
+            try:
+                with open(calib, "r", encoding="utf-8") as fh:
+                    cd = json.load(fh)
+                cam.update(rms=cd.get("rms_px"), saved_fov=cd.get("fov_deg"), fov_deg=cd.get("fov_deg") or DEFAULT_FOV,
+                           saved_points={n: i["px"] for n, i in (cd.get("court_points") or {}).items()},
+                           saved_proj=self.reprojected(cd), made=cd.get("made"))
+            except (OSError, ValueError, KeyError, TypeError):
+                cam["calibrated"] = False
+        return cam
+
+    def cameras(self, clip=None):
+        """Every camera of every recorded clip (or of one clip), as the stand-alone calibrator lists them."""
         out = []
-        for clip, e in self.registry().items():
-            group = clip
+        for c, e in self.registry().items():
+            if clip and c != clip:
+                continue
             for view in e.get("views") or []:
-                video = (e.get("videos") or {}).get(view)
-                calib = os.path.join(self.calib_dir, f"{view}_cam.json")
-                cam = {"view": view, "video": video, "group": group, "clip": clip, "mode": e.get("mode", "singles"),
-                       "camera": view.rsplit("_", 1)[0], "phone": "", "fov_deg": DEFAULT_FOV,
-                       "has_video": bool(video) and os.path.exists(os.path.join(self.repo, video)),
-                       "has_frame": os.path.exists(os.path.join(self.frames_dir, f"{view}.jpg")),
-                       "calibrated": os.path.exists(calib)}
-                if cam["calibrated"]:
-                    try:
-                        with open(calib, "r", encoding="utf-8") as fh:
-                            cd = json.load(fh)
-                        cam.update(rms=cd.get("rms_px"), saved_fov=cd.get("fov_deg"), fov_deg=cd.get("fov_deg") or DEFAULT_FOV,
-                                   saved_points={n: i["px"] for n, i in (cd.get("court_points") or {}).items()},
-                                   saved_proj=self.reprojected(cd))
-                    except (OSError, ValueError, KeyError, TypeError):
-                        cam["calibrated"] = False
-                inp = self.input_fn() or {}
-                url = (inp.get("cameras") or {}).get(view) if inp.get("kind") == "camera" else None
-                if url:                                   # v0.8.4 camera source: frames come from the stream
-                    cam.update(video=url, has_video=True, input="camera")
-                out.append(cam)
+                out.append(self.entry(view, (e.get("videos") or {}).get(view), c, e.get("mode", "singles")))
         return out
+
+    def source_cameras(self):
+        """v0.8.6: the cameras the Source step chose - the clip's ticked angles (recorded videos), or the live broadcast
+        cameras in use (named by the user; frames from their streams, calibration data/calib/<name>_cam.json)."""
+        inp = self.input_fn() or {}
+        clip = inp.get("clip")
+        e = self.registry().get(clip) or {}
+        mode = e.get("mode", "singles")
+        if inp.get("kind") == "camera":
+            cams = inp.get("cameras") or []
+            if isinstance(cams, dict):
+                cams = [{"name": k, "url": v, "use": True} for k, v in cams.items()]
+            return [self.entry(c["name"], None, clip, mode, group="broadcast", url=c["url"])
+                    for c in cams if c.get("use", True) and c.get("url") and SAFE.match(c.get("name") or "")]
+        chosen = inp.get("views") or self.live_views(clip) or e.get("views") or []
+        views = [v for v in (e.get("views") or []) if v in chosen]
+        return [self.entry(v, (e.get("videos") or {}).get(v), clip, mode) for v in views]
+
+    def live_views(self, clip):
+        """The clip's default live cameras (configs/live/<clip>.yaml), used until the Source step picks angles."""
+        p = os.path.join(self.repo, "configs", "live", f"{clip}.yaml")
+        if not clip or not os.path.exists(p):
+            return []
+        import yaml
+        with open(p, "r", encoding="utf-8") as fh:
+            return list((yaml.safe_load(fh) or {}).get("views") or [])
 
     @staticmethod
     def reprojected(cd):
@@ -92,10 +123,28 @@ class Calib:
         return {n: [round(float(a), 1), round(float(b), 1), round(float(e), 2)] for n, (a, b), e in zip(names, uv, err)}
 
     def camera(self, view):
-        cam = next((c for c in self.cameras() if c["view"] == view), None)
+        cam = next((c for c in self.cameras() if c["view"] == view), None) or \
+            next((c for c in self.source_cameras() if c["view"] == view), None)
         if cam is None:
             raise HTTPException(400, f"unknown camera {view!r}")
         return cam
+
+    def thumb_path(self, view, width=360):
+        """A small copy of the camera's primary frame (the Source step's cards)."""
+        if not SAFE.match(view or ""):
+            raise HTTPException(400, "bad camera name")
+        src = self.frame_path(f"{view}.jpg")
+        tdir = os.path.join(self.frames_dir, "thumbs")
+        dst = os.path.join(tdir, f"{view}.jpg")
+        if not os.path.exists(dst) or os.path.getmtime(dst) < os.path.getmtime(src):
+            img = cv2.imread(src)
+            if img is None:
+                raise HTTPException(404, "frame not readable")
+            h, w = img.shape[:2]
+            os.makedirs(tdir, exist_ok=True)
+            cv2.imwrite(dst, cv2.resize(img, (width, max(1, round(h * width / w))), interpolation=cv2.INTER_AREA),
+                        [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return dst
 
     # ------------------------------------------------------------------ frames
     def grab(self, cam, t_s, name, frame=None):
@@ -221,8 +270,8 @@ class Calib:
         out = []
         for clip, e in self.registry().items():
             p = os.path.join(self.calib_dir, f"{clip}_sync.json")
-            doc = os.path.join(self.unity, "Assets", "StreamingAssets", "analysis", f"{clip}_pose24.analysis.json")
-            item = {"clip": clip, "views": e.get("views") or [], "has_build": os.path.exists(doc), "sync": None}
+            item = {"clip": clip, "views": e.get("views") or [], "has_build": self.offline_build(clip) is not None,
+                    "sync": None}
             if os.path.exists(p):
                 try:
                     with open(p, "r", encoding="utf-8") as fh:
@@ -232,12 +281,23 @@ class Calib:
             out.append(item)
         return out
 
+    def offline_build(self, clip):
+        """The clip's offline pose24 build: StreamingAssets, data/analysis, or the archive folder the analysis files
+        were moved to (~/OneDrive/Desktop/archive on the laptop). None if there is none."""
+        name = f"{clip}_pose24.analysis.json"
+        for d in (os.path.join(self.unity, "Assets", "StreamingAssets", "analysis"), os.path.join(self.repo, "data", "analysis"),
+                  os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop", "archive")):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+        return None
+
     def make_sync(self, clip):
         if clip not in self.registry():
             raise HTTPException(400, f"no registry clip {clip!r}")
-        doc = os.path.join(self.unity, "Assets", "StreamingAssets", "analysis", f"{clip}_pose24.analysis.json")
-        if not os.path.exists(doc):
-            raise HTTPException(404, f"{clip} has no offline build ({os.path.basename(doc)}) to take the offsets from")
+        doc = self.offline_build(clip)
+        if doc is None:
+            raise HTTPException(404, f"{clip} has no offline build ({clip}_pose24.analysis.json) to take the offsets from")
         with open(doc, "r", encoding="utf-8") as fh:
             meta = json.load(fh).get("meta") or {}
         pvar = meta.get("pose_variant") or {}
@@ -276,8 +336,16 @@ def router(calib: Calib, tools_dir) -> APIRouter:
         return html.replace("<head>", "<head><script>window.EMBED_LIVE_SERVER = true;</script>", 1)
 
     @r.get("/calib/api/cameras")
-    def cameras():
-        return calib.cameras()
+    def cameras(clip: str = ""):
+        return calib.cameras(clip or None)
+
+    @r.get("/calib/api/source-cameras")
+    def source_cameras():
+        return calib.source_cameras()
+
+    @r.get("/calib/thumbs/{view}.jpg")
+    def thumb(view: str):
+        return FileResponse(calib.thumb_path(view), media_type="image/jpeg", headers={"Cache-Control": "no-cache"})
 
     @r.get("/calib/api/clips")
     def clips():
