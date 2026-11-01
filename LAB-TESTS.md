@@ -176,3 +176,19 @@ python tools/live_run.py campaign run --plan lab_5090_r4_player --group unity --
 
 Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r4.zip` and
 `C:\Users\sports_1\BadmintonVR-build\runs\campaign\lab_5090_r4_player.zip` (laptop: `BadmintonVR\runs\`).
+
+## Round 7 (v0.8.6: doubles in the live stream)
+
+`configs/live/campaign/lab_5090_r7.yaml` (12 streams, ~25 min): the three doubles clips with four players (P1 / P2
+near half, P3 / P4 far half), at 60 / 30 fps on 3 / 4 / 5 cameras, with 2 vs 4 fit processes (four body fits are
+twice the work of singles), the detector every 3rd frame, and a 20 s run; one singles stream as the reference. Quality
+is against each clip's offline 4-player build when it is in the analysis folder. The doubles videos have to be in the
+WSL clone first (as for singles 0.5x in round 1):
+
+```bash
+cd ~/BadmintonVR && source ~/venv-pc/bin/activate && git pull
+for d in "1 side" "2 sides" "2 sides (4 angle)"; do mkdir -p "data/15-08/doubles/$d" && cp -n "/mnt/c/Users/sports_1/BadmintonVR/data/15-08/doubles/$d/"*.mov "data/15-08/doubles/$d/"; done
+python tools/live_run.py campaign run --plan lab_5090_r7 --group main --unity-project /mnt/c/Users/sports_1/BadmintonVR-unity
+```
+
+Copy back `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r7.zip`.

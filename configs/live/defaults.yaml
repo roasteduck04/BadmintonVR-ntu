@@ -66,7 +66,7 @@ warmup:
   ankle_h: auto                 # auto = estimate from warm-up candidates | a number in metres
   refresh_body_s: null          # re-estimate the body model every N seconds (null = never)
 
-tracker:                        # online singles tracker (P1 = near half, P2 = far half)
+tracker:                        # online court tracker (singles P1 near, P2 far; doubles P1 / P2 near, P3 / P4 far)
   net_band_m: 0.5               # a player may lean / step this far past the net line
   court_margin_m: 0.0           # candidates outside the court + margin are ignored
   gate_m: 1.5                   # max floor jump between steps
@@ -74,6 +74,7 @@ tracker:                        # online singles tracker (P1 = near half, P2 = f
   first_support_weight: 10.0    # first sighting: prefer many views ...
   first_depth_weight: 0.01      # ... and players near the baseline
   support_weight: 0.2           # later: distance minus this x support
+  # predict: true               # match against the position moved on by the floor velocity (default: doubles only)
 
 stream:
   min_body_kp: 6                # a step counts as "seen" when >= this many of the 17 body keypoints triangulate

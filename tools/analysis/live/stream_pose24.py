@@ -1,6 +1,6 @@
 """StreamPose24 (spec § 6): the pose3d node's logic as a plain class.
 
-push(frameset) per time-step: calibrate dets -> online singles tracker (nearest source frame of each view) ->
+push(frameset) per time-step: calibrate dets -> online court tracker (singles P1/P2, v0.8.6 doubles P1-P4; nearest source frame of each view) ->
 interpolated per-view rows -> raw triangulation + causal EMA (fallback). Steps < warm-up are output at once from the
 fallback (quality 1); at warm-up end the body model is estimated and locked. Every WindowStepper window is launched
 when its last step has arrived AND the previous window is resolved: fixed-lag lrswap on [history + window] ->
@@ -11,7 +11,7 @@ fallback (quality 2) and the late solution is dropped (stream.late_policy drop),
 "behind" - waited for only while the stream is behind anyway (the window's last step reached the core more than
 budget_s after its capture time: dropping then saves no delay, it only loses the fit and the next window's warm start). Output frames are emitted once each, in step order.
 v0.8.4 live engine: warm_state (export_warm_state() of an earlier warm-up: body models, ankle plane) starts the core
-already warm - no warm-up steps, the tracker re-acquires P1 / P2 by court half from the first step, the first window
+already warm - no warm-up steps, the tracker re-acquires the players by court half from the first step, the first window
 is fitted with the saved body models. stop_at(m) ends a stream early (only steps < m are published at flush).
 Gap handling (spec 6.2, causal): a step whose body has been unseen for more than max_gap steps (fit.MAX_GAP = 20 frames
 at 60 fps, scaled to the step rate) is invalid (NaN, quality NONE). The leading edge of a gap, up to max_gap steps, is
@@ -99,7 +99,7 @@ class StreamPose24:
         self.partner_px = float(cfg["sync"]["partner_max_px"])
         ankle = (warm_state or {}).get("ankle_h_m") if warm_state else cfg.get("ankle_h_m")
         self.tracker = SinglesTracker(self.cams, self.views, self.fps, cfg["tracker"], ankle_h=ankle,
-                                      wcfg=cfg.get("warmup"), warm_steps=self.warm)
+                                      wcfg=cfg.get("warmup"), warm_steps=self.warm, mode=cfg.get("mode", "singles"))
         self.n_tracker_events = 0
         self.late_init = {}
         self.pids = list(self.tracker.pids)

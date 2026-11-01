@@ -216,6 +216,10 @@ def resolve(c, probe=probe_sources) -> dict:
     entry = reg[c["clip"]]
     base = reg.get(entry.get("base"), entry) if entry.get("base") else entry
     all_views = list(entry.get("views") or base.get("views") or [])
+    ip0 = c.get("input") or {}
+    cam_names = list(ip0.get("cameras") or {}) if ip0.get("kind") == "camera" else []
+    if cam_names and not set(cam_names) <= set(all_views):
+        all_views = cam_names           # v0.8.6: live cameras named on the page (cam1, cam2, ...), not the clip's videos
     c["views"] = sorted(c.get("views") or all_views)
     bad = [v for v in c["views"] if v not in all_views]
     if bad:
@@ -227,8 +231,8 @@ def resolve(c, probe=probe_sources) -> dict:
     if c["time_ref"] not in c["views"]:
         raise ValueError(f"time_ref {c['time_ref']!r} is not one of the views {c['views']}")
     c["mode"] = entry.get("mode") or base.get("mode") or "singles"
-    if c["mode"] != "singles":
-        raise ValueError(f"live-frames handles singles only (clip mode {c['mode']!r})")
+    if c["mode"] not in ("singles", "doubles"):          # v0.8.6: doubles = four players, two per court half
+        raise ValueError(f"live-frames handles singles and doubles (clip mode {c['mode']!r})")
     videos = base.get("videos") or entry.get("videos") or {}
     c["video_variant"] = c.get("video_variant") or None
     if c["video_variant"] and c["backend"] != "live":

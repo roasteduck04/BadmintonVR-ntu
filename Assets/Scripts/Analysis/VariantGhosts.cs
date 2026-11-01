@@ -84,7 +84,6 @@ namespace BadmintonVR.Analysis
         readonly Dictionary<string, Ghost> _on = new Dictionary<string, Ghost>();
         readonly KeyedLoads<GhostRead> _loads = new KeyedLoads<GhostRead>();
         Transform _root;
-        GUIStyle _style;
 
         public IReadOnlyList<string> Candidates => _candidates;
         /// <summary>Turned on: drawn, or still being read (IsLoading).</summary>
@@ -194,29 +193,6 @@ namespace BadmintonVR.Analysis
                 g.lines.Commit();
             }
         }
-
-        void OnGUI()
-        {
-            if ((_on.Count == 0 && _loads.Count == 0) || UiPointerGuard.ViewerOwnsScreen) return;   // the viewer's Builds section shows the legend
-            if (_style == null) _style = new GUIStyle(GUI.skin.label) { fontSize = 13 };
-            float y = 272f;
-            foreach (var g in _on.Values)
-            {
-                _style.normal.textColor = g.color;
-                GUI.Label(new Rect(12, y, 700, 20), "ghost " + g.label, _style);
-                y += 18f;
-            }
-            if (_loads.Count > 0)
-            {
-                _style.normal.textColor = Color.gray;
-                GUI.Label(new Rect(12, y, 700, 20), $"loading {_loads.Count} ghost build(s) ...", _style);
-                y += 18f;
-            }
-            if (_on.Keys.Any(k => k.Contains("doubles_2sides")))
-            {
-                _style.normal.textColor = Color.gray;
-                GUI.Label(new Rect(12, y, 700, 20), Note, _style);
-            }
-        }
+        // v0.8.6: the corner legend (IMGUI) is archived in _archive/unity-imgui-viewer/; the viewer's Builds section shows it
     }
 }

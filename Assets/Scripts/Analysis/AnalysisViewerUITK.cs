@@ -93,7 +93,7 @@ namespace BadmintonVR.Analysis
         {
             if (player == null) player = GetComponent<AnalysisPlayer>();
             var hud = FindAnyObjectByType<AnalysisDebugHUD>();
-            if (hud != null) { hud.master = false; hud.drawPanels = false; }   // its text + toggles live in the Debug section
+            if (hud != null) hud.master = false;      // its text + toggles live in the Debug section
         }
 
         void OnEnable()

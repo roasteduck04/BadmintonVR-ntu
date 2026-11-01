@@ -1,0 +1,8 @@
+# doubles_2sides_4angle (15-08 session, doubles on both sides, 4 cameras), simulated live on 3 cameras (the page's Source step can pick others).
+# v0.8.6: doubles = four players, P1 / P2 on the near half, P3 / P4 on the far half (live tracker mode doubles).
+clip: doubles_2sides_4angle
+mode: doubles                   # read by the pipeline server (streamable doubles clip)
+views: [back_41, backright_41, frontleft_41]
+section_s: [2.0, 12.0]          # 10 s
+report:
+  reference_clips: [doubles_2sides_4angle]   # offline 4-player build (when it is in the analysis folder)

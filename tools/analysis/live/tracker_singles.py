@@ -1,9 +1,11 @@
 # tools/analysis/live/tracker_singles.py
-"""Online singles tracker: per time-step 3D candidates (people.candidates) -> one candidate per player by court half
-+ distance to the player's last floor position (Hungarian). No seeds: P1 = near half (z < 0), P2 = far half, the
-convention the offline seedless fallback (people.seeds.player_sides) uses. First sighting: the best-supported
-candidate on the player's half. Every weight / gate comes from the run config's `tracker` section. Doubles is out
-of scope.
+"""Online court tracker: per time-step 3D candidates (people.candidates) -> one candidate per player by court half
++ distance to the player's last floor position (Hungarian). No seeds: singles P1 = near half (z < 0), P2 = far half,
+the convention the offline seedless fallback (people.seeds.player_sides) uses; v0.8.6 doubles (mode "doubles") P1 / P2
+near, P3 / P4 far like the offline doubles builds, P1 / P3 being the partner with the smaller court x when both are
+first seen together. Doubles also predicts each player's position from its floor velocity (tracker.predict), so
+partners passing close to each other keep their ids more often. First sighting: the best-supported candidate on the
+player's half. Every weight / gate comes from the run config's `tracker` section.
 
 Seedless start (config `warmup`): a player is only acquired from a plausible candidate (seen by >= min_support_views
 cameras, standing height inside player_height_m when it can be measured). During the warm-up steps a tracked player
@@ -24,10 +26,13 @@ from analysis.people import candidates
 
 BIG = 1e6
 SIDES = {"P1": "near", "P2": "far"}
+DOUBLES_SIDES = {"P1": "near", "P2": "near", "P3": "far", "P4": "far"}
+PARTNERS = (("P1", "P2"), ("P3", "P4"))
+MAX_SPEED_MPS = 8.0              # a player's floor speed is capped at this for the prediction
 
 
 class SinglesTracker:
-    def __init__(self, cams, views, fps, tcfg, params=None, ankle_h=None, wcfg=None, warm_steps=0):
+    def __init__(self, cams, views, fps, tcfg, params=None, ankle_h=None, wcfg=None, warm_steps=0, mode="singles"):
         self.p = params or people.load_params()
         self.t = dict(tcfg)
         self.w = dict(wcfg or {})
@@ -39,8 +44,13 @@ class SinglesTracker:
         self.ankle_auto = ankle_h is None
         self.ankle_h = float(ankle_h) if ankle_h is not None else float(self.p["ankle_h_m"])
         self.cand_hist = []
-        self.sides = dict(SIDES)
+        if mode not in ("singles", "doubles"):
+            raise ValueError(f"tracker: mode must be singles or doubles, got {mode!r}")
+        self.mode = mode
+        self.sides = dict(DOUBLES_SIDES if mode == "doubles" else SIDES)
         self.pids = sorted(self.sides)
+        self.predict = bool(self.t.get("predict", mode == "doubles"))
+        self.vel = {pid: np.zeros(2) for pid in self.pids}
         self.last = {pid: None for pid in self.pids}
         self.lost = {pid: 0 for pid in self.pids}
         self.gate_m, self.gate_growth = float(self.t["gate_m"]), float(self.t["gate_growth_mps"])
@@ -64,6 +74,12 @@ class SinglesTracker:
             return False
         h = float(c.height)
         return (not np.isfinite(h)) or float(lo) <= h <= float(hi)
+
+    def _expected(self, pid):
+        """Where the player should be now: the last floor position, moved on by its velocity when predicting."""
+        if not self.predict:
+            return self.last[pid]
+        return self.last[pid] + self.vel[pid] * (self.lost[pid] + 1) / self.fps
 
     def _on_side(self, pid, floor):
         z = float(floor[1])
@@ -89,7 +105,7 @@ class SinglesTracker:
                     cost[a, b] = (-float(self.t["first_support_weight"]) * c.support
                                   + float(self.t["first_depth_weight"]) * abs(float(c.floor[1])))
                 else:
-                    d = float(np.linalg.norm(np.asarray(c.floor, float) - self.last[pid]))
+                    d = float(np.linalg.norm(np.asarray(c.floor, float) - self._expected(pid)))
                     if d <= self.gate_m + self.gate_growth * self.lost[pid] / self.fps:
                         cost[a, b] = d - float(self.t["support_weight"]) * c.support
         chosen = {pid: None for pid in self.pids}
@@ -97,6 +113,12 @@ class SinglesTracker:
             for a, b in zip(*linear_sum_assignment(cost)):
                 if cost[a, b] < BIG / 2:
                     chosen[self.pids[a]] = C[b]
+        if self.mode == "doubles":                # partners first seen together: P1 / P3 = the smaller court x
+            for p, q in PARTNERS:
+                cp, cq = chosen[p], chosen[q]
+                if self.last[p] is None and self.last[q] is None and cp is not None and cq is not None \
+                        and float(cp.floor[0]) > float(cq.floor[0]):
+                    chosen[p], chosen[q] = cq, cp
         out = {}
         for pid in self.pids:
             c = chosen[pid]
@@ -104,6 +126,14 @@ class SinglesTracker:
                 self.lost[pid] += 1
                 out[pid] = {}
                 continue
+            if self.predict and self.last[pid] is not None:      # floor velocity (smoothed, capped) for the prediction
+                v = (np.asarray(c.floor, float) - self.last[pid]) * self.fps / (self.lost[pid] + 1)
+                sp = float(np.linalg.norm(v))
+                if sp > MAX_SPEED_MPS:
+                    v *= MAX_SPEED_MPS / sp
+                self.vel[pid] = 0.5 * self.vel[pid] + 0.5 * v
+            elif self.last[pid] is None:
+                self.vel[pid] = np.zeros(2)
             if self.last[pid] is None:
                 self.events.append({"kind": "acquire", "step": int(i), "pid": pid, "floor": [float(x) for x in c.floor],
                                     "support": int(c.support), "height_m": float(c.height),

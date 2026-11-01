@@ -99,7 +99,11 @@ def test_api_lists_play_pointer_and_settings(tmp_path):
     s, c = _app(tmp_path)
     info = c.get("/api/info").json()
     assert info["machine"] == "laptop-cached" and info["default_settings"] == "laptop_realtime"
-    assert [x["name"] for x in c.get("/api/clips").json()] == ["singles_05x"]
+    clips = {x["name"]: x for x in c.get("/api/clips").json()}       # v0.8.6: every recorded clip, streamable or not
+    assert set(clips) == {"singles_1x", "singles_05x", "doubles_1side", "doubles_2sides", "doubles_2sides_4angle"}
+    assert clips["singles_05x"]["streamable"] and clips["singles_1x"]["streamable"]
+    assert clips["doubles_1side"]["streamable"] and clips["doubles_1side"]["mode"] == "doubles"    # v0.8.6 doubles
+    assert clips["singles_05x"]["live_views"] == ["back_051", "backright_051", "frontleft_051"]
     v = c.get("/api/settings", params={"clip": "singles_05x", "preset": "laptop_realtime"}).json()["values"]
     assert v["backend"] == "cached" and v["output_fps"] == 30 and v["stream.solver_tol"] == pytest.approx(1e-4)
     runs = c.get("/api/runs").json()

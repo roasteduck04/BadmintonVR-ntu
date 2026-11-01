@@ -1,0 +1,35 @@
+# Round 7 (v0.8.6): doubles in the live stream - four players, P1 / P2 on the near half, P3 / P4 on the far half,
+# kept apart by floor position + motion. Speed and quality (vs each clip's offline 4-player build) at 60 / 30 fps on
+# 3 / 4 / 5 cameras, and whether more fit workers keep four body fits in real time. Tests may name their own clip.
+#   python tools/live_run.py campaign run --plan lab_5090_r7 --group main --unity-project <Unity project>
+# The doubles videos must be in the WSL clone first (tools/README.md / docs/setup/lab-tests.md: copy them from the
+# Windows side, as for singles_05x).
+name: lab_5090_r7
+clip: doubles_2sides
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+  set: ["sync.mode=nearest"]
+
+tests:
+  - {id: D00_singles_ref, clip: singles_05x, note: "singles reference (round 4 W01)", requires: [tensorrt, onnx]}
+  # doubles_2sides: both halves in play
+  - {id: D01_2s_3cam, note: "doubles, 3 cameras, 60 fps", requires: [tensorrt, onnx]}
+  - {id: D02_2s_3cam_w4, note: "D01 with 4 fit workers (four bodies)", requires: [tensorrt, onnx], set: ["stream.workers=4"]}
+  - {id: D03_2s_3cam_live30, settings: live_30, note: "doubles, 3 cameras, 30 fps", requires: [tensorrt, onnx]}
+  - {id: D04_2s_4cam_w4, note: "doubles, 4 cameras, 60 fps, 4 workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4", "views=[back_31, backleft_31, backright_31, frontleft_31]"]}
+  - {id: D05_2s_5cam_live30_w4, settings: live_30, note: "doubles, 5 cameras, 30 fps, 4 workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4", "views=[back_31, backleft_31, backright_31, frontleft_31, frontright_31]"]}
+  - {id: D06_2s_3cam_det3, note: "D01 with the person detector every 3rd frame (four players move more)",
+     requires: [tensorrt, onnx], set: ["rtmpose.det_every=3"]}
+  - {id: D07_2s_long, note: "D01 over 2-22 s", timeout_s: 3600, requires: [tensorrt, onnx], set: ["section_s=[2.0, 22.0]"]}
+  # the other doubles clips
+  - {id: D11_1side_3cam, clip: doubles_1side, note: "doubles, one side, 3 cameras, 60 fps", requires: [tensorrt, onnx]}
+  - {id: D12_1side_3cam_w4, clip: doubles_1side, note: "D11 with 4 fit workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4"]}
+  - {id: D21_4a_3cam, clip: doubles_2sides_4angle, note: "doubles, 4-angle session, 3 cameras, 60 fps",
+     requires: [tensorrt, onnx]}
+  - {id: D22_4a_4cam_w4, clip: doubles_2sides_4angle, note: "all 4 cameras, 4 workers", requires: [tensorrt, onnx],
+     set: ["stream.workers=4", "views=[back_41, backright_41, frontleft_41, frontright_41]"]}

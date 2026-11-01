@@ -96,3 +96,53 @@ def test_ankle_height_is_estimated_from_warmup_candidates(monkeypatch):
         tr.step(i, {})
     res = tr.estimate_ankle()
     assert abs(res["ankle_h_m"] - 0.141) < 0.002 and not res["used_default"] and tr.ankle_h == res["ankle_h_m"]
+
+
+# ---------------------------------------------------------------- v0.8.6 doubles
+def _doubles(monkeypatch, frames, warm=0, fps=30.0):
+    from analysis.live import tracker_singles as ts
+    it = iter(frames)
+    monkeypatch.setattr(ts.candidates, "frame_candidates", lambda *a, **k: next(it))
+    c = ls.cfg()
+    return ts.SinglesTracker({}, [], fps, c["tracker"], wcfg=c["warmup"], warm_steps=warm, mode="doubles")
+
+
+def _who(out):
+    return {pid: next(iter(d.values())) if d else None for pid, d in out.items()}
+
+
+def test_doubles_tracks_four_players_two_per_half_and_orders_partners_by_x(monkeypatch):
+    # dets id = the player: 0 near right, 1 near left, 2 far left, 3 far right, 4 bystander off court
+    def frame(t):
+        return [_cand(-3.0, x=1.5 + 0.02 * t, dets={"a": 0}), _cand(-4.0, x=-1.5, dets={"a": 1}),
+                _cand(3.5, x=-1.0, dets={"a": 2}), _cand(4.5, x=1.2 - 0.02 * t, dets={"a": 3}),
+                _cand(0.0, x=6.0, dets={"a": 4})]
+    tr = _doubles(monkeypatch, [frame(t) for t in range(10)])
+    assert tr.sides == {"P1": "near", "P2": "near", "P3": "far", "P4": "far"}
+    for t in range(10):
+        assert _who(tr.step(t, {})) == {"P1": 1, "P2": 0, "P3": 2, "P4": 3}   # P1 / P3 = smaller court x
+
+
+def test_doubles_partners_crossing_keep_their_ids(monkeypatch):
+    # near partners run past each other (4.5 m/s each, 0.1 m apart in depth, swapping places in one 30 fps frame):
+    # position alone swaps them at the crossing (checked with predict off), their velocity carries each one through
+    def frames():
+        return [[_cand(-3.0, x=-1.425 + 0.15 * t, dets={"a": 0}), _cand(-3.1, x=1.425 - 0.15 * t, dets={"a": 1}),
+                 _cand(4.0, x=-1.0, dets={"a": 2}), _cand(4.0, x=1.0, dets={"a": 3})] for t in range(20)]
+    tr = _doubles(monkeypatch, frames())
+    got = [_who(tr.step(t, {}))["P1"] for t in range(20)]
+    assert got == [0] * 20
+    from analysis.live import tracker_singles as ts
+    it = iter(frames())
+    monkeypatch.setattr(ts.candidates, "frame_candidates", lambda *a, **k: next(it))
+    off = ts.SinglesTracker({}, [], 30.0, dict(ls.cfg()["tracker"], predict=False), mode="doubles")
+    assert [_who(off.step(t, {}))["P1"] for t in range(20)][-1] == 1          # without the prediction: swapped
+
+
+def test_singles_stays_without_prediction(monkeypatch):
+    tr = _tracker_with(monkeypatch, [[_cand(-3)]])
+    assert tr.mode == "singles" and not tr.predict and tr.pids == ["P1", "P2"]
+    import pytest
+    from analysis.live import tracker_singles as ts
+    with pytest.raises(ValueError):
+        ts.SinglesTracker({}, [], 30.0, ls.cfg()["tracker"], mode="triples")
