@@ -17,7 +17,8 @@ warm-up: a short run over the first warmup.seconds of the chosen part (video) or
 picks P1 / P2, fixes their body models, the ankle plane, the facing signs and (sync.offsets auto) the camera offsets.
 A stream then starts warm: no model loading, no warm-up frames - the tracker re-finds P1 / P2 by court half. A video
 stream plays the chosen part from its start every time; a camera stream runs until stopped or input.max_minutes.
-The warm state is also saved to <runs>/engine/warm_state.json."""
+The warm state is also saved to <runs>/engine/warm_state.json (v0.8.7: a 1-camera warm-up to warm_state_1cam.json,
+so the multi-camera one - whose body models the 1-camera mode reuses - is kept)."""
 from __future__ import annotations
 
 import json
@@ -77,7 +78,9 @@ class LiveEngine:
 
     # ------------------------------------------------------------------ helpers
     def load_cfg(self, sets):
-        return live_config.load(self.clip, preset=self.preset, overrides=self.base + list(sets or []))
+        # paths.runs_dir = this engine's runs folder: a 1-camera stream finds the multi-camera warm state there
+        return live_config.load(self.clip, preset=self.preset,
+                                overrides=self.base + [f"paths.runs_dir={self.runs_dir}"] + list(sets or []))
 
     def _set_state(self, state, **kw):
         self.state = state
@@ -126,7 +129,8 @@ class LiveEngine:
                       players={p: m is not None for p, m in (ws.get("models") or {}).items()})
             self.warm_state, self.player_key = ws, player_key(cfg)
             os.makedirs(os.path.join(self.runs_dir, "engine"), exist_ok=True)
-            with open(os.path.join(self.runs_dir, "engine", "warm_state.json"), "w", encoding="utf-8") as fh:
+            name = "warm_state.json" if len(cfg["views"]) >= 2 else "warm_state_1cam.json"
+            with open(os.path.join(self.runs_dir, "engine", name), "w", encoding="utf-8") as fh:
                 json.dump(ws, fh, indent=1, default=str)
             log(f"warm-up done in {ws['seconds']} s: players {ws['players']}, ankle {ws.get('ankle_h_m', 0):.3f} m, "
                 f"offsets {ws.get('offsets')}")

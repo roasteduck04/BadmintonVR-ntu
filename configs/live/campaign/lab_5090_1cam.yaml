@@ -1,0 +1,26 @@
+# v0.8.7 one camera on the lab PC: live 2D on the GPU from one angle at a time (the 1-camera fit: feet on the court
+# floor, fixed limb lengths from the 1.50 m template; no racket / shuttle 3D). Quality vs the clip's 5-camera build in
+# each report; the laptop numbers on stored 2D are in tools/README.md § Live frames (v0.8.7).
+#   python tools/live_run.py campaign run --plan lab_5090_1cam --group main --unity-project <Unity project>
+name: lab_5090_1cam
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+  set: ["sync.mode=nearest"]
+
+tests:
+  - {id: M01_back_60, note: "one camera (back), 60 fps", requires: [tensorrt, onnx], set: ["views=[back_051]"]}
+  - {id: M02_backright_60, note: "one camera (back right), 60 fps", requires: [tensorrt, onnx],
+     set: ["views=[backright_051]"]}
+  - {id: M03_frontleft_60, note: "one camera (front left: the far player is out of view), 60 fps",
+     requires: [tensorrt, onnx], set: ["views=[frontleft_051]"]}
+  - {id: M04_back_live30, settings: live_30, note: "one camera (back), 30 fps", requires: [tensorrt, onnx],
+     set: ["views=[back_051]"]}
+  - {id: M05_back_h170, note: "M01 with the old 1.70 m template (the scale question)", requires: [tensorrt, onnx],
+     set: ["views=[back_051]", "mono.stature_m=1.70"]}
+  - {id: M06_doubles_back_live30, clip: doubles_2sides, settings: live_30, note: "doubles, one camera (back), 30 fps",
+     requires: [tensorrt, onnx], set: ["views=[back_31]"]}
+  - {id: M07_back_long, note: "M01 over 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["views=[back_051]", "section_s=[2.0, 30.0]"]}

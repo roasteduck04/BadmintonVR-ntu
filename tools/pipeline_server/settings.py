@@ -32,6 +32,8 @@ GROUPS = [
     ("speed2d", "2D speed", "Live 2D from the video only. Fewer detector calls and smaller frames are faster."),
     ("sync", "Camera sync", "Lines the cameras up in time. File = offsets measured once for fixed cameras."),
     ("warmup", "Player pick (warm-up)", "The first frames pick P1 (near half) and P2 (far half) without seeds."),
+    ("mono", "One camera", "Only when one angle / camera is used (v0.8.7): one camera cannot measure the limbs, so each "
+             "player's limb lengths come from here. Court position ~10-15 cm, rough pose, no racket / shuttle 3D."),
     ("tracker", "Tracker", "Follows each player from step to step on the court floor."),
     ("lrswap", "Left / right swap fix", "Fixes 2D models that mix up a person's left and right side."),
     ("fit", "Body fit", "Fits the SMPL body to the 3D points in short windows (the main accuracy step)."),
@@ -107,6 +109,21 @@ FIELDS = [
      "help": "A person must be seen by this many cameras to be picked as a player."},
     {"group": "warmup", "key": "warmup.min_time_in_court_frac", "label": "On court for at least", "kind": "float",
      "unit": "of warm-up", "help": "Share of the warm-up steps the candidate stands inside the court."},
+    # one camera (v0.8.7)
+    {"group": "mono", "key": "mono.body_models", "label": "Limb lengths", "kind": "choice",
+     "options": [["auto", "from the last multi-camera warm-up, if any"], ["off", "from the heights below"]],
+     "help": "Auto: the live engine's last warm-up with 2+ cameras (same singles / doubles) measured each player's limbs - "
+             "the most accurate, if the same players are on the same court halves."},
+    {"group": "mono", "key": "mono.heights_m.P1", "label": "P1 real height", "kind": "optfloat", "unit": "m",
+     "help": "Off = the template height below."},
+    {"group": "mono", "key": "mono.heights_m.P2", "label": "P2 real height", "kind": "optfloat", "unit": "m"},
+    {"group": "mono", "key": "mono.heights_m.P3", "label": "P3 real height (doubles)", "kind": "optfloat", "unit": "m"},
+    {"group": "mono", "key": "mono.heights_m.P4", "label": "P4 real height (doubles)", "kind": "optfloat", "unit": "m"},
+    {"group": "mono", "key": "mono.height_scale", "label": "Real height to skeleton", "kind": "float",
+     "help": "The multi-camera builds measure this footage's players at 1.36-1.59 m (an open scale question): a real "
+             "height is multiplied by this. 1.0 once heights are checked."},
+    {"group": "mono", "key": "mono.stature_m", "label": "Template skeleton height", "kind": "float", "unit": "m",
+     "help": "Players without a height. 1.50 m = what the multi-camera builds measure (1.70 m bent the knees: 39 vs 17 deg)."},
     # tracker
     {"group": "tracker", "key": "tracker.gate_m", "label": "Max jump per step", "kind": "float", "unit": "m",
      "help": "A candidate farther than this from the player's last floor position is not the same player."},
