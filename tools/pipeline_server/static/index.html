@@ -45,14 +45,15 @@
         <div id="src-video">
           <div class="row"><label class="field">Video size <select id="src-variant"></select></label></div>
           <p class="hint">Tick the angles to use: only these are calibrated (step 2) and streamed (step 3). 3 angles keep
-            real time at 60 fps; 4–5 are more accurate and slower.</p>
+            real time at 60 fps; 4–5 are more accurate and slower. <b>1 angle</b> = the 1-camera mode (testing): court
+            position ~10–15 cm, rough pose, no racket / shuttle 3D; player heights under "One camera" in step 3.</p>
           <div class="angles" id="src-angles"></div>
         </div>
 
         <div id="src-camera" hidden>
           <p class="hint">One row per camera. The names are yours (each names its calibration file,
             <code>data/calib/&lt;name&gt;_cam.json</code>); the clip above only sets the game type and the stream
-            settings. <b>Test</b> grabs one frame from every camera.</p>
+            settings. <b>Test</b> grabs one frame from every camera. One camera works too (the 1-camera mode, for testing).</p>
           <div class="table-wrap"><table class="tbl" id="src-cams">
             <thead><tr><th>Use</th><th>Name</th><th>Stream address</th><th>Test</th><th>Calibration</th><th></th></tr></thead>
             <tbody></tbody></table></div>

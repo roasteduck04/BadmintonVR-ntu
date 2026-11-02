@@ -399,7 +399,8 @@ class Server:
                          time.strftime("%Y-%m-%d_%H%M%S")])
         run_dir = self.runs / name
         argv = jobmod.python_cmd(str(self.repo / "tools" / "live_run.py"), "run", "--clip", clip,
-                                 "--preset", self.machine, "--run-dir", str(run_dir))
+                                 "--preset", self.machine, "--run-dir", str(run_dir),
+                                 "--set", f"paths.runs_dir={self.runs}")   # 1 camera: the engine's warm state is here
         for s in st.as_set_args(over):
             argv += ["--set", s]
         wu_s = over.get("warmup.seconds", st.get_key(cfg, "warmup.seconds")) or 0
@@ -452,8 +453,8 @@ class Server:
         bad = [v for v in views if v not in clips[clip]["views"]]
         if bad:
             raise HTTPException(400, f"{bad} are not angles of {clip}")
-        if kind == "video" and len(views) < 2:
-            raise HTTPException(400, "pick at least 2 angles (3D needs two cameras)")
+        if kind == "video" and not views:
+            raise HTTPException(400, "pick at least 1 angle (1 = the 1-camera mode, 2+ = triangulated 3D)")
         raw = d.get("cameras") or []
         if isinstance(raw, dict):
             raw = [{"name": k, "url": v, "use": True} for k, v in raw.items()]
@@ -470,8 +471,8 @@ class Server:
                 raise HTTPException(400, f"{name}: not a stream address (rtsp://, http://, tcp://, udp://...)")
             seen.add(name)
             cams.append({"name": name, "url": url, "use": bool(c.get("use", True)) and bool(url)})
-        if kind == "camera" and sum(c["use"] for c in cams) < 2:
-            raise HTTPException(400, "use at least 2 cameras with a stream address (3D needs two cameras)")
+        if kind == "camera" and not any(c["use"] for c in cams):
+            raise HTTPException(400, "use at least 1 camera with a stream address (1 = the 1-camera mode)")
         try:
             fps, mins = float(d.get("fps", 60)), float(d.get("max_minutes", 5))
         except (TypeError, ValueError):

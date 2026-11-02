@@ -66,6 +66,18 @@ warmup:
   ankle_h: auto                 # auto = estimate from warm-up candidates | a number in metres
   refresh_body_s: null          # re-estimate the body model every N seconds (null = never)
 
+mono:                           # v0.8.7, one camera (views = a single camera; ignored with 2 or more): feet on the court
+                                # floor + fixed limb lengths instead of triangulation (pose24 --mono, live). Court position
+                                # ~10-15 cm, rough pose (camera-count study), no racket / shuttle 3D
+  body_models: auto             # auto = each player's limb lengths from the last multi-camera warm-up of the live engine
+                                # (<runs>/engine/warm_state.json, same singles / doubles mode) | off
+  heights_m: {}                 # else the player's real height, e.g. {P1: 1.75, P2: 1.68}, times height_scale
+  height_scale: 0.88            # real height -> skeleton height: the multi-camera builds measure this footage's players
+                                # at 1.36-1.59 m (bones ~12 % short of a real 1.70 m; scale question H6, unresolved:
+                                # check against known heights)
+  stature_m: 1.50               # else this skeleton height (median of the multi-camera builds; 1.70 bent the knees:
+                                # singles back camera knee 39 -> 17 deg, court position 19 -> 11 cm)
+
 tracker:                        # online court tracker (singles P1 near, P2 far; doubles P1 / P2 near, P3 / P4 far)
   net_band_m: 0.5               # a player may lean / step this far past the net line
   court_margin_m: 0.0           # candidates outside the court + margin are ignored

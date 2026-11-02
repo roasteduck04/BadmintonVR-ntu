@@ -83,7 +83,7 @@ def test_fps_comes_from_the_inputs():
 @pytest.mark.parametrize("ov, msg", [
     (["sync.mode=cubic"], "sync.mode"), (["backend=tpu"], "backend"), (["pace=slow"], "pace"),
     (["stream.overlap_s=1.0"], "overlap"), (["sync.offsets={back_051: 0.0}"], "offset"), (["time_ref=back_9"], "time_ref"),
-    (["warmup.seconds=20.0"], "warm-up"), (["output_fps=7"], "divide"), (["views=[back_051]"], "at least 2"),
+    (["warmup.seconds=20.0"], "warm-up"), (["output_fps=7"], "divide"), (["views=[back_051]", "mono.stature_m=3.0"], "1.0-2.5 m"),
     (["views=[back_051, nope_9]"], "not cameras"), (["section_s=[40, 50]"], "empty or outside"),
     (["rtmpose.model=hands"], "rtmpose.model"),
     (["sync.offsets=file", "paths.sync_file=no/such/sync.json"], "does not exist"),

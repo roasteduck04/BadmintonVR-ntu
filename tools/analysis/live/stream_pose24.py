@@ -13,6 +13,9 @@ budget_s after its capture time: dropping then saves no delay, it only loses the
 v0.8.4 live engine: warm_state (export_warm_state() of an earlier warm-up: body models, ankle plane) starts the core
 already warm - no warm-up steps, the tracker re-acquires the players by court half from the first step, the first window
 is fitted with the saved body models. stop_at(m) ends a stream early (only steps < m are published at flush).
+v0.8.7 one camera (mono.on): no triangulation - each step stands the player's rest template on the floor point of its
+feet, each window is the offline 1-camera fit (planted feet anchored on the floor, fixed limb lengths), the body
+models come from mono_live.body_model at the start (saved multi-camera warm-up / player height / template).
 Gap handling (spec 6.2, causal): a step whose body has been unseen for more than max_gap steps (fit.MAX_GAP = 20 frames
 at 60 fps, scaled to the step rate) is invalid (NaN, quality NONE). The leading edge of a gap, up to max_gap steps, is
 still held/interpolated by the fit and output with quality FITTED but flagged interp=True (confidence 'filled')."""
@@ -26,7 +29,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from analysis import pose_v2 as pv
-from analysis.live import fallback, lrswap_lag, outputs, stream_fit, sync
+from analysis.live import fallback, lrswap_lag, mono_live, outputs, stream_fit, sync
 from analysis.live.tracker_singles import SinglesTracker
 from analysis.pose24 import fit, scores
 from analysis.pose_fit import _fill_init
@@ -111,6 +114,16 @@ class StreamPose24:
         self.seen = {p: np.zeros(self.n, bool) for p in self.pids}
         self.ema = {p: fallback.EmaSmoother(cfg["fallback"]["alpha"], cfg["fallback_max_hold"]) for p in self.pids}
         self.model = {}
+        self.mono = bool((cfg.get("mono") or {}).get("on"))
+        self.depth = {}               # 1 camera: the confidence's sigma along the camera axis (regress_frames)
+        if self.mono:
+            cam = self.cams[self.views[0]]
+            self.depth = {"depth_axis": mono_live.depth_axis(cam), "depth_sigma_m": mono_live.DEPTH_SIGMA_M}
+            saved, path = mono_live.load_saved(cfg, self.pids) if not warm_state else ({}, None)
+            src = {}
+            for pid in self.pids:
+                self.model[pid], src[pid] = mono_live.body_model(cfg, cam, pid, saved)
+            self.events({"node": "pose3d", "ev": "mono_models", "source": src, "saved_from": path})
         if warm_state:
             for pid, m in (warm_state.get("models") or {}).items():
                 if pid in self.pids and m:
@@ -169,10 +182,16 @@ class StreamPose24:
                     self.obs[pid][v][i] = det
         for pid in self.pids:
             uv, w = stream_fit.window_obs(self.obs[pid], self.views, i, i + 1)
-            Xr = stream_fit.triangulate35(self.cams, self.views, uv, w)[0][0]
+            if self.mono:
+                Xr = mono_live.step_points(uv[:, :, 0], w[:, :, 0], self.cams[self.views[0]], self.model[pid],
+                                           self.tracker.ankle_h)
+            else:
+                Xr = stream_fit.triangulate35(self.cams, self.views, uv, w)[0][0]
             self.Xr[pid][i] = Xr
             self.seen[pid][i] = bool((w[0, :17] >= pv.W_MIN).any(axis=-1).sum() >= self.min_body_kp)
-            self.Xfb[pid][i] = self.ema[pid].push(Xr)
+            # 1 camera: the step points lie on their pixel rays; the EMA would pull a moving near player tens of px
+            # off its 2D and leave its warm-up frames empty (no keypoint within the regress's inlier distance)
+            self.Xfb[pid][i] = Xr if self.mono else self.ema[pid].push(Xr)
         t3 = time.perf_counter_ns()
         self.events({"node": "pose3d", "ev": "step", "step": i, "t_recv_ns": t_recv, "calib_ns": t1 - t0,
                      "track_ns": t2 - t1, "tri_ns": t3 - t2,
@@ -192,7 +211,7 @@ class StreamPose24:
         frames = [self._frame(i) for i in range(a, b)]
         for pid in self.pids:
             uv, w = stream_fit.window_obs(self.obs[pid], self.views, a, b)
-            r = outputs.regress_frames(self.cams, self.views, self.Xfb[pid][a:b], uv, w, self.kind)
+            r = outputs.regress_frames(self.cams, self.views, self.Xfb[pid][a:b], uv, w, self.kind, **self.depth)
             for t, fr in enumerate(frames):
                 fr["players"][pid] = outputs.player_frame(r, t, quality)
         for fr in frames:
@@ -206,6 +225,8 @@ class StreamPose24:
         span = {p: {v: self.obs[p][v][:self.warm] for v in self.views} for p in self.pids}
         swaps = lrswap_lag.window_swaps(self.cams, self.views, span, slice(0, self.warm))
         for pid in self.pids:
+            if self.mono:                 # set at the start (one camera cannot measure the limbs)
+                continue
             uv, w = stream_fit.window_obs(self.obs[pid], self.views, 0, self.warm, swaps[pid])
             self.model[pid] = stream_fit.warmup_model(self.cams, self.views, uv, w, self.cfg["stream"])
         self.events({"node": "pose3d", "ev": "warmup", "models": {p: self.model[p] is not None for p in self.pids}})
@@ -254,22 +275,29 @@ class StreamPose24:
             if m is None:
                 win.status[pid] = "none"
                 continue
-            Xr, _, _ = stream_fit.triangulate35(self.cams, self.views, uv, w)
-            ok = np.isfinite(Xr).all(-1)
-            if not (ok[:, 11] | ok[:, 12]).any():
-                win.status[pid] = "none"
-                continue
+            if self.mono:
+                init, anchor, contact, seen = mono_live.window_inputs(uv, w, self.cams[self.views[0]], m,
+                                                                      self.tracker.ankle_h, self.fps)
+                if not seen.any():
+                    win.status[pid] = "none"
+                    continue
+            else:
+                Xr, _, _ = stream_fit.triangulate35(self.cams, self.views, uv, w)
+                ok = np.isfinite(Xr).all(-1)
+                if not (ok[:, 11] | ok[:, 12]).any():
+                    win.status[pid] = "none"
+                    continue
+                init, anchor, contact = _fill_init(Xr, ok, m.rest), Xr, fit.detect_contact(Xr, self.fps)
             if win.k % self.fit_every:
                 win.status[pid] = "skipped"
                 continue
-            init = _fill_init(Xr, ok, m.rest)
             prev = self.Xfit[pid][lo_p:stop]
             have = np.isfinite(prev).all(axis=(1, 2))
             init[have] = prev[have]
             free = np.zeros(stop - lo_p, bool)
             free[start - lo_p:] = True
-            job = {"P": self.P, "uv": uv, "w": w, "init": init, "free": free, "edges": m.edges, "anchor": Xr,
-                   "contact": fit.detect_contact(Xr, self.fps), "sgn": m.sgn, "fps": self.fps,
+            job = {"P": self.P, "uv": uv, "w": w, "init": init, "free": free, "edges": m.edges, "anchor": anchor,
+                   "contact": contact, "sgn": m.sgn, "fps": self.fps,
                    "max_nfev": self.max_nfev, "tol": self.tol, "lsmr_maxiter": self.lsmr_maxiter}
             win.jobs[pid] = self.pool.submit(stream_fit.solve_window, job) if self.pool else stream_fit.solve_window(job)
         win.ev = {"lrswap_ns": t1 - t0, "prep_ns": time.perf_counter_ns() - t1}
@@ -329,11 +357,12 @@ class StreamPose24:
                 uv, w = win.inputs[pid]
                 Xm = self.Xfit[pid][a:b].copy()
                 Xm[self._unsupported(pid, a, b, win.stop)] = np.nan
-                r = outputs.regress_frames(self.cams, self.views, Xm, uv[a - lo:b - lo], w[a - lo:b - lo], self.kind)
+                r = outputs.regress_frames(self.cams, self.views, Xm, uv[a - lo:b - lo], w[a - lo:b - lo], self.kind,
+                                           **self.depth)
                 q = outputs.FITTED
             else:
                 uv, w = stream_fit.window_obs(self.obs[pid], self.views, a, b)
-                r = outputs.regress_frames(self.cams, self.views, self.Xfb[pid][a:b], uv, w, self.kind)
+                r = outputs.regress_frames(self.cams, self.views, self.Xfb[pid][a:b], uv, w, self.kind, **self.depth)
                 q = outputs.LATE
             for t, fr in enumerate(frames):
                 fr["players"][pid] = outputs.player_frame(r, t, q)
@@ -351,7 +380,8 @@ class StreamPose24:
     def export_warm_state(self) -> dict:
         """What a later stream can reuse instead of its own warm-up: each player's body model and the ankle plane."""
         return {"models": {pid: (model_to_dict(m) if m is not None else None) for pid, m in self.model.items()},
-                "ankle_h_m": float(self.tracker.ankle_h), "views": list(self.views), "fps": self.fps}
+                "ankle_h_m": float(self.tracker.ankle_h), "views": list(self.views), "fps": self.fps,
+                "mode": self.cfg.get("mode", "singles")}
 
     def stop_at(self, m):
         """End the stream after step m - 1: steps >= m are never published (a stopped live stream)."""

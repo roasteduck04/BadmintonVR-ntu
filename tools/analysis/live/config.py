@@ -224,8 +224,25 @@ def resolve(c, probe=probe_sources) -> dict:
     bad = [v for v in c["views"] if v not in all_views]
     if bad:
         raise ValueError(f"views {bad} are not cameras of {c['clip']} ({all_views})")
-    if len(c["views"]) < 2:
-        raise ValueError(f"need at least 2 views for triangulation, got {c['views']}")
+    if not c["views"]:
+        raise ValueError("no views")
+    mono = c.setdefault("mono", {})
+    mono["on"] = len(c["views"]) == 1      # v0.8.7: one camera = the 1-camera fit (feet on the floor, fixed lengths)
+    if mono["on"]:
+        c["warmup"]["min_support_views"] = 1
+        if mono.get("body_models", "auto") is False:          # YAML reads a bare off as false
+            mono["body_models"] = "off"
+        if mono.get("body_models", "auto") not in ("auto", "off"):
+            raise ValueError(f"mono.body_models must be auto or off, got {mono.get('body_models')!r}")
+        hs = mono.get("heights_m") or {}
+        if not isinstance(hs, dict):
+            raise ValueError(f"mono.heights_m must be a mapping like {{P1: 1.75}}, got {hs!r}")
+        for pid, h in list(hs.items()) + [("mono.stature_m", mono.get("stature_m", 1.50))]:
+            if h is not None and not (isinstance(h, (int, float)) and 1.0 <= float(h) <= 2.5):
+                raise ValueError(f"{pid}: a height must be 1.0-2.5 m, got {h!r}")
+        k = mono.get("height_scale", 1.0)
+        if not (isinstance(k, (int, float)) and 0.5 <= float(k) <= 1.5):
+            raise ValueError(f"mono.height_scale must be 0.5-1.5, got {k!r}")
     reg_ref = entry.get("time_ref") or base.get("time_ref")
     c["time_ref"] = c.get("time_ref") or (reg_ref if reg_ref in c["views"] else c["views"][0])
     if c["time_ref"] not in c["views"]:
@@ -349,7 +366,9 @@ def resolve(c, probe=probe_sources) -> dict:
     c["facing_window"] = max(1, _steps(c["facing"]["window_s"], fps, "facing.window_s", lo=0))
 
     offs = c["sync"]["offsets"]
-    if isinstance(offs, dict):
+    if c["mono"]["on"]:                 # one camera: nothing to line up (no sync file, no warm-up estimate)
+        c["offsets"], c["offsets_source"] = {c["views"][0]: 0.0}, "one camera"
+    elif isinstance(offs, dict):
         missing = [v for v in c["views"] if v not in offs]
         if missing:
             raise ValueError(f"no offset for views {missing}")

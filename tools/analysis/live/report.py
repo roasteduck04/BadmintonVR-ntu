@@ -214,6 +214,10 @@ def seedless_lines(evs, cfg) -> list:
         L.append(f"- ankle plane fixed by config: {cfg.get('ankle_h_m')}")
     for e in late:
         L.append(f"- {e['pid']}: no warm-up body model, built late at step {e['step']}")
+    mono = next((e for e in evs if e.get("ev") == "mono_models"), None)
+    if mono:                            # v0.8.7 one camera: where each player's limb lengths came from
+        L.append("- **one camera**: limb lengths " + ", ".join(f"{p} {s}" for p, s in sorted(mono["source"].items()))
+                 + (f" ({mono['saved_from']})" if mono.get("saved_from") else ""))
     if nc:
         a = np.asarray(nc[:warm], float)
         b = np.asarray(nc[warm:], float)

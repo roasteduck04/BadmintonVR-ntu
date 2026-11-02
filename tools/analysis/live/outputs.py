@@ -12,11 +12,13 @@ from analysis.pose24 import build, confidence, fit
 FITTED, WARMUP, LATE, NONE = 0, 1, 2, 3
 
 
-def regress_frames(cams, views, X, uv, w, kind):
+def regress_frames(cams, views, X, uv, w, kind, depth_axis=None, depth_sigma_m=None):
+    """depth_axis / depth_sigma_m: one camera (v0.8.7) - the sigma along its axis, as the offline 1-camera docs."""
     P = pv.proj_mats(cams, views)
     r, inlier = fit._residuals(P, X, uv, w)
     out = build.regress_player({"cams": cams, "views": list(views)},
-                               {"X": X, "w": w, "resid": r, "inlier": inlier}, kind)
+                               {"X": X, "w": w, "resid": r, "inlier": inlier}, kind, depth_axis=depth_axis,
+                               depth_sigma_m=depth_sigma_m)
     with np.errstate(invalid="ignore"), warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         seen = np.asarray(w) >= pv.W_MIN

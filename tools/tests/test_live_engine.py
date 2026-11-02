@@ -208,9 +208,9 @@ def test_server_input_save_validate_and_sets(tmp_path):
     assert s.set_input({"kind": "camera", "cameras": {"back_051": "rtsp://a/x", "backleft_051": "rtsp://b/x"}})["cameras"][0]         == {"name": "back_051", "url": "rtsp://a/x", "use": True}
     from fastapi import HTTPException
     for bad in ({"kind": "camera", "cameras": {"back_051": "just-a-name", "b": "rtsp://b/x"}},     # not an address
-                {"kind": "camera", "cameras": [{"name": "cam1", "url": "rtsp://a/x"}]},              # one camera only
+                {"kind": "camera", "cameras": [{"name": "cam1", "url": ""}]},                        # no camera address
                 {"kind": "camera", "cameras": [{"name": "../x", "url": "rtsp://a/x"}, {"name": "c2", "url": "rtsp://b/x"}]},
-                {"kind": "video", "clip": "singles_05x", "views": ["back_051"]},                      # one angle only
+                {"kind": "video", "clip": "singles_05x", "views": []},                                # no angle (1 is fine, v0.8.7)
                 {"kind": "video", "clip": "singles_05x", "views": ["back_11", "back_051"]},           # another clip's angle
                 {"kind": "video", "clip": "nope", "views": []},
                 {"kind": "webcam"}):

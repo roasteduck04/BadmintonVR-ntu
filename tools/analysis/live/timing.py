@@ -19,7 +19,7 @@ import numpy as np
 
 MS = 1e6
 STAGES = [("decode", "2D: decode (max view)"), ("infer", "2D: model (max view)"), ("wait_2d", "frame captured → collected (2D + backlog)"),
-          ("calib", "3D: score calibration"), ("track", "3D: tracker"), ("tri", "3D: triangulate + EMA"),
+          ("calib", "3D: score calibration"), ("track", "3D: tracker"), ("tri", "3D: triangulate + EMA (1 camera: floor points)"),
           ("fit_share", "3D: window fit ÷ frames"), ("hold", "pushed → written (fixed lag + fit)"),
           ("write", "write frame file"), ("e2e", "end-to-end (capture → written)")]
 

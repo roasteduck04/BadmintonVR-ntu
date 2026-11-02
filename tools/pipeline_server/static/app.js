@@ -57,7 +57,7 @@ function sidebar() {
   if (!c) return;
   const cam = inp.kind === "camera";
   const views = cam ? usedCams().map((x) => x.name) : chosenViews(c);
-  $("#st-source").textContent = `${c.label.replace(/ \(.*\)$/, "")} · ${views.length} ${cam ? "cams" : "angles"}`;
+  $("#st-source").textContent = `${c.label.replace(/ \(.*\)$/, "")} · ${views.length} ${cam ? "cam" : "angle"}${views.length === 1 ? "" : "s"}`;
   const ncal = views.filter((v) => (cam ? state.camCalib[v] : c.calibrated[v])).length;
   $("#st-calib").textContent = `${ncal} / ${views.length}`;
 }
@@ -172,7 +172,8 @@ $("#src-save").addEventListener("click", async () => {
   try {
     state.input = await api("/api/input", body);
     await camCalibStatus(); renderCams(); sidebar();
-    const what = state.input.kind === "camera" ? `${usedCams().length} live cameras` : `${c.label}, ${state.input.views.length} angles`;
+    const what = state.input.kind === "camera" ? `${usedCams().length} live camera${usedCams().length === 1 ? "" : "s"}`
+      : `${c.label}, ${state.input.views.length} angle${state.input.views.length === 1 ? "" : "s"}`;
     $("#src-msg").textContent = `Saved: ${what}. Calibrate them (step 2), then warm up again (step 3).`;
   } catch (e) { toast(e.message, 7000); }
 });
@@ -315,10 +316,11 @@ async function loadSettings() {
     const cam = state.input && state.input.kind === "camera";
     const views = cam ? usedCams().map((x) => x.name) : chosenViews(c);
     const ncal = views.filter((v) => c.calibrated[v] || (cam && state.camCalib[v])).length;
-    const bits = [`${c.label}: ${views.length} ${cam ? "cameras" : "angles"} (${views.map(pretty).join(", ")})`,
+    const bits = [`${c.label}: ${views.length} ${cam ? "camera" : "angle"}${views.length === 1 ? "" : "s"} (${views.map(pretty).join(", ")})`,
       !cam && c.section_s ? `section ${c.section_s[0]}–${c.section_s[1] ?? "end"} s` : "",
       ncal === views.length ? "all calibrated" : `${views.length - ncal} not calibrated (step 2)`,
-      cam ? "offsets measured in the warm-up" : c.sync_file ? "sync file present" : "no sync file"];
+      views.length === 1 ? "1-camera mode: court ~10–15 cm, rough pose, no racket / shuttle 3D (heights: One camera)"
+        : cam ? "offsets measured in the warm-up" : c.sync_file ? "sync file present" : "no sync file"];
     $("#clip-info").textContent = bits.filter(Boolean).join(" · ");
   }
 }
