@@ -92,6 +92,31 @@ Laptop results (2026-10-31, CPU):
   after their frames were written (nothing fitted): the 3D now waits up to 1.5 s for a frame's 2D, and the thread
   drops its oldest step beyond 30 waiting (`worker.dropped` in rs_summary.json); the lab GPU decides.
 
+### Lab results, rounds 6 + 7 (2026-11-02, `runs/campaign_in/lab_5090_r67/`: summary.md, rs_report.md, rs_bench_*)
+
+- **Pose alone reproduces round 4** (Z01): 57 fps, keeps up, delay 1.28 s, q3 1.39 cm.
+- **Racket / shuttle inside the pose loop break real time.** The pose already uses ~13 ms of the 16.7 ms per 60 fps
+  step; the racket / shuttle work runs in the same loop, so every test falls behind: extra per step (p50) shuttle every
+  8 frames 2.6 ms -> 49 fps; racket wrist boxes 14.6 ms -> 31 fps; detector + keypoints 27.9 ms -> 22 fps; all with
+  the async thread 41.5 fps; doubles + racket + shuttle 17 fps. They need a process of their own next to the pose.
+- **TensorRT on these small models: 1.2-1.6x** (models alone, 3 cameras, 1080p): detector 13.2 -> 9.6 ms for 3 cameras
+  in one call; keypoints 8 crops + flip 8.3 -> 6.6 ms; TrackNet 8.9 -> 7.0 ms per window (~1 ms per camera frame every
+  8 frames). **FP16 breaks the racket keypoint model on ~5 % of crops** (TensorRT vs CUDA on the same crops 0.29 px
+  median, 79 px p95; likely its attention head overflowing in FP16); in the streams detector + keypoints on CUDA
+  (Z08) is the best racket: head 3.6 / 8.2 cm, shaft 2.4 / 7.2 deg (P1 / P2), vs TensorRT (Z02) 6.8 / 12.8 cm,
+  4.7 / 12.1 deg. Detector boxes (IoU 0.99) and TrackNet (identical positions) are fine in FP16.
+- **Racket boxes in the live stream: the detector wins.** Wrist boxes 43-66 cm head error (the tight second pass made
+  them worse on FP16: without it P1 12.8 cm); detector every 3rd frame 20 / 37 cm.
+- **Shuttle:** every 8 frames 64 % of frames, 8.3 cm (observed 15 cm); every 4: 54 %, 7.8 cm; every frame 56 %, 5.5 cm
+  but 17 ms per step; 28 s run 79 %, 8.1 cm. The doubles_2sides offline shuttle is no usable reference (13 m "errors").
+- **3D keeps up:** racket fit 7-11 ms per frame (2 players), 22-29 ms with 4 players or 5 cameras; shuttle 0.1 ms;
+  racket / shuttle written 26-224 ms after the pose frame.
+- **Doubles (round 7):** four players tracked, 0 identity swaps in 9 of 11 streams (2 short swaps in the 20 s run and
+  with the detector every 3rd frame), coverage 92-100 %; vs the offline 5-camera builds 2.3-2.9 cm on 3 cameras,
+  1.55 cm on 4, 0.79 cm on 5. Speed: the 2D takes 23 ms per step with four players (singles 13) -> 32-40 fps at a
+  60 fps target (falls behind; 4 fit workers change nothing: the 2D is the limit); **30 fps on 3 cameras keeps up**
+  (D03: 2D lag flat 20 ms, 0.94x, delay 1.17 s, 2.87 cm).
+
 Every run also records its 3D inputs (`rs_inputs.jsonl.gz`), so 3D settings are compared on the laptop afterwards
 (`rs_replay.py run <run> --set shuttle3d=tri ...`) instead of in more lab runs.
 
@@ -135,6 +160,29 @@ The first `rs_bench` builds the three TensorRT engines (a few minutes, cached fo
 4-player builds are in the archive folder). The separate plans `lab_5090_r6` / `lab_5090_r7` hold the same tests.
 Laptop check of the merge: racket / shuttle 3D on the stored doubles_2sides 2D fits all four rackets (P1-P3 80-97 %,
 P4 32 % of 300 frames) at ~26 ms per frame (four players; Z19 shows whether it keeps up at 60 fps).
+
+Round 8 (`lab_5090_r8`: racket / shuttle v2 in processes of their own; models alone with TensorRT FP32 ~5 min, then
+10 streams ~25 min). v2 is the default now (`rtmpose.exp_rs_mode=process`; the round-6 plans set `inline` to run as
+they did). Keys: `exp_rs_group camera|all`, `exp_racket_det_ep` (default trt), `exp_racket_pose_ep` (default cuda;
+`trt32` = TensorRT FP32), `exp_racket_every N`, `exp_rs_behind_s` (default 0.25), `exp_racket_flip`,
+`exp_racket_refine` (default off). The start file is copied into the Unity project folder too (double-click it there:
+it starts the server in WSL by itself):
+
+```bash
+cd ~/BadmintonVR && source ~/venv-pc/bin/activate && git fetch && git checkout test/r5-experiments && git pull
+export PYTHONPATH="$PWD/tools/experiments"
+U=/mnt/c/Users/sports_1/BadmintonVR-unity
+cp start-pipeline-server.bat $U/
+python tools/experiments/rs_bench.py --ep cuda,trt,trt32 --out $U/runs/campaign/lab_5090_r8/rs_bench_3cam
+python tools/live_run.py campaign run --plan lab_5090_r8 --group main --unity-project $U
+```
+
+Laptop check of v2 (CPU, 3 cameras at 4K, 30 fps as fast as it runs, detector + keypoints every 2nd frame + shuttle,
+45 frames): three racket / shuttle processes next to the three pose processes, results straight to the 3D; P1 racket
+fitted in 45 / 45 frames, P2 (far) 7 / 40, shuttle in 18 frames once its background was built; no errors. The
+`trt32` bench builds the FP32 engines once (a few minutes, cached for R05). Copy back
+`C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r8.zip`; on the laptop `python tools/experiments/rs_report.py
+<zip>` plus `campaign report` for the pose columns.
 
 Unity not in Play mode (this round measures the PC). Copy back
 `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r5.zip` and `~/.cache/badmintonvr/int8/*.json`

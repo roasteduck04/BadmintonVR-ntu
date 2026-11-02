@@ -12,7 +12,8 @@ machine: rtx5090
 defaults:
   settings: best_live
   timeout_s: 1800
-  set: ["sync.mode=nearest"]
+  # round 6 as it ran (round 8 changed the defaults: racket / shuttle in processes of their own, no second racket pass)
+  set: ["sync.mode=nearest", "rtmpose.exp_rs_mode=inline", "rtmpose.exp_racket_refine=true"]
 
 tests:
   # ================================================================ round 6: racket + shuttle (singles_05x)

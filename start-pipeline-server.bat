@@ -5,6 +5,8 @@ rem
 rem   start-pipeline-server.bat          Python on Windows, this folder = repository + Unity project (the laptop)
 rem   start-pipeline-server.bat wsl      Python in WSL with the GPU venv (lab / remote GPU PC); this folder = the
 rem                                      Unity project, the code is the WSL clone below (edit the WSL_ lines once)
+rem   A plain double-click picks WSL by itself when this folder has no code (tools\pipeline_server\server.py) or
+rem   Windows has no Python: copy this file into the lab's Unity project folder and double-click it there.
 rem
 rem Guide: docs\setup\pipeline-server.md
 setlocal
@@ -21,9 +23,12 @@ set "HERE=%HERE:~0,-1%"
 if not defined NO_BROWSER start "" /min cmd /c "timeout /t 6 /nobreak >nul & start "" http://localhost:%PORT%"
 
 if /i "%~1"=="wsl" goto wsl
+if not exist "tools\pipeline_server\server.py" goto wsl
 
 where python >nul 2>&1
 if errorlevel 1 (
+  where wsl >nul 2>&1
+  if not errorlevel 1 goto wsl
   echo Python was not found. Install Python 3.12 and the packages: pip install -r tools\requirements.txt
   pause
   exit /b 1

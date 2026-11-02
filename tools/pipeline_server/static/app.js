@@ -287,10 +287,16 @@ function markChanged() {
 }
 
 async function loadSettings() {
-  const clip = currentClip(), preset = $("#preset").value;
-  if (!clip) return;
   try { state.input = await api("/api/input"); } catch (e) { /* keep the last one */ }
+  const clip = currentClip();
+  if (!clip) return;
   const c = state.clips.find((x) => x.name === clip);
+  if (!state.presetPicked) {       // doubles: 30 fps unless a preset was picked (60 fps doubles is 2D-bound, round 7)
+    const want = c && c.mode === "doubles" && state.presets.some((p) => p.name === "live_30") ? "live_30"
+      : state.info.default_settings;
+    if (state.presets.some((p) => p.name === want)) $("#preset").value = want;
+  }
+  const preset = $("#preset").value;
   const blocked = c && !c.streamable;
   $("#stream-blocked").hidden = !blocked;
   if (blocked) $("#stream-blocked").innerHTML = `<b>${c.label}</b> can be calibrated but not streamed yet: ${c.mode === "doubles"
@@ -322,10 +328,11 @@ async function loadPresets(select) {
   const s = $("#preset"); s.innerHTML = "";
   state.presets.forEach((p) => { const o = document.createElement("option"); o.value = p.name; o.textContent = p.name + (p.builtin ? " (built in)" : ""); s.appendChild(o); });
   s.value = select || state.info.default_settings;
+  if (select) state.presetPicked = true;
   await loadSettings();
 }
 
-$("#preset").addEventListener("change", loadSettings);
+$("#preset").addEventListener("change", () => { state.presetPicked = true; loadSettings(); });
 $("#reset").addEventListener("click", () => { state.values = JSON.parse(JSON.stringify(state.base)); renderForm(); });
 $("#save").addEventListener("click", async () => {
   const name = $("#save-name").value.trim().toLowerCase();

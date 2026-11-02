@@ -214,8 +214,9 @@ def _g(d, *ks):
 def table(rows) -> str:
     L = ["| run | racket 2D (ep) | shuttle 2D (ep) | 2D extra ms/step p50 (det / racket / TrackNet) | pose fps | "
          "keeps up | racket fitted % (P1 / P2) | grip cm | head cm | shaft ° | shuttle % | shuttle cm (observed) | "
-         "shuttle cm at best shift (frames) | 3D ms racket / shuttle | lag after pose ms |",
-         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+         "shuttle cm at best shift (frames) | 3D ms racket / shuttle | lag after pose ms | "
+         "v2 worker behind ms p50 / p90 (racket steps skipped) |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         s = r.get("settings") or {}
         w = r.get("worker") or {}
@@ -226,8 +227,11 @@ def table(rows) -> str:
         sh = " / ".join(_f(_g(v, "shaft_deg", "median")) for _, v in sorted(rk.items())) or "–"
         su = r.get("shuttle") or {}
         ep = r.get("ep") or {}
-        rk2d = f"{s.get('racket')}{'/' + str(s.get('det_every')) if s.get('racket') == 'det' and s.get('det_every', 1) > 1 else ''}" \
-            f" ({ep.get('racket', '?')})" if s.get("racket") else "off"
+        mode = "" if s.get("mode", "inline") == "inline" else f"v2 {s.get('group', 'camera')}: "
+        rk2d = f"{mode}{s.get('racket')}{'/' + str(s.get('det_every')) if s.get('racket') == 'det' and s.get('det_every', 1) > 1 else ''}" \
+            f"{' every ' + str(s.get('racket_every')) if (s.get('racket_every') or 1) > 1 else ''}" \
+            f"{'' if s.get('flip', True) else ' no flip'}" \
+            f" ({ep.get('racket_det', ep.get('racket', '?'))} / {ep.get('racket', '?')})" if s.get("racket") else "off"
         sh2d = f"stride {s.get('stride')} ({ep.get('shuttle', '?')})" if s.get("shuttle") else "off"
         L.append(f"| {r['run']} | {rk2d} | {sh2d} | {_f(_g(w, 'all_ms', 'median'))} ({_f(_g(w, 'det_ms', 'median'))} / "
                  f"{_f(_g(w, 'pose_ms', 'median'))} / {_f(_g(w, 'tn_ms', 'median'))}) | {_f(_g(r, 'pose', 'fps'))} | "
@@ -236,7 +240,9 @@ def table(rows) -> str:
                  f"{_f(_g(su, 'pos_cm', 'median'))} ({_f(_g(su, 'pos_observed_cm', 'median'))}) | "
                  f"{_f(_g(su, 'pos_cm_best_shift', 'median'))} ({su.get('best_shift', '–')}) | "
                  f"{_f(_g(r, 'racket_ms', 'median'))} / {_f(_g(r, 'shuttle_ms', 'median'))} | "
-                 f"{_f(_g(r, 'after_pose_ms', 'median'), 0)} |")
+                 f"{_f(_g(r, 'after_pose_ms', 'median'), 0)} | "
+                 f"{_f(_g(w, 'behind_ms', 'median'), 0)} / {_f(_g(w, 'behind_ms', 'p90'), 0)} "
+                 f"({_f(_g(w, 'skipped_racket', 'max'), 0)}) |")
     return "\n".join(L)
 
 

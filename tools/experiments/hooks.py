@@ -12,6 +12,9 @@ Each is off unless its config key is set (keys pass through the live config unto
 Round 6 (racket + shuttle, rs_stream.py): rtmpose.exp_racket=det|wrist|both and/or rtmpose.exp_shuttle=true run the
 racket / shuttle models in the 2D processes after the pose model and a 3D process next to the runner; results go to
 <run>/racket_shuttle.jsonl, nothing else changes. Settings: rs_stream.settings().
+Round 8 (v2, the default rtmpose.exp_rs_mode=process): the racket / shuttle models run in processes of their own next
+to the pose processes (exp_rs_group camera = one per camera, all = one for every camera), decode the same frames on the
+same clock and send their results straight to the 3D process; exp_rs_mode=inline = round 6 (inside the pose processes).
 
 Always on (a fix, not an option): wholebody at a smaller input (rtmpose.mode=balanced) gets its raw scores mapped onto
 the wholebody-performance scale with tools/experiments/score_map_wb.json (score_map_fit.py) - pose2d_fast.score_to_wb
@@ -105,10 +108,33 @@ def _attach_rs_worker(m):
 
 
 def _attach_rs_sources(m):
-    """Main process: hand every delivered frame's racket / shuttle 2D to the run's 3D process."""
+    """Main process: hand every delivered frame's racket / shuttle 2D to the run's 3D process (inline mode), or start
+    the racket / shuttle processes next to the pose processes (v2 process mode: results go straight to the 3D)."""
     import rs_stream
     S = m.VideoRtmlibSource
     orig_try, orig_get = S.try_get, S.get
+    orig_start, orig_close, orig_session = S.start, S.close, S.session
+
+    def start(self, plan, origins, ready_timeout_s=600):
+        orig_start(self, plan, origins, ready_timeout_s)
+        st = rs_stream.settings(self.cfg.get("rtmpose"))
+        if st and st["mode"] == "process" and rs_stream.CURRENT is not None:
+            self._rs_procs = rs_stream.start_workers(self, plan, origins, rs_stream.CURRENT.q, log=self.log)
+
+    def close(self):
+        try:
+            orig_close(self)                  # sets stop_ev: the racket / shuttle processes stop too
+        finally:
+            rs_stream.stop_workers(getattr(self, "_rs_procs", None) or [])
+            self._rs_procs = []
+
+    def session(self, plan, origins, realtime=None, timeout_s=120):
+        st = rs_stream.settings(self.cfg.get("rtmpose"))
+        if st and st["mode"] == "process":
+            self.log("  racket / shuttle (process mode) runs in one-shot runs only (live_run.py run): none this stream")
+        return orig_session(self, plan, origins, realtime, timeout_s)
+
+    S.start, S.close, S.session = start, close, session
 
     def try_get(self, view, frame, wait_s=0.002):
         got = orig_try(self, view, frame, wait_s)

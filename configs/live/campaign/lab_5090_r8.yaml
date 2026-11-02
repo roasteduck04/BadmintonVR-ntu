@@ -1,0 +1,42 @@
+# Round 8 (TEST BRANCH test/r5-experiments): racket + shuttle v2 - in processes of their own next to the pose processes
+# (round 6 ran them inside the pose loop and broke 60 fps). Defaults of v2 (rs_stream.settings, exp_rs_mode=process):
+# one racket / shuttle process per camera, decoding the same frames on the run's clock; racket detector every frame on
+# TensorRT FP16, racket keypoints on CUDA FP32 (FP16 broke ~5 % of crops in round 6), flip test on, no second pass;
+# TrackNet every 8 frames on TensorRT; a process more than 0.25 s behind the cameras skips the racket until it catches up.
+# Results in <run>/racket_shuttle.jsonl + rs_summary.json, scored on the laptop by tools/experiments/rs_report.py.
+# Run with the experiment hooks on PYTHONPATH:
+#   PYTHONPATH="$PWD/tools/experiments" python tools/live_run.py campaign run --plan lab_5090_r8 --group main --unity-project <Unity project>
+name: lab_5090_r8
+clip: singles_05x
+machine: rtx5090
+defaults:
+  settings: best_live
+  timeout_s: 1800
+  set: ["sync.mode=nearest"]
+
+tests:
+  - {id: R01_pose_only, note: "reference: pose only (round 6 Z01)", requires: [tensorrt, onnx]}
+  # v2: where the racket / shuttle processes run
+  - {id: R02_v2_cam, note: "v2: racket (detector + keypoints) + shuttle, one process per camera",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true"]}
+  - {id: R03_v2_all, note: "v2: one racket / shuttle process for all cameras (batched calls)",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true", "rtmpose.exp_rs_group=all"]}
+  # v2: racket cost and quality
+  - {id: R04_v2_every2, note: "R02 with the racket on every 2nd frame (3D uses the nearest racket frame)",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true", "rtmpose.exp_racket_every=2"]}
+  - {id: R05_v2_kp_trt32, note: "R02 with the racket keypoints on TensorRT FP32 (vs CUDA FP32)",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true",
+                                       "rtmpose.exp_racket_pose_ep=trt32"]}
+  - {id: R06_v2_noflip, note: "R02 without the flip test (half the keypoint work)",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true", "rtmpose.exp_racket_flip=false"]}
+  - {id: R07_v2_shuttle_only, note: "v2: shuttle only (TrackNet every 8 frames)",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_shuttle=true"]}
+  # bigger setups
+  - {id: R08_v2_live30_5cam, settings: live_30, note: "v2 at 30 fps on 5 cameras, racket + shuttle",
+     requires: [tensorrt, onnx], set: ["rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true",
+                                       "views=[back_051, backleft_051, backright_051, frontleft_051, frontright_051]"]}
+  - {id: R09_v2_doubles_live30, clip: doubles_2sides, settings: live_30,
+     note: "doubles at 30 fps (round 7: 60 fps doubles is 2D-bound), racket + shuttle, 4 fit workers",
+     requires: [tensorrt, onnx], set: ["stream.workers=4", "rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true"]}
+  - {id: R10_v2_long, note: "R02 over 2-30 s", timeout_s: 3600, requires: [tensorrt, onnx],
+     set: ["section_s=[2.0, 30.0]", "rtmpose.exp_racket=det", "rtmpose.exp_shuttle=true"]}

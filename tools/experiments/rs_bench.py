@@ -1,14 +1,15 @@
-"""Round-6 experiment (test branch only): the racket / shuttle models alone - speed on CUDA vs TensorRT FP16 for the
-batch sizes a live run uses, and how far TensorRT FP16's answers move from CUDA FP32's on the same real frames.
+"""Round-6 experiment (test branch only): the racket / shuttle models alone - speed on CUDA vs TensorRT FP16 (and
+TensorRT FP32, --ep cuda,trt,trt32) for the batch sizes a live run uses, and how far TensorRT's answers move from
+CUDA FP32's on the same real frames.
 
     python tools/experiments/rs_bench.py --clip singles_05x --preset rtx5090 --out <folder> [--views 3|5] [--frames 64]
 
 Frames: `--frames` consecutive frames of each camera from the clip's live section, decoded and shrunk to the live
-1080 short side (as the live 2D does). Per execution provider (cuda, trt):
+1080 short side (as the live 2D does). Per execution provider (cuda, trt, trt32):
 - racket detector: one camera per call and every camera in one call (ms per call, per camera frame)
 - racket keypoints: 4 / 8 / 16 / 32 crops (the detector's boxes of these frames, repeated), flip test on and off
 - TrackNet: 1 window and one window per camera in one call; per camera frame = call / stride for stride 8 / 4 / 1
-Agreement TensorRT vs CUDA: detector boxes (IoU of the best box), keypoints (px at 1080p), TrackNet positions (px).
+Agreement TensorRT (FP16, FP32) vs CUDA: detector boxes (IoU of the best box), keypoints (px at 1080p), TrackNet positions (px).
 Writes rs_bench.json + rs_bench.md into --out."""
 from __future__ import annotations
 
@@ -120,8 +121,10 @@ def run(cfg, out, n_frames=64, reps=30, eps=("cuda", "trt"), log=print):
         log(f"{ep}: det 1 cam {R['det_1']['median']:.2f} ms, {nv} cams {R['det_all']['median']:.2f} ms; "
             f"racket 16 crops {R['pose_16_flip']['median']:.2f} ms (flip) / {R['pose_16']['median']:.2f} ms; "
             f"TrackNet 1 window {R['tn_1']['median']:.2f} ms, {nv} windows {R['tn_all']['median']:.2f} ms")
-    if "cuda" in keep and "trt" in keep:
-        a, b = keep["cuda"], keep["trt"]
+    for other in ("trt", "trt32"):
+        if "cuda" not in keep or other not in keep:
+            continue
+        a, b = keep["cuda"], keep[other]
         ious, kd, sd, sh_both, sh_one = [], [], [], 0, 0
         for v in views:
             for ba, bb, ka, kb in zip(a["boxes"][v], b["boxes"][v], a["kp"][v], b["kp"][v]):
@@ -135,10 +138,10 @@ def run(cfg, out, n_frames=64, reps=30, eps=("cuda", "trt"), log=print):
                     sd.append(float(np.hypot(pa[0] - pb[0], pa[1] - pb[1])))
                 elif (pa is None) != (pb is None):
                     sh_one += 1
-        res["trt_vs_cuda"] = {"det_best_box_iou_median": _med(ious), "racket_kp_px_median": _med(kd),
-                              "racket_kp_px_p95": _pct(kd, 95), "shuttle_px_median": _med(sd),
-                              "shuttle_px_p95": _pct(sd, 95), "shuttle_found_both": sh_both,
-                              "shuttle_found_one_only": sh_one}
+        res[f"{other}_vs_cuda"] = {"det_best_box_iou_median": _med(ious), "racket_kp_px_median": _med(kd),
+                                   "racket_kp_px_p95": _pct(kd, 95), "racket_kp_over_20px": _frac(kd, 20.0),
+                                   "shuttle_px_median": _med(sd), "shuttle_px_p95": _pct(sd, 95),
+                                   "shuttle_found_both": sh_both, "shuttle_found_one_only": sh_one}
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "rs_bench.json"), "w", encoding="utf-8") as fh:
         json.dump(res, fh, indent=1)
@@ -162,6 +165,11 @@ def _med(x):
 
 def _pct(x, q):
     return round(float(np.percentile(x, q)), 3) if len(x) else None
+
+
+def _frac(x, thr):
+    """Share of keypoints moved more than thr px (round 6: FP16 broke ~5 % of racket crops outright)."""
+    return round(float(np.mean(np.asarray(x) > thr)), 4) if len(x) else None
 
 
 def markdown(res):
@@ -190,10 +198,13 @@ def markdown(res):
             v = (R.get("tn_per_camera_frame") or {}).get(f"stride_{s}")
             vals.append("–" if v is None else f"{v:.2f}")
         L_.append(f"| TrackNet per camera frame, a call every {s} frame(s) | " + " | ".join(vals) + " |")
-    if res.get("trt_vs_cuda"):
-        a = res["trt_vs_cuda"]
-        L_ += ["", f"TensorRT FP16 vs CUDA FP32 on the same frames: best racket box IoU {a['det_best_box_iou_median']}, "
-                   f"racket keypoints {a['racket_kp_px_median']} px median ({a['racket_kp_px_p95']} p95), shuttle "
+    for other, label in (("trt", "TensorRT FP16"), ("trt32", "TensorRT FP32")):
+        a = res.get(f"{other}_vs_cuda")
+        if not a:
+            continue
+        L_ += ["", f"{label} vs CUDA FP32 on the same frames: best racket box IoU {a['det_best_box_iou_median']}, "
+                   f"racket keypoints {a['racket_kp_px_median']} px median ({a['racket_kp_px_p95']} p95, "
+                   f"{a.get('racket_kp_over_20px')} over 20 px), shuttle "
                    f"{a['shuttle_px_median']} px median ({a['shuttle_px_p95']} p95; found by both "
                    f"{a['shuttle_found_both']}, by one only {a['shuttle_found_one_only']})."]
     for ep, R in res["ep"].items():

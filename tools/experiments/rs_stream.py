@@ -1,7 +1,12 @@
 """Round-6 experiment (test branch only): racket + shuttle in a live stream, attached by hooks.py (nothing in the live
 code is edited; Unity frames and the server are untouched). Off unless a test sets rtmpose.exp_racket / exp_shuttle.
 
-2D (RS2D, inside each 2D process, after the pose model, on the frame that is already decoded):
+2D (RS2D). v2 (round 8, exp_rs_mode=process, the default): in rs_worker processes of their own next to the pose
+processes (one per camera, or one for all with exp_rs_group=all), each decoding the same frames on the run's clock;
+racket detector on TensorRT FP16, racket keypoints on CUDA FP32 (exp_racket_pose_ep trt32 = TensorRT FP32), TrackNet
+on TensorRT; exp_racket_every 2 = the racket on every 2nd frame (the 3D uses the nearest frame that has one), and a
+worker more than exp_rs_behind_s behind the cameras skips the racket until it catches up. Round 6
+(exp_rs_mode=inline): inside each 2D process, after the pose model, on the frame that is already decoded:
 - racket: boxes from the RacketVision detector (`det`, every exp_racket_det_every frames; wrist boxes in between),
   from the live body keypoints (`wrist`: a box around each wrist, no detector) or both (`both`: detector boxes + wrist
   boxes where no detector box overlaps); then the racket keypoint model on every box of every camera in one call.
@@ -46,11 +51,23 @@ def settings(rcfg) -> dict | None:
     if not racket and not shuttle:
         return None
     box = rcfg.get("exp_racket_box") or [1.6, 0.3]
-    return {"racket": racket, "shuttle": shuttle,
+    mode = str(rcfg.get("exp_rs_mode") or "process")
+    if mode not in ("process", "inline"):
+        raise ValueError(f"rtmpose.exp_rs_mode must be process | inline, got {mode!r}")
+    if mode == "process" and racket in ("wrist", "both"):
+        raise ValueError("exp_racket wrist / both need the body keypoints: exp_rs_mode=inline (round 6)")
+    group = str(rcfg.get("exp_rs_group") or "camera")
+    if group not in ("camera", "all"):
+        raise ValueError(f"rtmpose.exp_rs_group must be camera | all, got {group!r}")
+    return {"racket": racket, "shuttle": shuttle, "mode": mode, "group": group,
             "racket_ep": rcfg.get("exp_racket_ep"), "shuttle_ep": rcfg.get("exp_shuttle_ep"),
+            # v2 (round 8): detector boxes are fine in FP16, the keypoint model is not (round 6: ~5 % of crops broken)
+            "racket_det_ep": rcfg.get("exp_racket_det_ep"), "racket_pose_ep": rcfg.get("exp_racket_pose_ep"),
+            "racket_every": max(1, int(rcfg.get("exp_racket_every") or 1)),
+            "behind_s": float(rcfg.get("exp_rs_behind_s", 0.25)),
             "det_every": max(1, int(rcfg.get("exp_racket_det_every") or 1)),
             "flip": bool(rcfg.get("exp_racket_flip", True)),
-            "refine": bool(rcfg.get("exp_racket_refine", True)),
+            "refine": bool(rcfg.get("exp_racket_refine", False)),
             "fast_fit": bool(rcfg.get("exp_racket3d_fast", True)),
             "fast_nfev": int(rcfg.get("exp_racket3d_nfev") or 30),
             "solver": str(rcfg.get("exp_racket3d_solver") or "gn"),
@@ -78,8 +95,14 @@ class RS2D:
     def __init__(self, rcfg, device, ep):
         self.s = st = settings(rcfg)
         cpu = device != "cuda"
-        e_r = "cpu" if cpu else (st["racket_ep"] or ep)
-        e_s = "cpu" if cpu else (st["shuttle_ep"] or ep)
+        if st["mode"] == "process":               # v2 defaults: detector TensorRT FP16, keypoints CUDA FP32
+            e_det = "cpu" if cpu else (st["racket_det_ep"] or st["racket_ep"] or "trt")
+            e_r = "cpu" if cpu else (st["racket_pose_ep"] or st["racket_ep"] or "cuda")
+            e_s = "cpu" if cpu else (st["shuttle_ep"] or "trt")
+        else:                                     # round 6 (inline): one ep for both racket models
+            e_r = "cpu" if cpu else (st["racket_pose_ep"] or st["racket_ep"] or ep)
+            e_det = "cpu" if cpu else (st["racket_det_ep"] or st["racket_ep"] or ep)
+            e_s = "cpu" if cpu else (st["shuttle_ep"] or ep)
         self.providers = {}
         self.det = self.pose = self.tn_run = None
         if st["racket"]:
@@ -88,12 +111,12 @@ class RS2D:
             self.pose = L.RacketPose(run, flip=st["flip"])
             if st["racket"] in ("det", "both"):
                 run, self.providers["racket_det"] = L.session(
-                    "racket_det", e_r, rcfg, {"input": ((1, 3, 640, 640), (3, 3, 640, 640), (5, 3, 640, 640))})
+                    "racket_det", e_det, rcfg, {"input": ((1, 3, 640, 640), (3, 3, 640, 640), (5, 3, 640, 640))})
                 self.det = L.RacketDet(run)
         if st["shuttle"]:
             self.tn_run, self.providers["tracknet"] = L.session(
                 "tracknet", e_s, rcfg, {"input": ((1, 27, 288, 512), (3, 27, 288, 512), (5, 27, 288, 512))})
-        self.ep = {"racket": e_r, "shuttle": e_s}
+        self.ep = {"racket": e_r, "racket_det": e_det, "shuttle": e_s}
         self.chunk = 32 if e_r != "cpu" else 4          # racket crops per call (x2 with the flip test)
         self.tn_chunk = 5 if e_s != "cpu" else 1        # TrackNet windows per call
         self.tn, self.bg, self.bg_samples, self.bg_seen = {}, {}, {}, {}
@@ -106,7 +129,9 @@ class RS2D:
 
     @classmethod
     def maybe(cls, rcfg, device, ep):
-        return cls(rcfg, device, ep) if settings(rcfg) else None
+        """Inside a pose process (round 6 inline mode) only; v2 runs RS2D in rs_worker processes of its own."""
+        st = settings(rcfg)
+        return cls(rcfg, device, ep) if st and st["mode"] == "inline" else None
 
     # -------------------------------------------------------------- warm-up (engines built before the stream)
     def warmup(self, img_hw):
@@ -117,7 +142,7 @@ class RS2D:
         t = time.monotonic_ns()
         gpu = self.ep["racket"] != "cpu"
         if self.det is not None:
-            for n in ((1, 3, 5) if gpu else (1,)):
+            for n in ((1, 3, 5) if self.ep["racket_det"] != "cpu" else (1,)):
                 self.det.batch([img] * n)
         if self.pose is not None:
             for n in ((1, 4, 8, 16, self.chunk) if gpu else (1,)):
@@ -206,14 +231,18 @@ class RS2D:
             return self.outbox.pop(view, [])
 
     # -------------------------------------------------------------- the work
-    def process(self, items):
-        """items [(view, f, img (reader px), dets (calib px), calib px per reader px)] -> {(view, f): result}."""
+    def process(self, items, racket=True):
+        """items [(view, f, img (reader px), dets (calib px), calib px per reader px)] -> {(view, f): result}.
+        racket False (v2: the worker is behind) or a frame off exp_racket_every: no racket for these frames (their
+        results carry no "racket" key, so the 3D uses the nearest frame that has one)."""
         st = self.s
         t0 = time.monotonic_ns()
         res = {(v, f): {"f": int(f)} for v, f, *_ in items}
         tim = {"items": len(items)}
-        if self.pose is not None:
-            self._racket(items, res, tim)
+        r_items = [it for it in items if racket and int(it[1]) % st["racket_every"] == 0]
+        tim["racket_frames"] = len(r_items)
+        if self.pose is not None and r_items:
+            self._racket(r_items, res, tim)
         if self.tn_run is not None:
             self._shuttle(items, res, tim)
         tim["all_ms"] = round((time.monotonic_ns() - t0) / 1e6, 2)
@@ -358,6 +387,125 @@ def _iou(a, b):
     return inter / u if u > 0 else 0.0
 
 
+# ------------------------------------------------------------------------------------------------ v2 worker processes
+def rs_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, realtime, out_q, ready_q, stop_ev, k_cal):
+    """v2 (round 8): racket / shuttle for `views` in a process of its own next to the pose processes - its own decode
+    of the same frames on the same clock (go event + t0 of the run), results straight to the 3D process. The pose
+    processes are untouched. When it falls more than exp_rs_behind_s behind the cameras it skips the racket (the most
+    expensive part) on that step; the shuttle always runs (TrackNet needs consecutive frames)."""
+    from analysis.live import cpulimits
+    from analysis.live import pose2d_fast as pf
+    cpulimits.apply(rcfg.get("_threads"))
+    readers = {}
+    try:
+        pf.check_cuda(device)
+        with pf.trt_lock(dict(rcfg, ep="trt")):
+            rs = RS2D(rcfg, device, "cuda")
+            for v in views:
+                kind = "camera" if pf.is_stream_url(paths[v]) else rcfg.get("decoder", "cv2")
+                readers[v] = pf.open_reader(kind, paths[v], int(plans[v][0]), fps, rcfg.get("decode_short_side"),
+                                            rcfg.get("decode_threads", 0))
+            r0 = readers[views[0]]
+            warm_s = rs.warmup((r0.out_h, r0.out_w))
+    except Exception as e:  # noqa: BLE001 - reported to the run, which stops
+        ready_q.put(("error", list(views), f"{type(e).__name__}: {e}"))
+        for r in readers.values():
+            r.close()
+        return
+    ready_q.put(("ready", list(views), {"providers": rs.providers, "ep": rs.ep, "warm_s": round(warm_s, 1),
+                                        "decode": [readers[views[0]].out_w, readers[views[0]].out_h]}))
+    while not go_ev.wait(0.05):
+        if stop_ev.is_set():
+            for r in readers.values():
+                r.close()
+            return
+    t0 = int(t0_val.value)
+    st = rs.s
+    inv = {v: float(k_cal.get(v, 1.0)) / readers[v].scale for v in views}
+    n = min(len(plans[v]) for v in views)
+    skipped = 0
+    try:
+        for k in range(n):
+            if stop_ev.is_set():
+                break
+            fr = [(v, int(plans[v][k])) for v in views]
+            t_av = max(t0 + int(max(0.0, f - origins[v]) / fps * 1e9) for v, f in fr)
+            if realtime:
+                now = time.monotonic_ns()
+                if now < t_av:
+                    time.sleep((t_av - now) / 1e9)
+            td = time.monotonic_ns()
+            items = []
+            for v, f in fr:
+                img = readers[v].read(f)
+                if img is not None:
+                    items.append((v, f, img, [], inv[v]))
+            if not items:
+                continue
+            lag = (time.monotonic_ns() - t_av) / 1e9 if realtime else 0.0
+            racket = not (realtime and lag > st["behind_s"])
+            skipped += not racket
+            t1 = time.monotonic_ns()
+            res = rs.process(items, racket=racket)
+            first = True
+            for v, f, *_ in items:
+                r = res[(v, f)]
+                if first:
+                    r.setdefault("t", {}).update(decode_ms=round((t1 - td) / 1e6, 2), behind_ms=round(lag * 1000, 1),
+                                                 skipped_racket=skipped)
+                    first = False
+                out_q.put(("2d", v, [r]))
+    except Exception as e:  # noqa: BLE001
+        out_q.put(("2d", views[0], [{"f": -1, "error": f"rs_worker: {type(e).__name__}: {e}"}]))
+    finally:
+        out_q.cancel_join_thread()          # the 3D process may have ended already: exit without flushing to it
+        for r in readers.values():
+            r.close()
+
+
+def start_workers(src, plan, origins, out_q, log=print, timeout_s=3600):
+    """Start the v2 racket / shuttle processes of a run (sources.VideoRtmlibSource after its pose processes are ready):
+    one per camera (exp_rs_group camera) or one for every camera (all). Returns the processes."""
+    from analysis.live import cpulimits
+    c = src.cfg
+    rc = dict(c["rtmpose"])
+    st = settings(rc)
+    cb = c.get("cpu_budget") or {}
+    rc["_threads"] = cb.get("pose2d")
+    if cb and not rc.get("decode_threads"):
+        rc["decode_threads"] = cb.get("decode")
+    k_cal = {v: float((c.get("video_to_calib") or {}).get(v, 1.0)) for v in c["views"]}
+    groups = [list(c["views"])] if st["group"] == "all" else [[v] for v in c["views"]]
+    ready_q = src.ctx.Queue()
+    procs = []
+    for g in groups:
+        p = src.ctx.Process(target=rs_worker, name="rs2d-" + "+".join(g), daemon=True,
+                            args=(g, {v: c["videos"][v] for v in g}, {v: list(plan[v]) for v in g},
+                                  {v: float(origins[v]) for v in g}, rc, c["device"], float(c["source_fps"]),
+                                  src.t0_val, src.go_ev, c["pace"] == "realtime", out_q, ready_q, src.stop_ev, k_cal))
+        with cpulimits.child_env(rc.get("_threads")):
+            p.start()
+        procs.append(p)
+    t_end = time.monotonic() + timeout_s
+    for _ in groups:
+        try:
+            kind, vs, info = ready_q.get(timeout=max(1.0, t_end - time.monotonic()))
+        except queue.Empty:
+            raise RuntimeError("racket / shuttle workers did not start in time") from None
+        if kind != "ready":
+            raise RuntimeError(f"racket / shuttle worker {vs}: {info}")
+        log(f"  racket / shuttle worker {'+'.join(vs)}: ready (warm-up {info['warm_s']} s), ep {info['ep']}, "
+            f"decode {info['decode'][0]}x{info['decode'][1]}")
+    return procs
+
+
+def stop_workers(procs, timeout_s=10):
+    for p in procs:
+        p.join(timeout_s)
+        if p.is_alive():
+            p.terminate()
+
+
 # ------------------------------------------------------------------------------------------------ sink (main process)
 class RSSink:
     """Created with each run's FrameWriter: starts the 3D process, forwards the 2D results and the written frames."""
@@ -462,6 +610,7 @@ class RS3D:
         self.rk, self.sh = {}, {}
         self.sh_max = {v: -1 for v in cams}
         self.rk_max = {v: -1 for v in cams}
+        self.prog = {v: -1 for v in cams}           # newest frame each camera's 2D has reached (any result)
         self.pending = deque()
         self.last = {}               # pid -> (step, FitResult)
         self.hand_votes = {}         # pid -> [left, right]
@@ -500,6 +649,8 @@ class RS3D:
             if "t" in e:
                 self.stats["worker"].append(e["t"])
             f = e.get("f")
+            if f is not None and f >= 0:
+                self.prog[view] = max(self.prog.get(view, -1), f)
             if "racket" in e:
                 self.rk[(view, f)] = [np.asarray(c["kp"], np.float64) for c in e["racket"]]
                 self.rk_max[view] = max(self.rk_max.get(view, -1), f)
@@ -523,7 +674,8 @@ class RS3D:
         for v, (frames, alpha) in self.steps.get(step, {}).items():
             if self.st["shuttle"] and self.sh_max.get(v, -1) < max(frames) + need:
                 return False
-            if self.st["racket"] and self.st["racket3d"] and self.rk_max.get(v, -1) < self._nearest(frames, alpha):
+            if self.st["racket"] and self.st["racket3d"] and \
+                    max(self.prog.get(v, -1), self.rk_max.get(v, -1)) < self._nearest(frames, alpha):
                 return False                # (2D arrives in frame order per camera: a later frame = this one is done)
         return True
 
@@ -577,8 +729,11 @@ class RS3D:
         by_hand = [{}, {}]
         dist = [0.0, 0.0]               # per hand: sum over views of the nearest handle's distance (metres, capped)
         seen = 0
+        reach = max(0, self.st.get("racket_every", 1) - 1) + 1      # racket every N frames / skipped when behind
         for v, (frames, alpha) in views.items():
-            cands = self.rk.get((v, self._nearest(frames, alpha)))
+            f0 = self._nearest(frames, alpha)
+            cands = next((self.rk[(v, f0 + d)] for d in sorted(range(-reach, reach + 1), key=abs)
+                          if (v, f0 + d) in self.rk), None)
             if not cands or v not in self.cams:
                 continue
             cam = self.cams[v]
@@ -981,7 +1136,7 @@ class RS3D:
                     "n": int(len(x))} if len(x) else None
         wk = {}
         for k in ("all_ms", "det_ms", "warp_ms", "pose_ms", "tn_ms", "tn_prep_ms", "crops", "tn_calls", "items",
-                  "backlog", "dropped"):
+                  "backlog", "dropped", "racket_frames", "decode_ms", "behind_ms", "skipped_racket"):
             wk[k] = stat([t[k] for t in s["worker"] if k in t])
         prov = next((t.get("providers") for t in s["worker"] if t.get("providers")), None)
         ep = next((t.get("ep") for t in s["worker"] if t.get("ep")), None)

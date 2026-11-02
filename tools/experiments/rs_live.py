@@ -75,8 +75,10 @@ def model_path(name, model_dir=MODELS):
 
 def session(name, ep="cpu", rcfg=None, shapes=None, model_dir=MODELS):
     """onnxruntime session for models/<name>.onnx: ep cpu | cuda | trt (TensorRT FP16 through pose2d_fast's helpers,
-    engines cached like the pose model's). Returns (run, providers)."""
+    engines cached like the pose model's) | trt32 (TensorRT FP32, its own engine cache). Returns (run, providers)."""
     import onnxruntime as ort
+    if ep == "trt32":
+        ep, rcfg = "trt", dict(rcfg or {}, trt_fp16=False)
     path = model_path(name, model_dir)
     if ep in ("cuda", "trt"):
         from analysis.live import pose2d_fast as pf

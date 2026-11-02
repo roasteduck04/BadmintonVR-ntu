@@ -9,7 +9,8 @@ panel there after v0.8.0).
 Compares the .cs files under Assets/Scripts and Assets/Editor of the Unity project with this repository's:
 - leftovers: in the project, not in the repo (old-style IMGUI UI flagged: OnGUI, or a retired viewer name);
 - out of date: in both, different content; missing: in the repo only;
-- the main scene: the AnalysisPlayer's useNewViewer switch, and components whose scripts are leftovers.
+- the main scene: the AnalysisPlayer's useNewViewer switch, and components whose scripts are leftovers;
+- the start file start-pipeline-server.bat in the project folder (missing / out of date; --update copies it there).
 --archive moves each leftover (+ its .meta) to <project>/_archive_old_scripts/<date>/... (outside Assets: Unity stops
 compiling it; nothing is deleted). --update copies the repo's out-of-date / missing scripts in (the replaced ones are
 archived the same way first). Close Unity before --archive / --update."""
@@ -27,6 +28,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FOLDERS = (os.path.join("Assets", "Scripts"), os.path.join("Assets", "Editor"))
 RETIRED = {"AnalysisViewerUI.cs": "old IMGUI viewer panel (archived in v0.8.0)"}
 SCENE = os.path.join("Assets", "badminton.unity")
+ROOT_FILES = ("start-pipeline-server.bat",)       # started from the Unity project folder on the lab PC
 
 
 def scripts(root):
@@ -101,6 +103,10 @@ def main(argv=None):
     print(f"\nMissing (in the repo only): {len(missing)}")
     for r in missing:
         print(f"  {r}")
+    root = [f for f in ROOT_FILES if os.path.exists(os.path.join(a.repo, f)) and
+            (not os.path.exists(os.path.join(proj, f)) or
+             not filecmp.cmp(os.path.join(a.repo, f), os.path.join(proj, f), shallow=False))]
+    print(f"\nStart files missing / out of date in the project folder: {', '.join(root) or 'none'}")
     scene = os.path.join(proj, SCENE)
     if os.path.exists(scene):
         with open(scene, encoding="utf-8", errors="replace") as fh:
@@ -132,6 +138,11 @@ def main(argv=None):
             if os.path.exists(mine[r] + ".meta"):
                 shutil.copy2(mine[r] + ".meta", dst + ".meta")
             print(f"  copied {r}")
+        for f in root:
+            if os.path.exists(os.path.join(proj, f)):
+                move_out(proj, f, stamp, print)
+            shutil.copy2(os.path.join(a.repo, f), os.path.join(proj, f))
+            print(f"  copied {f} (double-click it in the Unity project folder: it starts the server in WSL)")
     print("\nDone. Open Unity: it recompiles; if a component shows 'missing script', remove it from AnalysisPlayer.")
 
 
