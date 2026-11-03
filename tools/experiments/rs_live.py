@@ -87,7 +87,11 @@ def session(name, ep="cpu", rcfg=None, shapes=None, model_dir=MODELS):
         pf.preload_tensorrt()
         sess = pf.trt_session(path, dict(rcfg or {}), shapes)
     else:
-        prov = ["CUDAExecutionProvider", "CPUExecutionProvider"] if ep == "cuda" else ["CPUExecutionProvider"]
+        # cuDNN: onnxruntime's default EXHAUSTIVE search runs for every new batch size (minutes over a stream's
+        # warm-up sizes); HEURISTIC picks at once (rtmpose.exp_rs_cudnn_search exhaustive | heuristic | default)
+        search = str((rcfg or {}).get("exp_rs_cudnn_search") or "heuristic").upper()
+        prov = ([("CUDAExecutionProvider", {"cudnn_conv_algo_search": search}), "CPUExecutionProvider"]
+                if ep == "cuda" else ["CPUExecutionProvider"])
         so = ort.SessionOptions()
         if ep == "cpu" and rcfg and rcfg.get("_threads"):
             so.intra_op_num_threads = int(rcfg["_threads"])

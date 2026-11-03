@@ -119,7 +119,11 @@ def _attach_rs_sources(m):
         orig_start(self, plan, origins, ready_timeout_s)
         st = rs_stream.settings(self.cfg.get("rtmpose"))
         if st and st["mode"] == "process" and rs_stream.CURRENT is not None:
-            self._rs_procs = rs_stream.start_workers(self, plan, origins, rs_stream.CURRENT.q, log=self.log)
+            try:
+                self._rs_procs = rs_stream.start_workers(self, plan, origins, rs_stream.CURRENT.q, log=self.log)
+            except Exception:
+                orig_close(self)              # a racket / shuttle worker failed to start: stop the pose processes too
+                raise
 
     def close(self):
         try:

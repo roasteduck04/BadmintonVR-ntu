@@ -3,7 +3,7 @@ code is edited; Unity frames and the server are untouched). Off unless a test se
 
 2D (RS2D). v2 (round 8, exp_rs_mode=process, the default): in rs_worker processes of their own next to the pose
 processes (one per camera, or one for all with exp_rs_group=all), each decoding the same frames on the run's clock;
-racket detector on TensorRT FP16, racket keypoints on CUDA FP32 (exp_racket_pose_ep trt32 = TensorRT FP32), TrackNet
+racket detector on TensorRT FP16, racket keypoints on TensorRT FP32 (exp_racket_pose_ep cuda = CUDA FP32), TrackNet
 on TensorRT; exp_racket_every 2 = the racket on every 2nd frame (the 3D uses the nearest frame that has one), and a
 worker more than exp_rs_behind_s behind the cameras skips the racket until it catches up. Round 6
 (exp_rs_mode=inline): inside each 2D process, after the pose model, on the frame that is already decoded:
@@ -95,9 +95,11 @@ class RS2D:
     def __init__(self, rcfg, device, ep):
         self.s = st = settings(rcfg)
         cpu = device != "cuda"
-        if st["mode"] == "process":               # v2 defaults: detector TensorRT FP16, keypoints CUDA FP32
+        if st["mode"] == "process":               # v2 defaults: detector TensorRT FP16, keypoints TensorRT FP32
             e_det = "cpu" if cpu else (st["racket_det_ep"] or st["racket_ep"] or "trt")
-            e_r = "cpu" if cpu else (st["racket_pose_ep"] or st["racket_ep"] or "cuda")
+            # lab bench (round 8): TensorRT FP32 = CUDA FP32 (1 % of keypoints > 20 px apart vs 24 % in FP16) and
+            # faster; CUDA's default exhaustive cuDNN search per batch size also made the start-up take minutes
+            e_r = "cpu" if cpu else (st["racket_pose_ep"] or st["racket_ep"] or "trt32")
             e_s = "cpu" if cpu else (st["shuttle_ep"] or "trt")
         else:                                     # round 6 (inline): one ep for both racket models
             e_r = "cpu" if cpu else (st["racket_pose_ep"] or st["racket_ep"] or ep)
@@ -396,11 +398,18 @@ def rs_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, re
     from analysis.live import cpulimits
     from analysis.live import pose2d_fast as pf
     cpulimits.apply(rcfg.get("_threads"))
+    name = "+".join(views)
     readers = {}
     try:
         pf.check_cuda(device)
+        t_wait = time.monotonic()
         with pf.trt_lock(dict(rcfg, ep="trt")):
+            t_in = time.monotonic()
+            print(f"  racket / shuttle worker {name}: loading the models (waited {t_in - t_wait:.1f} s for the "
+                  "TensorRT lock)", flush=True)
             rs = RS2D(rcfg, device, "cuda")
+            print(f"  racket / shuttle worker {name}: models loaded in {time.monotonic() - t_in:.1f} s ({rs.ep}), "
+                  "warming up", flush=True)
             for v in views:
                 kind = "camera" if pf.is_stream_url(paths[v]) else rcfg.get("decoder", "cv2")
                 readers[v] = pf.open_reader(kind, paths[v], int(plans[v][0]), fps, rcfg.get("decode_short_side"),
@@ -463,9 +472,11 @@ def rs_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, re
             r.close()
 
 
-def start_workers(src, plan, origins, out_q, log=print, timeout_s=3600):
+def start_workers(src, plan, origins, out_q, log=print, timeout_s=3600, poll_s=5.0, report_s=30.0):
     """Start the v2 racket / shuttle processes of a run (sources.VideoRtmlibSource after its pose processes are ready):
-    one per camera (exp_rs_group camera) or one for every camera (all). Returns the processes."""
+    one per camera (exp_rs_group camera) or one for every camera (all). Returns the processes. While they start, a
+    process that ends without saying "ready" stops the run at once (its error is in the run log above), and every
+    report_s seconds the log says which are still loading (a first TensorRT build can take minutes)."""
     from analysis.live import cpulimits
     c = src.cfg
     rc = dict(c["rtmpose"])
@@ -486,16 +497,33 @@ def start_workers(src, plan, origins, out_q, log=print, timeout_s=3600):
         with cpulimits.child_env(rc.get("_threads")):
             p.start()
         procs.append(p)
-    t_end = time.monotonic() + timeout_s
-    for _ in groups:
+    t0 = time.monotonic()
+    t_end, t_report = t0 + timeout_s, t0 + report_s
+    waiting = {"+".join(g): p for g, p in zip(groups, procs)}
+    while waiting:
         try:
-            kind, vs, info = ready_q.get(timeout=max(1.0, t_end - time.monotonic()))
+            kind, vs, info = ready_q.get(timeout=poll_s)
         except queue.Empty:
-            raise RuntimeError("racket / shuttle workers did not start in time") from None
+            now = time.monotonic()
+            dead = {n: p.exitcode for n, p in waiting.items() if not p.is_alive()}
+            if dead:
+                stop_workers(procs, timeout_s=2)
+                raise RuntimeError("racket / shuttle worker " + ", ".join(f"{n} (exit code {c})" for n, c in dead.items())
+                                   + " stopped while starting: its error is in the run log above") from None
+            if now > t_end:
+                stop_workers(procs, timeout_s=2)
+                raise RuntimeError(f"racket / shuttle workers {sorted(waiting)} did not start in {timeout_s:.0f} s") from None
+            if now > t_report:
+                log(f"  still waiting for racket / shuttle workers {sorted(waiting)} ({now - t0:.0f} s)")
+                t_report = now + report_s
+            continue
+        n = "+".join(vs)
+        waiting.pop(n, None)
         if kind != "ready":
-            raise RuntimeError(f"racket / shuttle worker {vs}: {info}")
-        log(f"  racket / shuttle worker {'+'.join(vs)}: ready (warm-up {info['warm_s']} s), ep {info['ep']}, "
-            f"decode {info['decode'][0]}x{info['decode'][1]}")
+            stop_workers(procs, timeout_s=2)
+            raise RuntimeError(f"racket / shuttle worker {n}: {info}")
+        log(f"  racket / shuttle worker {n}: ready (warm-up {info['warm_s']} s), ep {info['ep']}, "
+            f"decode {info['decode'][0]}x{info['decode'][1]} ({time.monotonic() - t0:.0f} s after the pose)")
     return procs
 
 

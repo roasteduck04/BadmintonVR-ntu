@@ -163,10 +163,10 @@ P4 32 % of 300 frames) at ~26 ms per frame (four players; Z19 shows whether it k
 
 Round 8 (`lab_5090_r8`: racket / shuttle v2 in processes of their own; models alone with TensorRT FP32 ~5 min, then
 10 streams ~25 min). v2 is the default now (`rtmpose.exp_rs_mode=process`; the round-6 plans set `inline` to run as
-they did). Keys: `exp_rs_group camera|all`, `exp_racket_det_ep` (default trt), `exp_racket_pose_ep` (default cuda;
-`trt32` = TensorRT FP32), `exp_racket_every N`, `exp_rs_behind_s` (default 0.25), `exp_racket_flip`,
-`exp_racket_refine` (default off). The start file is copied into the Unity project folder too (double-click it there:
-it starts the server in WSL by itself):
+they did). Keys: `exp_rs_group camera|all`, `exp_racket_det_ep` (default trt), `exp_racket_pose_ep` (default trt32 =
+TensorRT FP32 since the bench below; `cuda` = CUDA FP32), `exp_racket_every N`, `exp_rs_behind_s` (default 0.25),
+`exp_racket_flip`, `exp_racket_refine` (default off), `exp_rs_cudnn_search` (CUDA sessions; default heuristic). The start
+file is copied into the Unity project folder too (double-click it there: it starts the server in WSL by itself):
 
 ```bash
 cd ~/BadmintonVR && source ~/venv-pc/bin/activate && git fetch && git checkout test/r5-experiments && git pull
@@ -175,12 +175,34 @@ U=/mnt/c/Users/sports_1/BadmintonVR-unity
 cp start-pipeline-server.bat $U/
 python tools/experiments/rs_bench.py --ep cuda,trt,trt32 --out $U/runs/campaign/lab_5090_r8/rs_bench_3cam
 python tools/live_run.py campaign run --plan lab_5090_r8 --group main --unity-project $U
+python tools/live_run.py campaign run --plan lab_5090_1cam --group main --unity-project $U   # v0.8.7 one camera
 ```
 
 Laptop check of v2 (CPU, 3 cameras at 4K, 30 fps as fast as it runs, detector + keypoints every 2nd frame + shuttle,
 45 frames): three racket / shuttle processes next to the three pose processes, results straight to the 3D; P1 racket
 fitted in 45 / 45 frames, P2 (far) 7 / 40, shuttle in 18 frames once its background was built; no errors. The
-`trt32` bench builds the FP32 engines once (a few minutes, cached for R05). Copy back
+`trt32` bench builds the FP32 engines once (a few minutes, cached for the streams).
+
+Models alone on the lab PC (2026-11-03, 3 cameras, 1080p; CUDA / TensorRT FP16 / TensorRT FP32): detector, 3 cameras in
+one call 14.4 / 9.5 / 12.4 ms; keypoints, 16 crops with flip 18.6 / 14.3 / 17.2 ms (no flip 7.6 / 4.7 / 6.4); TrackNet
+per camera frame every 8 frames 1.5 / 1.1 / 1.2 ms. Against CUDA FP32 on the same crops: **FP16 moves 24 % of the racket
+keypoints by more than 20 px** (79 px p95), FP32 1 % (0.3 px p95); detector boxes IoU 0.99 / 1.0; TrackNet identical.
+So the keypoints run on TensorRT FP32 by default (R05 = CUDA for comparison).
+
+The first R02 (keypoints on CUDA) sat for minutes before streaming: onnxruntime's CUDA default searches cuDNN algorithms
+exhaustively for every new batch size, in three processes one after another. CUDA sessions now pick heuristically, the
+racket / shuttle processes print their progress to the run log, and one that dies while starting stops the test at once
+(it waited silently for up to an hour). **A campaign runs each test in its own session: Ctrl+C stops only the campaign,
+the test keeps running.** Stop a stuck test (and free the GPU) with its process group:
+
+```bash
+ps -eo pid,etime,args | grep "[l]ive_run.py run"       # the test's PID
+kill -- -<PID>                                         # it and its 2D / racket / shuttle processes
+nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+tail -n 40 $U/runs/campaign/lab_5090_r8/R02_v2_cam/campaign.log     # what the test printed
+```
+
+Copy back
 `C:\Users\sports_1\BadmintonVR-unity\runs\campaign\lab_5090_r8.zip`; on the laptop `python tools/experiments/rs_report.py
 <zip>` plus `campaign report` for the pose columns.
 
