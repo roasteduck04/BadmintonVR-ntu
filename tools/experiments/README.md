@@ -117,6 +117,26 @@ Laptop results (2026-10-31, CPU):
   60 fps target (falls behind; 4 fit workers change nothing: the 2D is the limit); **30 fps on 3 cameras keeps up**
   (D03: 2D lag flat 20 ms, 0.94x, delay 1.17 s, 2.87 cm).
 
+### Lab results, round 8 (2026-11-03, `runs/campaign_in/lab_5090_r8/`: summary.md, rs_report.md, rs_bench_3cam)
+
+- **Racket / shuttle in processes of their own do not reach 60 fps either.** Pose alone (R01) 55 fps, 2D lag flat; with
+  any v2 process the pose drops to 45-49 fps and its 2D falls behind (lag 0.8 -> 2.3 s in 10 s) - even shuttle only
+  (R07, 45.5 fps; round 6 inline shuttle 49). Two costs that inline did not have: every racket / shuttle process decodes
+  the same 4K video again (~10 ms per frame on average, 30 ms p90 spikes) and six processes share the GPU by
+  time-slicing (no MPS on WSL): the pose model step 14.8 -> 17.6 ms median.
+- **The workers themselves fall behind:** each starts ~0.4 s late (its first frame) and the racket costs ~24 ms per
+  frame (detector 11.6 + keypoints 12.0 ms) against 16.7 ms at 60 fps, so it never catches up: the racket was skipped
+  on nearly every step (R02 600 of ~600, fitted 15 % / 1 % of frames); shuttle only still drifts 0.4 -> 0.8-1.3 s.
+  One process for all cameras (R03) is worse (3.8 s behind: three videos decoded in turn).
+- **Shuttle quality holds** while behind: 67 % of frames, 8.3 cm (round 6: 64 %, 8.3 cm); 28 s run 84 %, 7.6 cm.
+- **Doubles at 30 fps (R09):** the racket runs part of the time (workers ~0.25 s behind, 173 of 300 steps skipped):
+  fitted 41-62 % of frames, head 4-17 cm; pose 22.7 / 30 fps. 5 cameras at 30 fps (R08) 20.6 / 30 fps.
+- Start-up after the fix: the three workers ready 2-5 s after the pose (models 1.2-1.4 s, warm-up 0.2 s each);
+  TensorRT FP32 keypoints vs CUDA cannot be told apart in the streams (both mostly skipped) - the bench decides it.
+- Next (not built): the racket / shuttle work must not decode again nor add GPU processes - hand the pose processes'
+  decoded frames over (shared memory) to one racket / shuttle process, or GPU video decoding (NVDEC), and / or the
+  racket at 30 fps without the flip test.
+
 Every run also records its 3D inputs (`rs_inputs.jsonl.gz`), so 3D settings are compared on the laptop afterwards
 (`rs_replay.py run <run> --set shuttle3d=tri ...`) instead of in more lab runs.
 
