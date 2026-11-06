@@ -80,7 +80,7 @@ async function loadSource() {
   $("#src-msg").textContent = "";
   await camCalibStatus();
   renderSourceKind(); await renderClip();
-  sidebar();
+  sidebar(); testcamsStatus();
 }
 
 async function camCalibStatus() {
@@ -165,6 +165,44 @@ $("#src-test").addEventListener("click", async () => {
     });
   } catch (e) { toast(e.message, 7000); }
 });
+// v0.8.7 one-click test cameras: the server plays the clip's ticked angles as looping cameras and saves them as the source
+function renderTestcams(s) {
+  const note = $("#src-testcams-note"), b = $("#src-testcams");
+  if (s && s.running) {
+    const c = clipOf(s.clip);
+    note.innerHTML = `<b>Test cameras on</b>: ${s.views.map(pretty).join(", ")} - ${esc(c ? c.label : s.clip)}${s.variant ? ` (${esc(s.variant)} copies)` : ""} looping from ${s.start_s} s.
+      <button class="btn small" id="src-testcams-stop">Stop test cameras</button>`;
+    $("#src-testcams-stop").addEventListener("click", async () => {
+      try { renderTestcams(await api("/api/testcams/stop", {})); } catch (e) { toast(e.message, 7000); }
+    });
+    b.textContent = "▶ Restart test cameras";
+  } else {
+    note.textContent = s && s.error ? `Test cameras stopped: ${s.error}` : "";
+    b.textContent = "▶ Test cameras from the clip";
+  }
+}
+async function testcamsStatus() {
+  try { renderTestcams(await api("/api/testcams")); } catch (e) { /* older server */ }
+}
+$("#src-testcams").addEventListener("click", async () => {
+  const c = clipOf(src.clip), b = $("#src-testcams");
+  if (!c) return;
+  b.disabled = true;
+  $("#src-testcams-note").textContent = "Starting the test cameras (opening the videos)…";
+  try {
+    const r = await api("/api/testcams/start", { clip: src.clip, views: src.views[src.clip] || c.live_views,
+      variant: $("#src-variant").value || null });                // Video size: smaller copies decode faster
+    state.input = r.input;
+    src.kind = "camera"; src.cams = r.input.cameras.map((x) => ({ ...x }));
+    $("#src-fps").value = r.input.fps;
+    await camCalibStatus(); renderSourceKind(); sidebar(); renderTestcams(r.status);
+    $("#src-msg").textContent = `Saved: ${r.status.views.length} test camera${r.status.views.length === 1 ? "" : "s"} `
+      + "(the clip's calibrations apply). Warm up again in step 3.";
+    $("#src-test").click();                         // a frame from each camera
+  } catch (e) { toast(e.message, 8000); $("#src-testcams-note").textContent = ""; }
+  finally { b.disabled = false; }
+});
+
 $("#src-save").addEventListener("click", async () => {
   const c = clipOf(src.clip);
   const body = { kind: src.kind, clip: src.clip, views: src.views[src.clip] || c.live_views,
