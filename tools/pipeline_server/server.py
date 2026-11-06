@@ -48,6 +48,8 @@ UNITY_STATUS = "unity_status.json"
 UNITY_STALE_S = 3.0              # no heartbeat for this long = Unity is not in Play mode
 INPUT_FILE = "input.json"        # v0.8.4 Source tab (in the runs folder: machine-specific camera addresses)
 THUMB_W = 240                    # Test cameras preview width (px)
+TEST_CAM_PORT = 8090             # v0.8.7 one-click test cameras (tools/fake_camera.py)
+TESTCAMS_PID = "testcams.pid"    # in the runs folder: the test cameras' process, stopped by the next start
 # settings the warm-up depends on: changing one after the warm-up means warming up again
 WARM_PREFIXES = ("backend", "rtmpose.", "cpu.", "warmup.", "sync.offsets", "video_variant", "input.", "device")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
@@ -234,6 +236,7 @@ class Server:
         self._np_lock = threading.Lock()
         self.warm_request = None         # {clip, warm: {key: value}} of the last warm-up sent to the engine
         self._beat = {"t": None, "mono": 0.0}   # last heartbeat stamp seen + when (this process's monotonic clock)
+        self.testcams = None             # v0.8.7 test cameras job (runs next to the engine / stream job)
 
     # ------------------------------------------------------------------ catalogue
     @property
@@ -515,32 +518,123 @@ class Server:
         out = ["input.kind=video"] + ([f"video_variant={d['video_variant']}"] if d.get("video_variant") else [])
         return out + ([f"views=[{', '.join(d['views'])}]"] if d.get("views") else [])
 
-    def test_cameras(self, cams) -> dict:
-        """One frame from every camera address: {view: {ok, size, ms, thumb (JPEG data URL) | error}}."""
+    def test_cameras(self, cams, timeout_s=5.0) -> dict:
+        """One frame from every camera address (all at once, each given timeout_s to open and to send a frame):
+        {view: {ok, size, ms, thumb (JPEG data URL) | error}}."""
+        from concurrent.futures import ThreadPoolExecutor
+        cams = dict(cams or {})
+        if not cams:
+            return {}
+        with ThreadPoolExecutor(max_workers=len(cams)) as ex:
+            return dict(zip(cams, ex.map(lambda u: self._test_camera(u, timeout_s), cams.values())))
+
+    @staticmethod
+    def _test_camera(url, timeout_s) -> dict:
         import base64
         import cv2
-        out = {}
-        for v, url in (cams or {}).items():
-            t = time.perf_counter()
-            if "://" not in str(url):
-                out[v] = {"ok": False, "error": "not a stream address"}
-                continue
-            cap = cv2.VideoCapture(str(url), cv2.CAP_FFMPEG)
-            try:
-                ok, img = cap.read() if cap.isOpened() else (False, None)
-            finally:
-                cap.release()
-            if not ok or img is None:
-                out[v] = {"ok": False, "error": "no frames (address, port, firewall?)"}
-                continue
-            h, w = img.shape[:2]
-            ms = round(1000 * (time.perf_counter() - t))
-            s = THUMB_W / w
-            ok, buf = cv2.imencode(".jpg", cv2.resize(img, (THUMB_W, max(1, round(h * s))), interpolation=cv2.INTER_AREA),
-                                   [cv2.IMWRITE_JPEG_QUALITY, 75])
-            out[v] = {"ok": True, "size": [int(w), int(h)], "ms": ms,
-                      "thumb": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else None}
-        return out
+        t = time.perf_counter()
+        if "://" not in str(url):
+            return {"ok": False, "error": "not a stream address"}
+        ms = int(timeout_s * 1000)
+        cap = cv2.VideoCapture(str(url), cv2.CAP_FFMPEG,
+                               [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, ms, cv2.CAP_PROP_READ_TIMEOUT_MSEC, ms])
+        try:
+            ok, img = cap.read() if cap.isOpened() else (False, None)
+        finally:
+            cap.release()
+        if not ok or img is None:
+            return {"ok": False, "error": f"no frame in {timeout_s:g} s (address, port, firewall?)"}
+        h, w = img.shape[:2]
+        ms = round(1000 * (time.perf_counter() - t))
+        s = THUMB_W / w
+        ok, buf = cv2.imencode(".jpg", cv2.resize(img, (THUMB_W, max(1, round(h * s))), interpolation=cv2.INTER_AREA),
+                               [cv2.IMWRITE_JPEG_QUALITY, 75])
+        return {"ok": True, "size": [int(w), int(h)], "ms": ms,
+                "thumb": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else None}
+
+    # ------------------------------------------------------------------ v0.8.7 one-click test cameras
+    def testcams_status(self) -> dict:
+        j = self.testcams
+        on = j is not None and j.running
+        m = j.meta if j is not None else {}
+        err = None
+        if j is not None and not on and not j._stop_requested:
+            err = j.error or (list(j.lines)[-1] if j.lines else f"exit code {j.returncode}")
+        return {"running": on, "clip": m.get("clip"), "views": list(m.get("views") or []), "start_s": m.get("start_s"),
+                "urls": dict(m.get("urls") or {}), "port": m.get("port"), "variant": m.get("variant"), "error": err}
+
+    def testcams_start(self, clip=None, views=None, port=TEST_CAM_PORT, ready_s=30.0, variant=None) -> dict:
+        """Play the clip's chosen angles as looping live cameras (tools/fake_camera.py, http://localhost:<port>/<angle>.mjpg,
+        from the clip's live section) and switch the Source step to them. The cameras are named after the angles, so
+        the clip's calibrations apply; the next warm-up measures their offsets as for real cameras."""
+        clips = {c["name"]: c for c in self.clips()}
+        inp = self.get_input()
+        clip = clip or inp["clip"]
+        if clip not in clips:
+            raise HTTPException(400, f"unknown clip {clip!r}")
+        c = clips[clip]
+        same = inp.get("clip") == clip and inp.get("views")
+        views = [str(v) for v in (views or (inp["views"] if same else c["live_views"]))]
+        bad = [v for v in views if v not in c["views"]]
+        if bad or not views:
+            raise HTTPException(400, f"{bad} are not angles of {clip}" if bad else "pick at least 1 angle")
+        self.testcams_stop()
+        self._stop_stale_testcams()
+        if port_open(port):
+            raise HTTPException(409, f"port {port} is in use (a fake_camera.py started by hand?): stop it, then try again")
+        start_s = float((c.get("section_s") or [0.0])[0] or 0.0)
+        if variant and variant not in self.video_variants(clip):
+            raise HTTPException(400, f"no {variant!r} copies of {clip}")
+        argv = jobmod.python_cmd(str(self.repo / "tools" / "fake_camera.py"), "--clip", clip, "--views", ",".join(views),
+                                 "--port", str(port), "--host", "127.0.0.1", "--start-s", f"{start_s:g}")
+        if variant:                                      # lighter to decode (a laptop cannot decode three 4K videos)
+            argv += ["--variant", str(variant)]
+        urls = {v: f"http://localhost:{port}/{v}.mjpg" for v in views}
+        j = jobmod.Job("testcams", argv, cwd=str(self.repo), title=f"test cameras · {clip}",
+                       meta={"clip": clip, "views": views, "start_s": start_s, "urls": urls, "port": port,
+                             "variant": variant})
+        j.start()
+        self.testcams = j
+        (self.runs / TESTCAMS_PID).write_text(str(j.proc.pid), encoding="utf-8")
+        t_end = time.monotonic() + ready_s
+        while not port_open(port):                       # the cameras open their videos before the server listens
+            if not j.running:
+                raise HTTPException(500, f"the test cameras stopped: {self.testcams_status()['error']}")
+            if time.monotonic() > t_end:
+                self.testcams_stop()
+                raise HTTPException(504, f"the test cameras did not start in {ready_s:.0f} s")
+            time.sleep(0.3)
+        saved = self.set_input({"kind": "camera", "clip": clip, "views": inp["views"] if same else views,
+                                "cameras": [{"name": v, "url": urls[v], "use": True} for v in views],
+                                "fps": video_fps(self.repo, clip, views[0]), "max_minutes": inp.get("max_minutes", 5),
+                                "video_variant": None})
+        return {"status": self.testcams_status(), "input": saved}
+
+    def testcams_stop(self) -> dict:
+        if self.testcams is not None and self.testcams.running:
+            self.testcams.stop()
+        pf = self.runs / TESTCAMS_PID
+        if pf.exists() and (self.testcams is None or self.testcams.proc is None
+                            or pf.read_text(encoding="utf-8").strip() == str(self.testcams.proc.pid)):
+            pf.unlink()
+        return self.testcams_status()
+
+    def _stop_stale_testcams(self):
+        """Test cameras left by an earlier server (its window closed without stopping them) still hold the port."""
+        pf = self.runs / TESTCAMS_PID
+        if not pf.exists():
+            return
+        try:
+            import psutil
+            pr = psutil.Process(int(pf.read_text(encoding="utf-8").strip()))
+            if any("fake_camera.py" in str(a) for a in pr.cmdline()):
+                for ch in pr.children(recursive=True):
+                    ch.kill()
+                pr.kill()
+                pr.wait(5)
+        except Exception:  # noqa: BLE001 - gone already / not ours / psutil missing
+            pass
+        pf.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------ v0.8.4 live engine
     def engine_job(self):
@@ -660,6 +754,30 @@ class Server:
             time.sleep(0.2)
 
 
+def port_open(port, host="127.0.0.1", timeout_s=0.3) -> bool:
+    """Something listens on host:port."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.settimeout(timeout_s)
+        return sk.connect_ex((host, int(port))) == 0
+
+
+def video_fps(repo, clip, view) -> float:
+    """The frame rate the test cameras send: the clip's video of that angle (60 if it cannot be read)."""
+    try:
+        import cv2
+        from analysis.pose24 import config as p24config
+        reg = p24config.load_registry()
+        e = reg[clip]
+        vids = (reg.get(e.get("base"), e) if e.get("base") else e).get("videos") or {}
+        cap = cv2.VideoCapture(str(Path(repo) / vids[view]) if not os.path.isabs(vids[view]) else vids[view])
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        cap.release()
+        return round(fps, 3) if fps > 0 else 60.0
+    except Exception:  # noqa: BLE001
+        return 60.0
+
+
 def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=8770) -> FastAPI:
     app = FastAPI(title="BadmintonVR pipeline server")
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts) + ["testserver"])
@@ -766,8 +884,24 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
 
     @app.post("/api/input/test")
     async def input_test(request: Request):
+        from starlette.concurrency import run_in_threadpool     # off the event loop: the page keeps answering
         b = await request.json()
-        return server.test_cameras(b.get("cameras") or server.used_cameras())
+        return await run_in_threadpool(server.test_cameras, b.get("cameras") or server.used_cameras())
+
+    @app.get("/api/testcams")
+    def testcams_get():
+        return server.testcams_status()
+
+    @app.post("/api/testcams/start")
+    async def testcams_start(request: Request):
+        from starlette.concurrency import run_in_threadpool
+        b = await request.json()
+        return await run_in_threadpool(lambda: server.testcams_start(b.get("clip"), b.get("views"),
+                                                                     variant=b.get("variant") or None))
+
+    @app.post("/api/testcams/stop")
+    def testcams_stop():
+        return server.testcams_stop()
 
     @app.get("/api/job")
     def job_status():
@@ -850,6 +984,8 @@ def main(argv=None):
         sys.exit("refusing a non-loopback --host without --allow-host <name> (the name LAN browsers use)")
     os.chdir(REPO)
     server = Server(a.unity_project, a.runs_dir, a.machine)
+    import atexit
+    atexit.register(server.testcams_stop)                # test cameras end with the server
     hosts = ["127.0.0.1", "localhost"] + [h.lower() for h in a.allow_host]
     app = create_app(server, hosts, a.port)
     print(f"pipeline server: http://127.0.0.1:{a.port}  (machine preset {server.machine}, runs in {server.runs})")

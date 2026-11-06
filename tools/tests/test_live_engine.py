@@ -266,3 +266,57 @@ def test_engine_job_phases_from_status_lines():
     assert all(p["state"] == "done" for p in j.phases) and j.engine["last_stream"]["written"] == 90
     j._engine_line(json.dumps({"ev": "error", "message": "bad", "cmd": "stream"}))
     assert j.engine["error"]["message"] == "bad"
+
+
+# ------------------------------------------------------------------ v0.8.7 one-click test cameras
+class _FakeCamJob:
+    """Stands in for jobs.Job: no process (the real fake_camera.py needs the clip's videos)."""
+    started = []
+
+    def __init__(self, kind, argv, cwd, title="", meta=None, **kw):
+        self.kind, self.argv, self.meta, self.lines = kind, list(argv), dict(meta or {}), []
+        self.running, self._stop_requested, self.error, self.returncode = False, False, None, None
+        self.proc = type("P", (), {"pid": 4242})()
+
+    def start(self):
+        self.running = True
+        _FakeCamJob.started.append(self.argv)
+        return self
+
+    def stop(self, timeout_s=10.0):
+        self.running, self._stop_requested = False, True
+
+
+def test_server_test_cameras_one_click(tmp_path, monkeypatch):
+    srv, s = _server(tmp_path)
+    _FakeCamJob.started = []
+    monkeypatch.setattr(srv.jobmod, "Job", _FakeCamJob)
+    answers = iter([False] + [True] * 20)              # the port is free, then the cameras listen
+    monkeypatch.setattr(srv, "port_open", lambda port, *a, **k: next(answers))
+    monkeypatch.setattr(srv, "video_fps", lambda repo, clip, view: 60.0)
+    s.set_input({"kind": "video", "clip": "singles_05x", "views": ["back_051", "frontleft_051"]})
+    r = s.testcams_start()
+    a = _FakeCamJob.started[-1]
+    assert a[1].endswith("fake_camera.py") and a[a.index("--clip") + 1] == "singles_05x"
+    assert a[a.index("--views") + 1] == "back_051,frontleft_051" and a[a.index("--start-s") + 1] == "6.5"
+    inp = r["input"]
+    assert inp["kind"] == "camera" and [c["name"] for c in inp["cameras"]] == ["back_051", "frontleft_051"]
+    assert inp["cameras"][0] == {"name": "back_051", "url": "http://localhost:8090/back_051.mjpg", "use": True}
+    assert inp["fps"] == 60.0 and inp["views"] == ["back_051", "frontleft_051"]      # the video angles are kept
+    assert "views=[back_051, frontleft_051]" in s.input_sets()
+    assert r["status"]["running"] and (tmp_path / "runs" / "testcams.pid").read_text() == "4242"
+    st = s.testcams_stop()
+    assert not st["running"] and st["error"] is None and not (tmp_path / "runs" / "testcams.pid").exists()
+
+
+def test_server_test_cameras_refuse_a_busy_port_and_bad_angles(tmp_path, monkeypatch):
+    srv, s = _server(tmp_path)
+    from fastapi import HTTPException
+    monkeypatch.setattr(srv.jobmod, "Job", _FakeCamJob)
+    monkeypatch.setattr(srv, "port_open", lambda port, *a, **k: True)
+    with pytest.raises(HTTPException) as e:
+        s.testcams_start("singles_05x", ["back_051"])
+    assert e.value.status_code == 409 and "8090" in e.value.detail
+    with pytest.raises(HTTPException) as e:
+        s.testcams_start("singles_05x", ["back_11"])
+    assert e.value.status_code == 400

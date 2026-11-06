@@ -6,6 +6,8 @@ source without Raspberry Pis. Run from the repository root:
 
 Every camera runs on one shared clock from the moment the server starts, like real cameras that are already
 recording: a viewer that connects later gets the frame of "now", not the first frame; at the end of the video it loops.
+A camera behind the clock skips frames but still sends one at least every MIN_EMIT_S (v0.8.7: on a laptop the three
+4K videos never caught up after the seek to --start-s, so the skip loop never sent a single frame).
 Frames are shrunk to --short-side (default 1080) and JPEG-encoded (--quality); the live run rescales the 2D to the
 4K calibration (config video_to_calib), as for a real camera of another resolution. --variant reads the
 `live_run.py transcode` copies (e.g. 720p: much lighter to decode than the 4K originals on a laptop).
@@ -31,6 +33,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 BOUNDARY = "bvrframe"
+MIN_EMIT_S = 0.25                # a camera behind the clock still sends a frame this often
 
 
 class Camera(threading.Thread):
@@ -64,12 +67,14 @@ class Camera(threading.Thread):
             cap = cv2.VideoCapture(self.path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, first)
             f = first
+            last_emit = 0.0
             while self.running:
                 due = self.t_start + (f - first) / self.fps                  # this frame's moment on the shared clock
-                ahead = due - time.monotonic()
+                now = time.monotonic()
+                ahead = due - now
                 if ahead > 0:
                     time.sleep(ahead)
-                elif ahead < -1.0 / self.fps:                                # behind: skip, like a live camera
+                elif ahead < -1.0 / self.fps and now - last_emit < MIN_EMIT_S:   # behind: skip, like a live camera
                     if not cap.grab():
                         break
                     f += 1
@@ -86,6 +91,7 @@ class Camera(threading.Thread):
                     with self.cond:
                         self.jpeg, self.seq, self.size = buf.tobytes(), self.seq + 1, (tw, th)
                         self.cond.notify_all()
+                    last_emit = time.monotonic()
                 f += 1
             cap.release()
             self.t_start, first = time.monotonic(), 0                        # loop from the start of the video
