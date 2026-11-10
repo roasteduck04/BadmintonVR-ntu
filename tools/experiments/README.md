@@ -212,8 +212,10 @@ So the keypoints run on TensorRT FP32 by default (R05 = CUDA for comparison).
 The first R02 (keypoints on CUDA) sat for minutes before streaming: onnxruntime's CUDA default searches cuDNN algorithms
 exhaustively for every new batch size, in three processes one after another. CUDA sessions now pick heuristically, the
 racket / shuttle processes print their progress to the run log, and one that dies while starting stops the test at once
-(it waited silently for up to an hour). **A campaign runs each test in its own session: Ctrl+C stops only the campaign,
-the test keeps running.** Stop a stuck test (and free the GPU) with its process group:
+(it waited silently for up to an hour). Since 2026-11-10 Ctrl+C on a campaign stops the running test too (status `interrupted`) and still packs the zip, and a
+re-run test starts in an empty folder (the earlier attempt is kept in `_attempts/`; before that a second run appended
+to the first one's `timing.jsonl` - **round 8's R02 has both attempts' windows in its numbers**). A test left over
+from an older campaign version is stopped by hand with its process group:
 
 ```bash
 ps -eo pid,etime,args | grep "[l]ive_run.py run"       # the test's PID

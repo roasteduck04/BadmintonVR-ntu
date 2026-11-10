@@ -320,3 +320,407 @@ def test_server_test_cameras_refuse_a_busy_port_and_bad_angles(tmp_path, monkeyp
     with pytest.raises(HTTPException) as e:
         s.testcams_start("singles_05x", ["back_11"])
     assert e.value.status_code == 400
+
+
+# ------------------------------------------------------------------ v0.8.7 USB cameras on this PC
+def test_fake_camera_quit_token_and_webcam_names():
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import urllib.error
+    import urllib.request
+    import fake_camera
+    quits = []
+    srv = fake_camera.ThreadingServer(("127.0.0.1", 0), fake_camera.make_handler({}, "abc", lambda: quits.append(1)))
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/quit?token=nope", timeout=5)
+        assert e.value.code == 403 and not quits
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/quit?token=abc", timeout=5) as r:
+            assert r.status == 200 and r.read() == b"bye"
+        assert quits == [1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    with pytest.raises(SystemExit):                     # one different name per camera, checked before any opens
+        fake_camera.main(["--webcam", "0,1", "--webcam-names", "back"])
+
+
+def test_fake_camera_probe_lists_the_cameras_that_send_a_frame(monkeypatch):
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import fake_camera
+
+    class Cap:
+        def read(self):
+            return True, np.zeros((36, 64, 3), np.uint8)
+
+        def get(self, prop):
+            return 30.0
+
+        def release(self):
+            pass
+
+    asked = []
+
+    def fake_open(cv2, index, size=None, fps=30.0, fourcc="MJPG"):
+        asked.append(index)
+        return Cap() if index == 1 else None
+    monkeypatch.setattr(fake_camera, "open_webcam", fake_open)
+    monkeypatch.setattr(fake_camera, "dshow_names", lambda: ["Front", "Capture card"])
+    out = io.StringIO()
+    assert fake_camera.probe_webcams(4, skip={2}, out=out, measure_s=0.05) == 1
+    rows = [json.loads(ln) for ln in out.getvalue().splitlines()]
+    assert asked == [0, 1, 3]                           # 2 is in use: left alone
+    assert rows[0]["index"] == 1 and rows[0]["name"] == "Capture card" and rows[0]["size"] == [64, 36]
+    assert rows[0]["fps"] > 0 and rows[0]["thumb"]                       # measured, not the asked rate
+    assert rows[0]["thumb"].startswith("data:image/jpeg;base64,")
+    assert rows[1] == {"index": 2, "name": None, "skipped": True} and rows[-1] == {"done": True, "found": 1}
+
+
+class _FakeUsbJob:
+    """Stands in for jobs.Job: the relay 'opens' its cameras at once."""
+    started = []
+
+    def __init__(self, kind, argv, cwd, title="", meta=None, **kw):
+        self.kind, self.argv, self.meta = kind, list(argv), dict(meta or {})
+        self.lines, self.running, self._stop_requested = [], False, False
+        self.error, self.returncode = None, None
+        self.proc = type("P", (), {"pid": 777 + len(_FakeUsbJob.started)})()
+
+    def start(self):
+        self.running = True
+        self.lines.append("fake cameras on port 8091:")
+        _FakeUsbJob.started.append(self.argv)
+        return self
+
+    def wait(self, timeout_s=None):
+        return "running" if self.running else "stopped"
+
+    def stop(self, timeout_s=10.0):
+        self.running, self._stop_requested = False, True
+
+
+def _usb_server(tmp_path, monkeypatch, wsl=False, reach=("127.0.0.1",)):
+    srv, s = _server(tmp_path)
+    _FakeUsbJob.started = []
+    monkeypatch.setattr(srv.jobmod, "Job", _FakeUsbJob)
+    monkeypatch.setattr(srv, "in_wsl", lambda: wsl)
+    quits = []
+    monkeypatch.setattr(srv, "_quit_relay", lambda info, hosts: quits.append((dict(info or {}), list(hosts))) or True)
+    # nothing listens before a relay starts; afterwards it answers on the reachable addresses
+    monkeypatch.setattr(srv, "port_open", lambda port, host="127.0.0.1", **k: bool(
+        s.usbcams is not None and s.usbcams.running and host in reach))
+    return srv, s, quits
+
+
+def test_server_usb_rows_start_the_relay_and_fill_their_addresses(tmp_path, monkeypatch):
+    srv, s, quits = _usb_server(tmp_path, monkeypatch)
+    rows = [{"name": "back", "type": "usb", "device": 2, "use": True}, {"name": "net", "url": "rtsp://pi1:8554/cam"}]
+    inp = s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": rows, "fps": 60})
+    assert inp["cameras"] == [{"name": "back", "url": "http://127.0.0.1:8091/back.mjpg", "use": True, "type": "usb",
+                               "device": 2},
+                              {"name": "net", "url": "rtsp://pi1:8554/cam", "use": True}]
+    a = _FakeUsbJob.started[-1]
+    assert a[0] == sys.executable and a[1] == "-u" and a[2].endswith("fake_camera.py")
+    assert a[a.index("--webcam") + 1] == "2" and a[a.index("--webcam-names") + 1] == "back"
+    assert a[a.index("--host") + 1] == "127.0.0.1" and a[a.index("--fps") + 1] == "60"
+    info = json.loads((tmp_path / "runs" / "usbcams.json").read_text())
+    assert info["host"] == "127.0.0.1" and info["token"] == a[a.index("--quit-token") + 1]
+    st = s.usb_status()
+    assert st["running"] and st["devices"] == {"back": 2} and st["where"] == "this PC"
+    s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": rows, "fps": 60})
+    assert len(_FakeUsbJob.started) == 1                # same cameras: the relay keeps running
+    assert "input.cameras=" + json.dumps({"back": "http://127.0.0.1:8091/back.mjpg", "net": "rtsp://pi1:8554/cam"}) \
+        in s.input_sets()
+    s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": rows, "fps": 30})
+    assert len(_FakeUsbJob.started) == 2 and quits    # another frame rate: restarted (the old one asked to quit)
+    s.set_input({"kind": "video", "clip": "singles_05x", "views": ["back_051", "frontleft_051"]})
+    assert not s.usb_status()["running"] and not (tmp_path / "runs" / "usbcams.json").exists()
+
+
+def test_server_usb_rows_are_checked(tmp_path, monkeypatch):
+    srv, s, _ = _usb_server(tmp_path, monkeypatch)
+    from fastapi import HTTPException
+    for rows, part in (([{"name": "a", "type": "usb", "device": 0}, {"name": "b", "type": "usb", "device": 0}],
+                        "already a"),
+                       ([{"name": "a", "type": "usb", "device": 12}], "0-9"),
+                       ([{"name": "a", "type": "usb", "device": "x"}], "0-9")):
+        with pytest.raises(HTTPException) as e:
+            s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": rows})
+        assert e.value.status_code == 400 and part in e.value.detail
+    s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": [            # an unticked duplicate is fine
+        {"name": "a", "type": "usb", "device": 0}, {"name": "b", "type": "usb", "device": 0, "use": False}]})
+    a = _FakeUsbJob.started[-1]
+    assert a[a.index("--webcam") + 1] == "0" and a[a.index("--webcam-names") + 1] == "a"
+
+
+def test_server_usb_in_wsl_runs_the_relay_on_windows(tmp_path, monkeypatch):
+    srv, s, _ = _usb_server(tmp_path, monkeypatch, wsl=True, reach=("172.20.0.1",))
+    from fastapi import HTTPException
+    monkeypatch.setattr(srv, "find_windows_python", lambda: [])
+    with pytest.raises(HTTPException) as e:
+        s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": [{"name": "back", "type": "usb", "device": 0}]})
+    assert e.value.status_code == 400 and "opencv-python" in e.value.detail and not _FakeUsbJob.started
+    monkeypatch.setattr(srv, "find_windows_python", lambda: ["/mnt/c/Windows/py.exe", "-3"])
+    monkeypatch.setattr(srv, "win_path", lambda p: r"\\wsl.localhost\Ubuntu\repo\tools\fake_camera.py")
+    monkeypatch.setattr(srv, "wsl_windows_hosts", lambda: ["127.0.0.1", "172.20.0.1"])
+    inp = s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": [{"name": "back", "type": "usb", "device": 0}]})
+    a = _FakeUsbJob.started[-1]
+    assert a[:4] == ["/mnt/c/Windows/py.exe", "-3", "-u", r"\\wsl.localhost\Ubuntu\repo\tools\fake_camera.py"]
+    assert a[a.index("--host") + 1] == "0.0.0.0"       # WSL reaches Windows over its virtual network
+    assert inp["cameras"][0]["url"] == "http://172.20.0.1:8091/back.mjpg"
+    assert s.usb_status()["where"] == "Windows"
+
+
+def test_server_usb_unreachable_relay_is_stopped_with_a_firewall_hint(tmp_path, monkeypatch):
+    srv, s, _ = _usb_server(tmp_path, monkeypatch, wsl=True, reach=())
+    from fastapi import HTTPException
+    monkeypatch.setattr(srv, "find_windows_python", lambda: ["py.exe"])
+    monkeypatch.setattr(srv, "win_path", lambda p: p)
+    monkeypatch.setattr(srv, "wsl_windows_hosts", lambda: ["127.0.0.1"])
+    monkeypatch.setattr(srv.time, "sleep", lambda s_: None)
+    with pytest.raises(HTTPException) as e:
+        s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": [{"name": "back", "type": "usb", "device": 0}]})
+    assert e.value.status_code == 502 and "Firewall" in e.value.detail and not s.usb_status()["running"]
+
+
+def test_server_usb_ensure_restarts_the_relay_and_moves_addresses(tmp_path, monkeypatch):
+    srv, s, _ = _usb_server(tmp_path, monkeypatch, wsl=True, reach=("172.29.0.1",))
+    monkeypatch.setattr(srv, "find_windows_python", lambda: ["py.exe"])
+    monkeypatch.setattr(srv, "win_path", lambda p: p)
+    monkeypatch.setattr(srv, "wsl_windows_hosts", lambda: ["127.0.0.1", "172.29.0.1"])
+    old = {"kind": "camera", "clip": "singles_05x", "views": [], "fps": 60, "max_minutes": 5, "video_variant": None,
+           "cameras": [{"name": "back", "url": "http://172.20.0.1:8091/back.mjpg", "use": True, "type": "usb",
+                        "device": 0}]}                  # saved before a reboot moved WSL's address of Windows
+    (tmp_path / "runs" / "input.json").write_text(json.dumps(old))
+    sets = s.input_sets()
+    assert "input.cameras=" + json.dumps({"back": "http://172.29.0.1:8091/back.mjpg"}) in sets
+    assert s.get_input()["cameras"][0]["url"] == "http://172.29.0.1:8091/back.mjpg"
+
+
+def test_server_usb_test_rows_and_find(tmp_path, monkeypatch):
+    srv, s, _ = _usb_server(tmp_path, monkeypatch)
+    tested = {}
+    monkeypatch.setattr(s, "test_cameras", lambda cams, timeout_s=5.0: tested.update(cams) or
+                        {k: {"ok": True, "size": [1920, 1080]} for k in cams})
+    r = s.test_rows([{"name": "back", "type": "usb", "device": 1}, {"name": "net", "url": "rtsp://pi/1"},
+                     {"name": "empty", "url": ""}], fps=60)
+    assert tested == {"back": "http://127.0.0.1:8091/back.mjpg", "net": "rtsp://pi/1"}
+    assert r["back"]["url"] == "http://127.0.0.1:8091/back.mjpg" and "url" not in r["net"]
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        out = "\n".join([json.dumps({"index": 0, "name": "Front", "size": [1280, 720], "fps": 30.0, "thumb": None}),
+                         json.dumps({"index": 1, "name": "Capture card", "skipped": True}),
+                         json.dumps({"done": True, "found": 1})])
+        return type("R", (), {"stdout": out, "stderr": "[ WARN ] DSHOW", "returncode": 0})()
+    monkeypatch.setattr(srv.subprocess, "run", fake_run)
+    f = s.usb_find(fps=60)                              # the relay holds camera 1: skipped, listed as in use
+    a = calls[-1]
+    assert a[a.index("--probe") + 1] == "6" and a[a.index("--skip") + 1] == "1"
+    assert f["where"] == "this PC" and [c["index"] for c in f["cameras"]] == [0, 1]
+    assert f["cameras"][1] == {"index": 1, "name": "Capture card", "in_use": "back"}
+
+
+def test_find_windows_python_skips_the_store_stand_in(tmp_path, monkeypatch):
+    srv, _ = _server(tmp_path)
+    monkeypatch.setattr(srv, "_WIN_PY", [])
+    monkeypatch.delenv("BVR_WINDOWS_PYTHON", raising=False)
+    monkeypatch.setattr(srv.shutil, "which", lambda exe: {"python.exe": "/mnt/c/Users/u/AppData/Local/Microsoft/"
+                                                          "WindowsApps/python.exe"}.get(exe))
+    monkeypatch.setattr(srv.subprocess, "run", lambda argv, **kw: type("R", (), {"returncode": 9009})())
+    assert srv.find_windows_python() == []              # the Store stand-in: no Python
+    monkeypatch.setattr(srv.shutil, "which", lambda exe: {"py.exe": "/mnt/c/Windows/py.exe",
+                                                          "python.exe": "/mnt/c/x/python.exe"}.get(exe))
+    seen = []
+    monkeypatch.setattr(srv.subprocess, "run",
+                        lambda argv, **kw: seen.append(argv) or type("R", (), {"returncode": 0})())
+    assert srv.find_windows_python() == ["/mnt/c/Windows/py.exe", "-3"]
+    assert seen[0][:3] == ["/mnt/c/Windows/py.exe", "-3", "-c"]
+    assert srv.find_windows_python() == ["/mnt/c/Windows/py.exe", "-3"] and len(seen) == 1     # found once, kept
+
+
+def test_server_usb_quits_a_relay_left_by_an_earlier_server(tmp_path, monkeypatch):
+    srv, s, quits = _usb_server(tmp_path, monkeypatch)
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    (tmp_path / "runs" / "usbcams.json").write_text(json.dumps({"pid": 1, "token": "old", "port": 8091,
+                                                                "hosts": ["127.0.0.1"], "where": "Windows",
+                                                                "host": "127.0.0.1"}))
+    inp = s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": [{"name": "back", "type": "usb", "device": 0}]})
+    assert quits and quits[0][0]["token"] == "old" and quits[0][1] == ["127.0.0.1"]     # asked to quit first
+    assert inp["cameras"][0]["url"] == "http://127.0.0.1:8091/back.mjpg" and len(_FakeUsbJob.started) == 1
+    assert json.loads((tmp_path / "runs" / "usbcams.json").read_text())["token"] != "old"
+    (tmp_path / "runs" / "usbcams.json").write_text(json.dumps({"pid": 2, "token": "older", "port": 8091,
+                                                                "hosts": ["127.0.0.1"], "where": "Windows"}))
+    s.usbcams = None                                    # a fresh server, the source has no USB rows: freed too
+    s.set_input({"kind": "video", "clip": "singles_05x", "views": ["back_051", "frontleft_051"]})
+    assert quits[-1][0]["token"] == "older" and not (tmp_path / "runs" / "usbcams.json").exists()
+
+
+# ---------------------------------------------------------------------------------- review fixes (2026-11-10)
+def test_job_output_is_kept_in_a_log_file(tmp_path, monkeypatch):
+    srv, s = _server(tmp_path)
+    assert srv.jobmod.LOG_DIR == str(tmp_path / "runs" / "server_logs")
+    j = srv.jobmod.Job("probe", [sys.executable, "-c", "print('hello'); raise SystemExit(3)"], cwd=str(tmp_path)).start()
+    assert j.wait(30) == "failed"
+    j._thread.join(5)
+    text = open(j.log_path, encoding="utf-8").read()
+    assert "hello" in text and "failed, exit code 3" in text and "raise SystemExit(3)" in text.splitlines()[1]
+
+
+def test_camera_test_says_whether_the_camera_was_reached(tmp_path, monkeypatch):
+    srv, s = _server(tmp_path)
+    assert srv.stream_host_port("rtsp://user:pw@10.0.0.9/stream1") == ("10.0.0.9", 554)
+    assert srv.stream_host_port("http://pi1:8090/back.mjpg") == ("pi1", 8090)
+    assert srv.stream_host_port("nonsense") == (None, None)
+    assert srv.stream_reachable("udp://239.0.0.1:5000") is None
+    monkeypatch.setattr(srv, "port_open", lambda port, host="127.0.0.1", timeout_s=0.3: False)
+    monkeypatch.setattr(srv, "in_wsl", lambda: True)
+    r = srv.Server._test_camera("rtsp://user:pw@10.0.0.9/stream1", 1.0)
+    assert not r["ok"] and "cannot connect to 10.0.0.9:554 from WSL" in r["error"] and "pw" not in r["error"]
+    assert "ping" in r["error"]
+
+
+def test_usb_status_reports_a_camera_that_stopped_sending(tmp_path, monkeypatch):
+    srv, s, _ = _usb_server(tmp_path, monkeypatch)
+    s.usb_start({"back": 2}, 60)
+    assert s.usb_status()["lost"] == [] and s.usb_status()["error"] is None
+    s.usbcams.lines.append("camera back: no frames from webcam 2")
+    st = s.usb_status()
+    assert st["running"] and st["lost"] == ["back"] and "unplugged" in st["error"]
+    s.usbcams.lines.append("camera back: frames again from webcam 2")
+    assert s.usb_status()["lost"] == [] and s.usb_status()["error"] is None
+
+
+def test_usb_relay_is_not_restarted_under_the_engine(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+    srv, s, _ = _usb_server(tmp_path, monkeypatch)
+    s.usb_start({"back": 2}, 60)
+    monkeypatch.setattr(s, "cameras_in_use", lambda: True)
+    assert s.usb_start({"back": 2}, 60)                  # the same cameras: nothing restarts
+    with pytest.raises(HTTPException) as e:
+        s.usb_start({"back": 2}, 30)
+    assert e.value.status_code == 409 and "engine" in e.value.detail
+    assert len(_FakeUsbJob.started) == 1 and s.usb_status()["running"]
+
+
+def test_other_angles_need_a_new_warm_up(tmp_path):
+    srv, s = _server(tmp_path)
+    assert srv.Server._warm_part(["views=[back_051, frontleft_051]", "output_fps=30"]) == {
+        "views": "[back_051, frontleft_051]"}
+
+
+def test_engine_left_by_an_earlier_server_is_stopped(tmp_path):
+    pytest.importorskip("psutil")
+    import subprocess
+    srv, s = _server(tmp_path)
+    pf = tmp_path / "runs" / "engine" / "engine.pid"
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    mine = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "live_run.py", "engine"])
+    try:
+        pf.write_text(str(other.pid))
+        assert s.stop_stale_engine() is False and other.poll() is None and not pf.exists()   # not an engine: left alone
+        pf.write_text(str(mine.pid))
+        assert s.stop_stale_engine() is True and not pf.exists()
+        assert mine.wait(10) is not None
+        assert s.stop_stale_engine() is False            # no file: nothing to do
+    finally:
+        for p in (other, mine):
+            if p.poll() is None:
+                p.kill()
+
+
+def test_webcam_reports_a_lost_camera_and_opens_it_again(monkeypatch, capsys):
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import fake_camera as fc
+
+    class Cap:
+        def __init__(self, n):
+            self.n, self.released = n, False
+
+        def read(self):
+            if self.n <= 0:
+                return False, None
+            self.n -= 1
+            return True, np.zeros((48, 64, 3), np.uint8)
+
+        def get(self, prop):
+            return 30.0
+
+        def release(self):
+            self.released = True
+
+    caps = [Cap(2), Cap(10 ** 6)]
+    opened = []
+    monkeypatch.setattr(fc, "open_webcam", lambda cv2, index, *a: (opened.append(index), caps[len(opened) - 1])[1])
+    monkeypatch.setattr(fc, "LOST_S", 0.05)
+    monkeypatch.setattr(fc, "REOPEN_S", 0.01)
+    cam = fc.Webcam("back", 3, None, 80)
+    cam.start()
+    try:
+        t_end = time.monotonic() + 10
+        while len(opened) < 2 and time.monotonic() < t_end:
+            time.sleep(0.02)
+        seq = cam.seq
+        jpeg, new = cam.wait_next(seq, timeout=5.0)
+        assert new > seq and jpeg                        # frames flow again from the reopened camera
+    finally:
+        cam.running = False
+        cam.join(5)
+    out = capsys.readouterr().out
+    assert opened == [3, 3] and caps[0].released
+    assert "camera back: no frames from webcam 3" in out and "camera back: frames again" in out
+
+
+def test_mjpeg_stream_never_resends_an_old_frame():
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import fake_camera as fc
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    class Still:                                         # a camera that sent one frame and then stopped
+        size, fps = (64, 48), 30.0
+        cond = threading.Condition()
+        jpeg, seq, running = b"\xff\xd8one\xff\xd9", 1, True
+        wait_next = fc.Camera.wait_next
+
+    cam = Still()
+    cam.wait_next = lambda seq, timeout=0.2: fc.Camera.wait_next(cam, seq, timeout=0.2)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), fc.make_handler({"back": cam}))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        r = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/back.mjpg", timeout=1.0)
+        got = b""
+        try:
+            while True:
+                got += r.read(1)
+        except Exception:  # noqa: BLE001 - the read times out once the one frame is through
+            pass
+        assert got.count(b"\xff\xd8one\xff\xd9") == 1
+    finally:
+        cam.running = False
+        srv.shutdown()
+
+
+def test_live_camera_calibration_frame_is_taken_again_after_a_new_source(tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "tools", "pipeline_server"))
+    import calib as calibmod
+    saved = [0.0]
+    c = calibmod.Calib(str(tmp_path), str(tmp_path), input_mtime_fn=lambda: saved[0])
+    os.makedirs(c.frames_dir)
+    grabs = []
+    c.grab = lambda cam, t, name, frame=None: grabs.append((cam["view"], name))
+    cams = {"cam1": {"view": "cam1", "video": "http://127.0.0.1:8091/cam1.mjpg", "has_video": True},
+            "back_051": {"view": "back_051", "video": "data/x/back_051.mp4", "has_video": True}}
+    c.camera = lambda view: cams[view]
+    for v in cams:
+        open(os.path.join(c.frames_dir, v + ".jpg"), "wb").write(b"jpg")
+    c.frame_path("cam1.jpg")
+    assert grabs == []                                   # the frame is newer than the saved source
+    saved[0] = time.time() + 100                         # the source was saved after the frame was taken
+    c.frame_path("cam1.jpg")
+    c.frame_path("back_051.jpg")                         # a recorded video never changes: its frame stays
+    assert grabs == [("cam1", "cam1.jpg")]

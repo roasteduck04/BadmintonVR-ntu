@@ -225,8 +225,28 @@ def _tail_error(log_path):
     return (errs[-1] if errs else (lines[-1] if lines else ""))[:400]
 
 
+def set_aside(out_dir, test_id):
+    """An earlier attempt of this test (failed, timed out, interrupted) moves to <out>/_attempts/<id>_<n>/ with its
+    logs: timing.jsonl is appended to, so a second run in the same folder would mix both runs' numbers. Returns the
+    new folder, or None when there was nothing to move."""
+    test_dir = os.path.join(out_dir, test_id)
+    if not os.path.isdir(test_dir) or not os.listdir(test_dir):
+        return None
+    root = os.path.join(out_dir, ATTEMPTS_DIR)
+    os.makedirs(root, exist_ok=True)
+    n = 1
+    while os.path.exists(os.path.join(root, f"{test_id}_{n}")):
+        n += 1
+    dst = os.path.join(root, f"{test_id}_{n}")
+    shutil.move(test_dir, dst)
+    return dst
+
+
 def run_test(test, plan, out_dir, unity_dir=None, python=None, log=print) -> dict:
     test_dir = os.path.join(out_dir, test["id"])
+    old = set_aside(out_dir, test["id"])
+    if old:
+        log(f"    earlier attempt kept in {os.path.relpath(old, out_dir)}")
     os.makedirs(test_dir, exist_ok=True)
     rec = {"id": test["id"], "base_id": test["base_id"], "kind": test["kind"], "group": test["group"],
            "stage": test["stage"], "repeat": test["repeat"], "note": test["note"], "settings": test["settings"],
@@ -257,6 +277,9 @@ def run_test(test, plan, out_dir, unity_dir=None, python=None, log=print) -> dic
         except subprocess.TimeoutExpired:
             _kill(proc)
             rc, status = None, "timeout"
+        except KeyboardInterrupt:            # Ctrl+C: the test runs in its own session, so it must be stopped here
+            _kill(proc)
+            rc, status = None, "interrupted"
     stop_watch.set()
     rec.update(status=status, rc=rc, seconds=round(time.time() - t0, 1), ended=time.strftime("%Y-%m-%d %H:%M:%S"),
                unity_at_end=unity_status(unity_dir))
@@ -265,6 +288,9 @@ def run_test(test, plan, out_dir, unity_dir=None, python=None, log=print) -> dic
     with open(os.path.join(test_dir, "test.json"), "w", encoding="utf-8") as fh:
         json.dump(rec, fh, indent=1)
     return rec
+
+
+ATTEMPTS_DIR = "_attempts"
 
 
 def _kill(proc):
@@ -335,6 +361,9 @@ def run_campaign(plan_name, group="main", unity_dir=None, only=None, retry_faile
         summary["tests"][t["id"]] = rec
         with open(summary_p, "w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=1)
+        if rec.get("status") == "interrupted":
+            log("Ctrl+C: the test was stopped; packing what there is (run the same command again to resume)")
+            break
     log(f"group {group} finished in {(time.time() - t_all) / 60:.1f} min")
     z = pack(out, log=log)
     log(f"results zip: {z}")

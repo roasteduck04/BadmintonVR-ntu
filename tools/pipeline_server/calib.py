@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
+from starlette.concurrency import run_in_threadpool
 
 from analysis import multiview as mv
 from analysis.pose24 import config as p24config
@@ -39,9 +40,13 @@ def _court_points():
     return COURT_POINTS
 
 
+LIVE_GRAB_MS = 10000             # a live camera gets this long to open and to send its frame
+
+
 class Calib:
-    def __init__(self, repo, unity, input_fn=None):
+    def __init__(self, repo, unity, input_fn=None, input_mtime_fn=None):
         self.repo, self.unity = str(repo), str(unity)
+        self.input_mtime_fn = input_mtime_fn or (lambda: 0.0)       # when the source was last saved
         self.input_fn = input_fn or (lambda: {"kind": "video"})     # v0.8.4: the Source tab's choice
         self.calib_dir = os.path.join(self.repo, "data", "calib")
         self.frames_dir = os.path.join(self.calib_dir, "frames")
@@ -154,7 +159,9 @@ class Calib:
             raise HTTPException(404, f"video of {cam['view']} not found ({cam.get('video')})")
         os.makedirs(self.frames_dir, exist_ok=True)
         is_url = "://" in str(cam["video"])
-        cap = cv2.VideoCapture(cam["video"], cv2.CAP_FFMPEG) if is_url else cv2.VideoCapture(os.path.join(self.repo, cam["video"]))
+        cap = (cv2.VideoCapture(cam["video"], cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, LIVE_GRAB_MS,
+                                                               cv2.CAP_PROP_READ_TIMEOUT_MSEC, LIVE_GRAB_MS])
+               if is_url else cv2.VideoCapture(os.path.join(self.repo, cam["video"])))
         try:
             if is_url:                                    # a live camera: the frame it sends now
                 pass
@@ -180,7 +187,21 @@ class Calib:
             if "_add_" in view:
                 raise HTTPException(404, "frame not found")
             self.grab(self.camera(view), 1.0, fname)              # first visit: the primary frame at t = 1 s
+        elif "_add_" not in os.path.splitext(fname)[0] and self._live_frame_is_old(os.path.splitext(fname)[0], p):
+            try:                                                  # cam1 is another camera since the source was saved
+                self.grab(self.camera(os.path.splitext(fname)[0]), 1.0, fname)
+            except HTTPException:                                 # camera off: the old picture is better than none
+                pass
         return p
+
+    def _live_frame_is_old(self, view, path) -> bool:
+        """A live camera's saved frame from before the source was last saved (names like cam1 are reused)."""
+        try:
+            if os.path.getmtime(path) >= float(self.input_mtime_fn()):
+                return False
+            return "://" in str(self.camera(view).get("video"))
+        except (OSError, HTTPException, ValueError, TypeError):
+            return False
 
     def frame_size(self, view):
         img = cv2.imread(self.frame_path(f"{view}.jpg"))
@@ -361,11 +382,11 @@ def router(calib: Calib, tools_dir) -> APIRouter:
 
     @r.post("/calib/api/auto-fov")
     async def auto_fov(request: Request):
-        return calib.auto_fov(await request.json())
+        return await run_in_threadpool(calib.auto_fov, await request.json())
 
     @r.post("/calib/api/calibrate")
     async def calibrate(request: Request):
-        return calib.calibrate(await request.json())
+        return await run_in_threadpool(calib.calibrate, await request.json())
 
     @r.post("/calib/api/extract-frame")
     async def extract_frame(request: Request):
@@ -373,19 +394,21 @@ def router(calib: Calib, tools_dir) -> APIRouter:
         cam = calib.camera(b.get("view"))
         if b.get("frame") is not None:
             f = _frame_no(b["frame"])
-            return {"ok": True, "filename": calib.grab(cam, None, f"{cam['view']}_add_f{f}.jpg", frame=f)}
+            return {"ok": True, "filename": await run_in_threadpool(
+                lambda: calib.grab(cam, None, f"{cam['view']}_add_f{f}.jpg", frame=f))}
         t = float(b.get("time", 1.0))
         name = f"{cam['view']}_add_{str(t).replace('.', '_').replace('-', 'neg')}.jpg"
-        return {"ok": True, "filename": calib.grab(cam, t, name)}
+        return {"ok": True, "filename": await run_in_threadpool(calib.grab, cam, t, name)}
 
     @r.post("/calib/api/re-extract")
     async def re_extract(request: Request):
         b = await request.json()
         cam = calib.camera(b.get("view"))
         if b.get("frame") is not None:
-            calib.grab(cam, None, f"{cam['view']}.jpg", frame=_frame_no(b["frame"]))
+            f = _frame_no(b["frame"])
+            await run_in_threadpool(lambda: calib.grab(cam, None, f"{cam['view']}.jpg", frame=f))
         else:
-            calib.grab(cam, float(b.get("time", 1.0)), f"{cam['view']}.jpg")
+            await run_in_threadpool(calib.grab, cam, float(b.get("time", 1.0)), f"{cam['view']}.jpg")
         return {"ok": True}
 
     @r.get("/calib/api/seeds/{clip}")

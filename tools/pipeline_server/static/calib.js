@@ -54,9 +54,11 @@ const Calib = (() => {
   function loadFrame(bust) {
     if (!C.cam) return;
     $("#cal-loading").hidden = false;
-    const img = new Image();
-    img.onload = () => { C.img = img; $("#cal-loading").hidden = true; fitView(); };
-    img.onerror = () => { $("#cal-loading").textContent = "No frame (video / camera not reachable)."; };
+    const img = new Image(), view = C.cam.view;
+    C.loading = img;                                  // only the newest request may show (a slow first grab of
+    const mine = () => C.loading === img && C.cam && C.cam.view === view;      // another camera arrives late)
+    img.onload = () => { if (!mine()) return; C.img = img; $("#cal-loading").hidden = true; fitView(); };
+    img.onerror = () => { if (mine()) $("#cal-loading").textContent = "No frame (video / camera not reachable)."; };
     img.src = `/calib/frames/${encodeURIComponent(C.cam.view)}.jpg?t=${bust || Date.now()}`;
     $("#cal-loading").textContent = "Loading the frame…";
   }
@@ -241,7 +243,7 @@ const Calib = (() => {
   document.addEventListener("keydown", (ev) => {
     if ($("#step-calibrate").hidden || ["INPUT", "SELECT", "TEXTAREA"].includes(ev.target.tagName) || ev.ctrlKey || ev.metaKey) return;
     if (ev.key === "z" || ev.key === "Z") { undo(); ev.preventDefault(); }
-    if (ev.key === "s" || ev.key === "S") { save(); ev.preventDefault(); }
+    if (ev.key === "s" || ev.key === "S") { if (!$("#cal-save").disabled) save(); ev.preventDefault(); }
     if (ev.key === "Escape") { C.sel = null; listPoints(); court(); }
   });
 

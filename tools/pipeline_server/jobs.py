@@ -20,6 +20,8 @@ import sys
 import threading
 import time
 
+LOG_DIR = None                   # set by the server: every job's output is also written to <LOG_DIR>/<kind>_<time>.log
+
 STEP_RE = re.compile(r"step (\d+)/(\d+)\s+written (\d+)")
 DONE_RE = re.compile(r"run done in ([\d.]+) s: (\d+)/(\d+) frames")
 BUILD_STEP_RE = re.compile(r"^STEP (\d+)/(\d+) (.*)")          # tools/pipeline_server/offline_build.py
@@ -58,6 +60,7 @@ class Job:
         self.progress = {"step": 0, "steps": None, "written": 0}
         self.error = None
         self.proc = None
+        self.log_path, self._log = None, None
         self._thread = None
         self._stop_requested = False
         self.stdin_pipe = False
@@ -73,6 +76,15 @@ class Job:
                                      stdin=subprocess.PIPE if self.stdin_pipe else subprocess.DEVNULL, text=True,
                                      encoding="utf-8", errors="replace", bufsize=1, env=env, **kw)
         self.state = "running"
+        if LOG_DIR:                      # the page keeps 400 lines in memory; the file keeps everything (tracebacks too)
+            try:
+                os.makedirs(LOG_DIR, exist_ok=True)
+                self.log_path = os.path.join(LOG_DIR, f"{self.kind}_{time.strftime('%Y-%m-%d_%H%M%S')}_{self.proc.pid}.log")
+                self._log = open(self.log_path, "a", encoding="utf-8", buffering=1)
+                self._log.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} {self.title or self.kind}\n"
+                                f"# {' '.join(map(str, self.argv))}\n")
+            except OSError:
+                self._log = None
         self._thread = threading.Thread(target=self._read, name=f"job-{self.kind}", daemon=True)
         self._thread.start()
         return self
@@ -80,6 +92,7 @@ class Job:
     def _read(self):
         for line in self.proc.stdout:
             line = line.rstrip("\n")
+            self._to_log(f"{time.strftime('%H:%M:%S')} {line}")
             if line.startswith("ENGINE "):
                 self._engine_line(line[7:])
                 continue
@@ -116,10 +129,24 @@ class Job:
             self.state = "done" if self.returncode == 0 else "failed"
             if self.state == "failed" and self.error is None:
                 self.error = next((ln for ln in reversed(self.lines) if ln.strip()), f"exit code {self.returncode}")
+        self._to_log(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} {self.state}, exit code {self.returncode}")
+        if self._log is not None:
+            try:
+                self._log.close()
+            except OSError:
+                pass
+            self._log = None
         for ph in self.phases:
             if ph["state"] == "active":
                 ph["state"] = {"done": "done", "failed": "failed"}.get(self.state, "stopped")
                 ph["t1"] = self.ended
+
+    def _to_log(self, text):
+        if self._log is not None:
+            try:
+                self._log.write(text + "\n")
+            except (OSError, ValueError):
+                pass
 
     # ------------------------------------------------------------------ stream phases
     def _phase(self, pid, detail=None):
@@ -290,6 +317,8 @@ class EngineJob(Job):
         if e == "state":
             st = ev.get("state")
             self.engine["state"] = st
+            if st in ("loading", "warming"):             # a new warm-up: the last one's error is history
+                self.error, self.engine["error"] = None, None
             if st == "loading":
                 self._set_phases(ENGINE_WARM_PHASES)
                 self._phase("models", "models into GPU memory, warm-up passes (TensorRT engines on the first run)")

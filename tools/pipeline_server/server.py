@@ -50,8 +50,22 @@ INPUT_FILE = "input.json"        # v0.8.4 Source tab (in the runs folder: machin
 THUMB_W = 240                    # Test cameras preview width (px)
 TEST_CAM_PORT = 8090             # v0.8.7 one-click test cameras (tools/fake_camera.py)
 TESTCAMS_PID = "testcams.pid"    # in the runs folder: the test cameras' process, stopped by the next start
+USB_CAM_PORT = 8091              # v0.8.7 USB cameras on this PC: their relay (tools/fake_camera.py --webcam)
+USBCAMS_FILE = "usbcams.json"    # in the runs folder: the relay's pid / address / stop token, stopped by the next start
+USB_SIZE = "1920x1080"           # asked of every USB camera (it picks its nearest mode; the 2D shrinks to 1080 anyway)
+USB_MAX_DEVICE = 9
+USB_LOST_RE = re.compile(r"^camera (\S+): (no frames|frames again)\b")
+CAM_TEST_S = 10.0                # Test cameras: seconds each camera gets to open and to send a frame
+WSL_NET_HINT = (". The server runs in WSL: a camera that plays in VLC on Windows can still be out of reach from WSL - "
+                "in a WSL terminal try  ping <camera address>")
+USB_WSL_HELP = ("USB cameras: this server runs in WSL, which cannot see USB cameras, so they are served from Windows - "
+                "install Python on Windows (python.org, tick 'Add to PATH'), run  py -m pip install opencv-python  in a "
+                "Windows terminal, then try again (or set BVR_WINDOWS_PYTHON to a Windows python.exe that has OpenCV)")
 # settings the warm-up depends on: changing one after the warm-up means warming up again
 WARM_PREFIXES = ("backend", "rtmpose.", "cpu.", "warmup.", "sync.offsets", "video_variant", "input.", "device")
+WARM_PREFIXES += ("views",)       # other angles ticked = other 2D processes: warm up again
+LOGS_DIR = "server_logs"
+ENGINE_PID = "engine.pid"        # runs/engine/engine.pid: the engine this server started (stopped by the next server)
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
 CAM_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")         # live camera names name their calibration files
 CLIP_LABELS = {"singles_1x": "Singles 1x", "singles_05x": "Singles 0.5x", "doubles_1side": "Doubles, one side",
@@ -233,10 +247,13 @@ class Server:
         self.runs.mkdir(parents=True, exist_ok=True)
         self.machine = machine or detect_machine()
         self.jobs = jobmod.JobManager()
+        jobmod.LOG_DIR = str(self.runs / LOGS_DIR)       # every job's whole output, kept after the window closes
         self._np_lock = threading.Lock()
         self.warm_request = None         # {clip, warm: {key: value}} of the last warm-up sent to the engine
         self._beat = {"t": None, "mono": 0.0}   # last heartbeat stamp seen + when (this process's monotonic clock)
         self.testcams = None             # v0.8.7 test cameras job (runs next to the engine / stream job)
+        self.usbcams = None              # v0.8.7 USB camera relay job (USB rows of the live camera table)
+        self._usb_lock = threading.RLock()
 
     # ------------------------------------------------------------------ catalogue
     @property
@@ -424,7 +441,8 @@ class Server:
     # ------------------------------------------------------------------ v0.8.4 Source tab
     def get_input(self) -> dict:
         """The Source step: {kind video|camera, clip, views (chosen angles of the clip), video_variant, cameras [{name,
-        url, use}] (live broadcast; names are the user's, default cam1, cam2, ...), fps, max_minutes}. v0.8.4 files
+        url, use} + type usb, device for a USB camera on this PC (v0.8.7; url = its relay address)] (live broadcast;
+        names are the user's, default cam1, cam2, ...), fps, max_minutes}. v0.8.4 files
         ({view: url} cameras, no clip) are read too."""
         p = self.runs / INPUT_FILE
         d = {"kind": "video", "clip": None, "views": [], "fps": 60, "max_minutes": 5, "cameras": [], "video_variant": None}
@@ -444,6 +462,44 @@ class Server:
         d = d or self.get_input()
         return {c["name"]: c["url"] for c in d.get("cameras") or [] if c.get("use", True) and c.get("url")}
 
+    @staticmethod
+    def _camera_rows(raw):
+        """The live camera table, checked: [{name, url, use}] for network cameras, [{name, url, use, type: usb,
+        device}] for USB cameras on this PC (url = their relay address, filled when it runs); + {name: device} of the
+        USB cameras in use."""
+        if isinstance(raw, dict):
+            raw = [{"name": k, "url": v, "use": True} for k, v in raw.items()]
+        cams, seen, devs = [], set(), {}
+        for c in raw or []:
+            usb = str(c.get("type") or "network") == "usb"
+            name, url = str(c.get("name") or "").strip(), str(c.get("url") or "").strip()
+            if not name and not url and not usb:
+                continue
+            if not CAM_NAME.match(name):
+                raise HTTPException(400, f"camera name {name!r}: letters, digits, _ or - (it names the calibration file)")
+            if name in seen:
+                raise HTTPException(400, f"camera name {name!r} is used twice")
+            seen.add(name)
+            if usb:
+                try:
+                    dev = int(c.get("device", 0))
+                except (TypeError, ValueError):
+                    raise HTTPException(400, f"{name}: the USB camera number must be 0-{USB_MAX_DEVICE}")
+                if not 0 <= dev <= USB_MAX_DEVICE:
+                    raise HTTPException(400, f"{name}: the USB camera number must be 0-{USB_MAX_DEVICE}")
+                use = bool(c.get("use", True))
+                other = next((k for k, v in devs.items() if v == dev), None)
+                if use and other:
+                    raise HTTPException(400, f"{name}: USB camera {dev} is already {other}")
+                if use:
+                    devs[name] = dev
+                cams.append({"name": name, "url": "", "use": use, "type": "usb", "device": dev})
+                continue
+            if url and "://" not in url:
+                raise HTTPException(400, f"{name}: not a stream address (rtsp://, http://, tcp://, udp://...)")
+            cams.append({"name": name, "url": url, "use": bool(c.get("use", True)) and bool(url)})
+        return cams, devs
+
     def set_input(self, d) -> dict:
         kind = d.get("kind", "video")
         if kind not in ("video", "camera"):
@@ -458,24 +514,9 @@ class Server:
             raise HTTPException(400, f"{bad} are not angles of {clip}")
         if kind == "video" and not views:
             raise HTTPException(400, "pick at least 1 angle (1 = the 1-camera mode, 2+ = triangulated 3D)")
-        raw = d.get("cameras") or []
-        if isinstance(raw, dict):
-            raw = [{"name": k, "url": v, "use": True} for k, v in raw.items()]
-        cams, seen = [], set()
-        for c in raw:
-            name, url = str(c.get("name") or "").strip(), str(c.get("url") or "").strip()
-            if not name and not url:
-                continue
-            if not CAM_NAME.match(name):
-                raise HTTPException(400, f"camera name {name!r}: letters, digits, _ or - (it names the calibration file)")
-            if name in seen:
-                raise HTTPException(400, f"camera name {name!r} is used twice")
-            if url and "://" not in url:
-                raise HTTPException(400, f"{name}: not a stream address (rtsp://, http://, tcp://, udp://...)")
-            seen.add(name)
-            cams.append({"name": name, "url": url, "use": bool(c.get("use", True)) and bool(url)})
+        cams, devs = self._camera_rows(d.get("cameras") or [])
         if kind == "camera" and not any(c["use"] for c in cams):
-            raise HTTPException(400, "use at least 1 camera with a stream address (1 = the 1-camera mode)")
+            raise HTTPException(400, "use at least 1 camera with a stream address or a USB camera (1 = the 1-camera mode)")
         try:
             fps, mins = float(d.get("fps", 60)), float(d.get("max_minutes", 5))
         except (TypeError, ValueError):
@@ -485,6 +526,13 @@ class Server:
         vv = d.get("video_variant") or None
         if vv is not None and not re.match(r"^[A-Za-z0-9_-]{1,20}$", str(vv)):
             raise HTTPException(400, "bad video_variant")
+        if kind == "camera" and devs:                    # v0.8.7: USB rows stream through the relay (started here)
+            urls = self.usb_start(devs, fps)
+            for c in cams:
+                if c.get("type") == "usb" and c["use"]:
+                    c["url"] = urls[c["name"]]
+        else:
+            self.usb_stop()                              # frees the USB cameras for other apps
         out = {"kind": kind, "clip": clip, "views": views, "fps": fps, "max_minutes": mins, "cameras": cams,
                "video_variant": vv}
         atomic_json(self.runs / INPUT_FILE, out)
@@ -511,6 +559,7 @@ class Server:
         their offsets estimated in the warm-up (a clip's sync file is for its recorded videos only)."""
         d = self.get_input()
         if d["kind"] == "camera":
+            d = self.usb_ensure(d)                       # USB rows: their relay runs (after a server restart too)
             cams = self.used_cameras(d)
             return ["input.kind=camera", "input.cameras=" + json.dumps(cams), f"views=[{', '.join(cams)}]",
                     f"input.fps={d['fps']}", f"input.max_minutes={d['max_minutes']}", "video_variant=null",
@@ -518,7 +567,7 @@ class Server:
         out = ["input.kind=video"] + ([f"video_variant={d['video_variant']}"] if d.get("video_variant") else [])
         return out + ([f"views=[{', '.join(d['views'])}]"] if d.get("views") else [])
 
-    def test_cameras(self, cams, timeout_s=5.0) -> dict:
+    def test_cameras(self, cams, timeout_s=CAM_TEST_S) -> dict:
         """One frame from every camera address (all at once, each given timeout_s to open and to send a frame):
         {view: {ok, size, ms, thumb (JPEG data URL) | error}}."""
         from concurrent.futures import ThreadPoolExecutor
@@ -528,6 +577,17 @@ class Server:
         with ThreadPoolExecutor(max_workers=len(cams)) as ex:
             return dict(zip(cams, ex.map(lambda u: self._test_camera(u, timeout_s), cams.values())))
 
+    def test_rows(self, rows, fps=None, timeout_s=CAM_TEST_S) -> dict:
+        """v0.8.7 Test cameras with the table's rows (network and USB): USB rows start their relay first; each
+        result of a USB row carries its relay address (url)."""
+        cams, devs = self._camera_rows(rows)
+        urls = self.usb_start(devs, float(fps or self.get_input().get("fps") or 60)) if devs else {}
+        out = self.test_cameras({c["name"]: urls.get(c["name"]) or c["url"] for c in cams
+                                 if c["url"] or c["name"] in urls}, timeout_s)
+        for nm, u in urls.items():
+            out[nm]["url"] = u
+        return out
+
     @staticmethod
     def _test_camera(url, timeout_s) -> dict:
         import base64
@@ -535,14 +595,26 @@ class Server:
         t = time.perf_counter()
         if "://" not in str(url):
             return {"ok": False, "error": "not a stream address"}
+        where = "WSL" if in_wsl() else "this PC"
+        reach = stream_reachable(url)                    # the network first: it tells a wrong address from a wrong path
+        if reach is False:
+            host, port = stream_host_port(url)
+            return {"ok": False, "error": f"cannot connect to {host}:{port} from {where} (camera off, wrong address "
+                                          f"or port, or a firewall)" + (WSL_NET_HINT if where == "WSL" else "")}
         ms = int(timeout_s * 1000)
         cap = cv2.VideoCapture(str(url), cv2.CAP_FFMPEG,
                                [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, ms, cv2.CAP_PROP_READ_TIMEOUT_MSEC, ms])
         try:
-            ok, img = cap.read() if cap.isOpened() else (False, None)
+            opened = cap.isOpened()
+            ok, img = cap.read() if opened else (False, None)
         finally:
             cap.release()
         if not ok or img is None:
+            if reach and not opened:
+                return {"ok": False, "error": f"the camera answers but the stream did not open in {timeout_s:g} s "
+                                              "(stream path, user name / password, or a codec this PC cannot read)"}
+            if reach:
+                return {"ok": False, "error": f"the stream opened but sent no picture in {timeout_s:g} s"}
             return {"ok": False, "error": f"no frame in {timeout_s:g} s (address, port, firewall?)"}
         h, w = img.shape[:2]
         ms = round(1000 * (time.perf_counter() - t))
@@ -636,6 +708,188 @@ class Server:
             pass
         pf.unlink(missing_ok=True)
 
+    # ------------------------------------------------------------------ v0.8.7 USB cameras on this PC
+    def usb_runner(self) -> dict:
+        """How the relay (tools/fake_camera.py) runs next to the USB cameras: with this Python, or - when the server
+        runs in WSL, which cannot see USB cameras - with a Windows Python that has OpenCV, through WSL interop
+        (listening on every address: WSL reaches Windows through its virtual network unless networking is mirrored)."""
+        script = str(self.repo / "tools" / "fake_camera.py")
+        if not in_wsl():
+            return {"where": "this PC", "argv": jobmod.python_cmd("-u", script), "bind": "127.0.0.1",
+                    "hosts": ["127.0.0.1"]}
+        exe = find_windows_python()
+        if not exe:
+            raise HTTPException(400, USB_WSL_HELP)
+        return {"where": "Windows", "argv": [*exe, "-u", win_path(script)], "bind": "0.0.0.0",
+                "hosts": wsl_windows_hosts()}
+
+    def usb_status(self) -> dict:
+        j = self.usbcams
+        on = j is not None and j.running
+        m = j.meta if j is not None else {}
+        err = None
+        if j is not None and not on and not j._stop_requested:
+            err = j.error or next((ln for ln in reversed(list(j.lines)) if ln.strip()), None) or f"exit code {j.returncode}"
+        lost = {}
+        for ln in (list(j.lines) if on else []):         # fake_camera.py: "camera <name>: no frames" / "frames again"
+            mm = USB_LOST_RE.match(ln)
+            if mm:
+                lost[mm.group(1)] = mm.group(2) == "no frames"
+        lost = sorted(k for k, v in lost.items() if v)
+        if lost:
+            err = "no frames from " + ", ".join(lost) + " (USB cable unplugged? it is tried again every few seconds)"
+        return {"running": on, "lost": lost, "devices": dict(m.get("devices") or {}), "urls": dict(m.get("urls") or {}),
+                "where": m.get("where"), "host": m.get("host"), "port": m.get("port"), "fps": m.get("fps"), "error": err}
+
+    def usb_find(self, n=6, fps=60.0, timeout_s=120.0) -> dict:
+        """Which USB cameras open (0..n-1), each with its size and a preview frame - the ones the relay already serves
+        are listed as in use (a USB camera opens in one program at a time)."""
+        run = self.usb_runner()
+        st = self.usb_status()
+        busy = {int(i): nm for nm, i in st["devices"].items()} if st["running"] else {}
+        argv = run["argv"] + ["--probe", str(int(n)), "--webcam-size", USB_SIZE, "--fps", f"{float(fps):g}"]
+        if busy:
+            argv += ["--skip", ",".join(str(i) for i in sorted(busy))]
+        try:
+            r = subprocess.run(argv, cwd=str(self.repo), capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=timeout_s, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, f"the USB camera search took over {timeout_s:.0f} s")
+        rows = []
+        for ln in r.stdout.splitlines():
+            if ln.startswith("{"):
+                try:
+                    rows.append(json.loads(ln))
+                except ValueError:
+                    pass
+        if not any(x.get("done") for x in rows):
+            tail = next((ln for ln in reversed((r.stderr or r.stdout or "").splitlines()) if ln.strip()), "no output")
+            raise HTTPException(500, f"the USB camera search failed ({run['where']}): {tail}")
+        named = {x["index"]: x.get("name") for x in rows if x.get("skipped")}
+        cams = [x for x in rows if "index" in x and not x.get("skipped")]
+        cams += [{"index": i, "name": named.get(i), "in_use": nm} for i, nm in busy.items()]
+        return {"where": run["where"], "cameras": sorted(cams, key=lambda x: x["index"])}
+
+    def usb_start(self, devices, fps=60.0, ready_s=45.0) -> dict:
+        """Serve the USB cameras {name: device number} as http://<address>:8091/<name>.mjpg (the relay keeps running
+        while they stay the same); returns {name: address}."""
+        devices = {str(k): int(v) for k, v in (devices or {}).items()}
+        with self._usb_lock:
+            st = self.usb_status()
+            if st["running"] and st["devices"] == devices and st["fps"] == float(fps):
+                return st["urls"]
+            if st["running"] and self.cameras_in_use():  # a restart would cut the cameras under the engine
+                raise HTTPException(409, "The engine is using the cameras, and this would restart the USB cameras "
+                                         "(other cameras or frame rate). Shut down the engine in step 3 first.")
+            self.usb_stop()
+            self._stop_stale_usbcams()
+            run = self.usb_runner()
+            port = USB_CAM_PORT
+            busy = next((h for h in run["hosts"] if port_open(port, h)), None)
+            if busy:
+                raise HTTPException(409, f"port {port} is in use on {busy} (a fake_camera.py started by hand?): "
+                                         "stop it, then try again")
+            import secrets
+            token = secrets.token_hex(8)
+            argv = run["argv"] + ["--webcam", ",".join(str(i) for i in devices.values()),
+                                  "--webcam-names", ",".join(devices), "--webcam-size", USB_SIZE,
+                                  "--fps", f"{float(fps):g}", "--port", str(port), "--host", run["bind"],
+                                  "--quit-token", token]
+            j = jobmod.Job("usbcams", argv, cwd=str(self.repo), title="USB cameras",
+                           meta={"devices": devices, "where": run["where"], "port": port, "fps": float(fps),
+                                 "urls": {}, "host": None})
+            j.start()
+            self.usbcams = j
+            info = {"pid": j.proc.pid, "token": token, "port": port, "hosts": run["hosts"], "where": run["where"]}
+            atomic_json(self.runs / USBCAMS_FILE, info)
+            t_end = time.monotonic() + ready_s
+            while not any(str(ln).startswith("fake cameras on port") for ln in list(j.lines)):   # every camera opened
+                if not j.running:
+                    err = self.usb_status()["error"]
+                    self.usb_stop()
+                    raise HTTPException(500, f"the USB cameras did not start ({run['where']}): {err}")
+                if time.monotonic() > t_end:
+                    self.usb_stop()
+                    raise HTTPException(504, f"the USB cameras did not start in {ready_s:.0f} s")
+                time.sleep(0.2)
+            host = None
+            for _ in range(10):                          # it listens right after that line
+                host = next((h for h in run["hosts"] if port_open(port, h, timeout_s=1.0)), None)
+                if host:
+                    break
+                time.sleep(0.3)
+            if host is None:
+                self.usb_stop()
+                raise HTTPException(502, f"the USB cameras run on {run['where']} but this server cannot reach port "
+                                         f"{port} (tried {', '.join(run['hosts'])}): allow Python through Windows "
+                                         "Firewall (Private and Public networks), then try again")
+            urls = {nm: f"http://{host}:{port}/{nm}.mjpg" for nm in devices}
+            j.meta.update(host=host, urls=urls)
+            atomic_json(self.runs / USBCAMS_FILE, dict(info, host=host))
+            return urls
+
+    def usb_ensure(self, d=None) -> dict:
+        """A saved source with USB rows: start their relay if it is not running (e.g. after a server restart) and
+        update their addresses when they moved (WSL's address of Windows changes with a reboot)."""
+        d = d or self.get_input()
+        devs = {c["name"]: int(c.get("device", 0)) for c in d.get("cameras") or []
+                if c.get("type") == "usb" and c.get("use", True)}
+        if d.get("kind") != "camera" or not devs:
+            return d
+        urls = self.usb_start(devs, float(d.get("fps") or 60))
+        if any(c.get("url") != urls[c["name"]] for c in d["cameras"] if c["name"] in urls):
+            d = dict(d, cameras=[dict(c, url=urls[c["name"]]) if c["name"] in urls else c for c in d["cameras"]])
+            atomic_json(self.runs / INPUT_FILE, d)
+        return d
+
+    def usb_autostart(self):
+        """At server start: a saved source with USB cameras gets its relay back (calibration frames need it too)."""
+        try:
+            self.usb_ensure()
+        except HTTPException as e:
+            print(f"USB cameras not started: {e.detail}", flush=True)
+        except Exception as e:  # noqa: BLE001 - never stop the server over the cameras
+            print(f"USB cameras not started: {e}", flush=True)
+
+    def usb_stop(self) -> dict:
+        with self._usb_lock:
+            j = self.usbcams
+            pf = self.runs / USBCAMS_FILE
+            info = read_json(pf) or {}
+            ours = j is not None and j.proc is not None and str(info.get("pid")) == str(j.proc.pid)
+            if j is not None and j.running:
+                j._stop_requested = True
+                _quit_relay(info, [j.meta.get("host")] if j.meta.get("host") else info.get("hosts") or [])
+                if j.wait(5.0) != "stopped" and j.running:
+                    j.stop()                             # the relay did not answer /quit
+            if ours:
+                pf.unlink(missing_ok=True)
+            elif info:
+                self._stop_stale_usbcams()               # an earlier server's relay: it still holds the cameras
+            return self.usb_status()
+
+    def _stop_stale_usbcams(self):
+        """A relay left by an earlier server (its window closed) still holds the USB cameras and the port."""
+        pf = self.runs / USBCAMS_FILE
+        info = read_json(pf)
+        if not info:
+            return
+        hosts = [info["host"]] if info.get("host") else info.get("hosts") or []
+        if _quit_relay(info, hosts):                     # it lets the port go a moment after answering
+            port, t_end = int(info.get("port") or USB_CAM_PORT), time.monotonic() + 5.0
+            while time.monotonic() < t_end and any(port_open(port, h) for h in hosts):
+                time.sleep(0.2)
+        if info.get("where") == "this PC":
+            try:
+                import psutil
+                pr = psutil.Process(int(info["pid"]))
+                if any("fake_camera.py" in str(a) for a in pr.cmdline()):
+                    pr.kill()
+                    pr.wait(5)
+            except Exception:  # noqa: BLE001 - gone already / not ours / psutil missing
+                pass
+        pf.unlink(missing_ok=True)
+
     # ------------------------------------------------------------------ v0.8.4 live engine
     def engine_job(self):
         j = self.jobs.current
@@ -659,7 +913,53 @@ class Server:
             self.jobs.start(j)
         except RuntimeError as e:
             raise HTTPException(409, str(e))
+        try:
+            (cmd_dir / ENGINE_PID).write_text(str(j.proc.pid), encoding="utf-8")
+        except (OSError, AttributeError):
+            pass
         return j
+
+    def engine_shutdown(self):
+        """The server ends: so does the engine or stream job it started (else it keeps the GPU and the cameras)."""
+        try:
+            self.jobs.stop()
+        finally:
+            (self.runs / "engine" / ENGINE_PID).unlink(missing_ok=True)
+
+    def stop_stale_engine(self):
+        """An engine left by an earlier server (its window was closed): it still holds GPU memory and the cameras."""
+        pf = self.runs / "engine" / ENGINE_PID
+        if not pf.exists():
+            return False
+        killed = False
+        try:
+            import psutil
+            pr = psutil.Process(int(pf.read_text(encoding="utf-8").strip()))
+            cl = [str(a) for a in pr.cmdline()]
+            if any("live_run.py" in a for a in cl) and "engine" in cl:
+                for ch in pr.children(recursive=True):
+                    ch.kill()
+                pr.kill()
+                pr.wait(5)
+                killed = True
+        except Exception:  # noqa: BLE001 - gone already / not ours / psutil missing
+            pass
+        pf.unlink(missing_ok=True)
+        return killed
+
+    def input_mtime(self) -> float:
+        """When the source was last saved (a live camera's calibration frame older than that is grabbed again)."""
+        try:
+            return (self.runs / "input.json").stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def cameras_in_use(self) -> bool:
+        """The engine is reading the live cameras (warming up, warm, or streaming)."""
+        j = self.engine_job()
+        if j is None or self.get_input().get("kind") != "camera":
+            return False
+        return bool(j.engine.get("warm")) or j.engine.get("state") in ("loading", "warming", "streaming")
 
     def _request(self, clip, preset, values):
         """(cfg, overrides, fps, src) of a page request, frames converted to seconds (as start_stream does)."""
@@ -725,6 +1025,7 @@ class Server:
                          over.get("pace", "realtime"), time.strftime("%Y-%m-%d_%H%M%S")])
         run_dir = self.runs / name
         title = f"{clip} · {int(fps)} fps · {'cameras' if kind == 'camera' else ('2D from video' if src == 'live2d' else 'stored 2D')} · warm"
+        j.error, j.engine["error"] = None, None           # a new stream: the last error is history
         j.meta.update(fps=float(fps), pace=over.get("pace", cfg.get("pace")), backend=over.get("backend"),
                       views=len(cfg.get("views") or []), frames_dir=win_path(run_dir / fw.FRAMES_DIR), title=title)
         j.send({"cmd": "stream", "set": sets, "run_dir": str(run_dir), "title": title})
@@ -745,6 +1046,8 @@ class Server:
         rd = run_dir or job.run_dir
         t_end = time.time() + 600
         while job.running and time.time() < t_end:
+            if getattr(job, "engine", None) and job.engine.get("error"):
+                return                                   # the engine refused the stream: nothing to follow
             if rd and fw.frames_dir(rd) is not None:
                 try:
                     self.play("run", name, title=title or job.title)
@@ -754,12 +1057,114 @@ class Server:
             time.sleep(0.2)
 
 
+def stream_host_port(url):
+    """(host, port) of a stream address (the scheme's usual port when none is given), or (None, None)."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(str(url))
+        port = u.port or {"rtsp": 554, "rtsps": 322, "http": 80, "https": 443, "rtmp": 1935}.get(u.scheme.lower())
+        return (u.hostname, port) if u.hostname and port else (None, None)
+    except ValueError:
+        return None, None
+
+
+def stream_reachable(url, timeout_s=3.0):
+    """True / False: a TCP connection to the stream's host and port opens; None when that cannot be told (udp://,
+    no port known)."""
+    host, port = stream_host_port(url)
+    if not host or str(url).lower().startswith(("udp:", "rtp:", "srt:")):
+        return None
+    try:
+        return port_open(port, host, timeout_s)
+    except OSError:
+        return False
+
+
 def port_open(port, host="127.0.0.1", timeout_s=0.3) -> bool:
     """Something listens on host:port."""
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
         sk.settimeout(timeout_s)
         return sk.connect_ex((host, int(port))) == 0
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def in_wsl() -> bool:
+    """This server runs in WSL (Linux on Windows: no USB cameras, but Windows programs start through interop)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        with open("/proc/sys/kernel/osrelease", "r", encoding="utf-8") as fh:
+            return "microsoft" in fh.read().lower()
+    except OSError:
+        return False
+
+
+_WIN_PY = []                     # the Windows Python found once (with OpenCV), as an argv prefix
+
+
+def find_windows_python() -> list:
+    """From WSL: a Windows Python that imports OpenCV - BVR_WINDOWS_PYTHON, else the py launcher, else python.exe
+    (the Microsoft Store stand-in fails the import check). [] when there is none; a miss is checked again next time."""
+    if _WIN_PY:
+        return list(_WIN_PY)
+    cands = []
+    env = os.environ.get("BVR_WINDOWS_PYTHON")
+    if env:
+        cands.append([env])
+    for exe, extra in (("py.exe", ["-3"]), ("python.exe", [])):
+        p = shutil.which(exe)
+        if p:
+            cands.append([p, *extra])
+    for c in cands:
+        try:
+            r = subprocess.run([*c, "-c", "import cv2"], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0:
+            _WIN_PY[:] = c
+            return list(c)
+    return []
+
+
+def wsl_windows_hosts() -> list:
+    """The addresses WSL may reach Windows on: localhost (mirrored networking), else the default gateway and the
+    resolv.conf name server (NAT networking: Windows' address on WSL's virtual network)."""
+    hosts = ["127.0.0.1"]
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=5).stdout
+        hosts += re.findall(r"default via (\S+)", out)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open("/etc/resolv.conf", "r", encoding="utf-8") as fh:
+            hosts += re.findall(r"^nameserver\s+(\d+\.\d+\.\d+\.\d+)", fh.read(), re.M)
+    except OSError:
+        pass
+    return list(dict.fromkeys(hosts))
+
+
+def _quit_relay(info, hosts):
+    """Ask a USB camera relay to stop (GET /quit with its token: it may run on Windows, out of reach of a kill)."""
+    import urllib.request
+    if not info or not info.get("token"):
+        return False
+    for h in hosts:
+        try:
+            with urllib.request.urlopen(f"http://{h}:{int(info.get('port') or USB_CAM_PORT)}/quit?token={info['token']}",
+                                        timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:  # noqa: BLE001 - not there / already gone
+            continue
+    return False
 
 
 def video_fps(repo, clip, view) -> float:
@@ -798,7 +1203,7 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
         return response
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
-    app.include_router(calibmod.router(calibmod.Calib(server.repo, server.unity, input_fn=server.get_input), TOOLS))
+    app.include_router(calibmod.router(calibmod.Calib(server.repo, server.unity, input_fn=server.get_input, input_mtime_fn=server.input_mtime), TOOLS))
 
     @app.get("/")
     def index():
@@ -853,7 +1258,9 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
         b = await request.json()
         if b.get("oneshot"):                    # the v0.8.2 path: one process loads, warms up and streams once
             return server.start_stream(b.get("clip"), b.get("preset") or None, b.get("values") or {}, bool(b.get("force")))
-        return server.stream_engine(b.get("clip"), b.get("preset") or None, b.get("values") or {}, bool(b.get("force")))
+        from starlette.concurrency import run_in_threadpool     # a USB source may restart its relay first (seconds)
+        return await run_in_threadpool(server.stream_engine, b.get("clip"), b.get("preset") or None,
+                                       b.get("values") or {}, bool(b.get("force")))
 
     @app.post("/api/stream/stop")
     def stream_stop():
@@ -861,8 +1268,9 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
 
     @app.post("/api/engine/warmup")
     async def engine_warmup(request: Request):
+        from starlette.concurrency import run_in_threadpool     # a USB camera source may start its relay first
         b = await request.json()
-        return server.warmup(b.get("clip"), b.get("preset") or None, b.get("values") or {})
+        return await run_in_threadpool(server.warmup, b.get("clip"), b.get("preset") or None, b.get("values") or {})
 
     @app.post("/api/engine/stop")
     def engine_stop():
@@ -876,7 +1284,9 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
 
     @app.post("/api/input")
     async def input_set(request: Request):
-        return server.set_input(await request.json())
+        from starlette.concurrency import run_in_threadpool     # USB rows start their relay (seconds)
+        b = await request.json()
+        return await run_in_threadpool(server.set_input, b)
 
     @app.get("/api/input/variants")
     def input_variants(clip: str):
@@ -886,7 +1296,25 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
     async def input_test(request: Request):
         from starlette.concurrency import run_in_threadpool     # off the event loop: the page keeps answering
         b = await request.json()
+        if b.get("rows") is not None:                            # v0.8.7: the table's rows (network + USB)
+            return await run_in_threadpool(server.test_rows, b["rows"], b.get("fps"))
         return await run_in_threadpool(server.test_cameras, b.get("cameras") or server.used_cameras())
+
+    @app.get("/api/usb")
+    def usb_get():
+        return server.usb_status()
+
+    @app.post("/api/usb/find")
+    async def usb_find(request: Request):
+        from starlette.concurrency import run_in_threadpool
+        b = await request.json()
+        return await run_in_threadpool(lambda: server.usb_find(fps=float(b.get("fps") or 60)))
+
+    @app.post("/api/usb/stop")
+    def usb_stop():
+        if server.usb_status()["running"] and server.cameras_in_use():
+            raise HTTPException(409, "The engine is using the cameras. Shut down the engine in step 3 first.")
+        return server.usb_stop()
 
     @app.get("/api/testcams")
     def testcams_get():
@@ -985,7 +1413,12 @@ def main(argv=None):
     os.chdir(REPO)
     server = Server(a.unity_project, a.runs_dir, a.machine)
     import atexit
+    if server.stop_stale_engine():
+        print("stopped a live engine left by an earlier server")
+    atexit.register(server.engine_shutdown)              # the engine / stream job ends with the server
     atexit.register(server.testcams_stop)                # test cameras end with the server
+    atexit.register(server.usb_stop)                     # so does the USB camera relay
+    threading.Thread(target=server.usb_autostart, name="usb-autostart", daemon=True).start()
     hosts = ["127.0.0.1", "localhost"] + [h.lower() for h in a.allow_host]
     app = create_app(server, hosts, a.port)
     print(f"pipeline server: http://127.0.0.1:{a.port}  (machine preset {server.machine}, runs in {server.runs})")

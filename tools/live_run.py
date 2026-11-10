@@ -81,7 +81,12 @@ def cmd_run(a, overrides=None):
         json.dump({"argv": sys.argv, "cwd": os.getcwd(), "overrides": list(a.set or []) + list(overrides or [])}, fh,
                   indent=1)
     t = time.perf_counter()
-    res = runner.Runner(cfg, rd, log=log).run()
+    try:
+        res = runner.Runner(cfg, rd, log=log).run()
+    except BaseException:                # also Ctrl+C / a kill signal: run.log says where the run was
+        import traceback
+        log(traceback.format_exc())
+        raise
     log(f"run done in {time.perf_counter() - t:.1f} s: {res['written']}/{res['steps']} frames")
     if not a.no_report:
         from analysis.live import report
