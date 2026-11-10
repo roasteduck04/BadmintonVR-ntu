@@ -285,3 +285,42 @@ def test_round2_plan_loads():
     p = campaign.load_plan(campaign.plan_path("lab_5090_r2"))
     ids = [t["id"] for t in p["expanded"]]
     assert "R04_full_r2" in ids and "V01_full_nearest_unity" in ids and len(ids) == len(set(ids))
+
+
+# ---------------------------------------------------------------------------------- review fixes (2026-11-10)
+def _one_test(tid="T01"):
+    return {"id": tid, "base_id": tid, "kind": "run", "group": "main", "stage": "a", "repeat": 1, "note": "",
+            "settings": None, "set": [], "requires": [], "timeout_s": 5, "clip": "singles_05x"}
+
+
+def test_a_second_attempt_never_mixes_with_the_first(tmp_path, monkeypatch):
+    out = str(tmp_path)
+    plan = {"name": "p", "clip": "singles_05x", "machine": "laptop-cached"}
+    monkeypatch.setattr(campaign, "argv_for", lambda test, plan, test_dir, python=None: [
+        sys.executable, "-c", "import sys; print('attempt'); open(sys.argv[1] + '/timing.jsonl', 'a').write('x\\n')",
+        test_dir])
+    assert campaign.set_aside(out, "T01") is None        # nothing there yet
+    for _ in range(2):
+        rec = campaign.run_test(_one_test(), plan, out, log=lambda *a: None)
+        assert rec["status"] == "done"
+    assert open(os.path.join(out, "T01", "timing.jsonl")).read() == "x\n"            # one run's rows only
+    assert open(os.path.join(out, "_attempts", "T01_1", "timing.jsonl")).read() == "x\n"
+    assert "attempt" in open(os.path.join(out, "_attempts", "T01_1", "campaign.log")).read()   # the first log is kept
+
+
+def test_ctrl_c_stops_the_test_and_is_recorded(tmp_path, monkeypatch):
+    killed = []
+
+    class Proc:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(campaign.subprocess, "Popen", lambda *a, **k: Proc())
+    monkeypatch.setattr(campaign, "_kill", lambda proc: killed.append(proc.pid))
+    monkeypatch.setattr(campaign, "argv_for", lambda *a, **k: ["x"])
+    rec = campaign.run_test(_one_test(), {"name": "p", "clip": "c", "machine": "m"}, str(tmp_path),
+                            log=lambda *a: None)
+    assert rec["status"] == "interrupted" and killed == [4242]
+    assert json.load(open(os.path.join(str(tmp_path), "T01", "test.json")))["status"] == "interrupted"

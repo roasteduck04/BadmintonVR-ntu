@@ -80,7 +80,7 @@ async function loadSource() {
   $("#src-msg").textContent = "";
   await camCalibStatus();
   renderSourceKind(); await renderClip();
-  sidebar(); testcamsStatus();
+  sidebar(); testcamsStatus(); usbStatus();
 }
 
 async function camCalibStatus() {
@@ -127,20 +127,48 @@ async function renderClip() {
 }
 $("#src-clip").addEventListener("change", () => { src.clip = $("#src-clip").value; renderClip(); });
 
+// v0.8.7 USB cameras on this PC: what "Find USB cameras" saw ({index: {name, size, fps, thumb, in_use}})
+const usb = { found: {}, where: null };
+const usbLabel = (i) => {
+  const f = usb.found[i];
+  return `USB camera ${i}` + (f && f.name ? ` · ${f.name}` : "") + (f && f.size ? ` (${f.size[0]}×${f.size[1]})` : "");
+};
+function addrCell(c, i) {
+  if (c.type !== "usb") {
+    return `<input class="addr" data-i="${i}" data-f="url" value="${esc(c.url)}" placeholder="rtsp://… or http://…/stream.mjpg">`;
+  }
+  const opts = [...Array(10).keys()].map((d) => `<option value="${d}"${Number(c.device) === d ? " selected" : ""}>${esc(usbLabel(d))}</option>`).join("");
+  return `<select class="dev" data-i="${i}" data-f="device">${opts}</select>`
+    + (c.url ? `<div class="tiny muted" title="the server serves this USB camera as a stream here">${esc(c.url)}</div>` : "");
+}
 function renderCams() {
   $("#src-cams tbody").innerHTML = src.cams.map((c, i) => `<tr>
     <td><input type="checkbox" data-i="${i}" data-f="use"${c.use ? " checked" : ""}></td>
     <td><input class="nm" data-i="${i}" data-f="name" value="${esc(c.name)}" maxlength="40"></td>
-    <td><input class="addr" data-i="${i}" data-f="url" value="${esc(c.url)}" placeholder="rtsp://… or http://…/stream.mjpg"></td>
-    <td class="test" data-test="${esc(c.name)}">–</td>
+    <td><select class="typ" data-i="${i}" data-f="type"><option value="network">Network</option>
+      <option value="usb"${c.type === "usb" ? " selected" : ""}>USB on this PC</option></select></td>
+    <td>${addrCell(c, i)}</td>
+    <td class="test" data-test="${i}">–</td>
     <td>${c.name in state.camCalib ? calChip(state.camCalib[c.name], true) : calChip(null, false)}</td>
     <td><button class="btn small" data-del="${i}" title="remove this camera">×</button></td></tr>`).join("");
 }
 $("#src-cams").addEventListener("input", (ev) => {
-  const t = ev.target, i = Number(t.dataset.i);
-  if (!t.dataset.f || Number.isNaN(i)) return;
-  src.cams[i][t.dataset.f] = t.type === "checkbox" ? t.checked : t.value.trim();
+  const t = ev.target, i = Number(t.dataset.i), f = t.dataset.f;
+  if (!f || Number.isNaN(i)) return;
+  const c = src.cams[i];
+  if (f === "type") {                               // Network <-> USB: the address cell changes
+    c.type = t.value; c.url = "";
+    if (c.type === "usb") c.device = c.device ?? firstFreeDevice(); else delete c.device;
+    renderCams(); return;
+  }
+  if (f === "device") { c.device = Number(t.value); c.url = ""; renderCams(); return; }
+  c[f] = t.type === "checkbox" ? t.checked : t.value.trim();
 });
+function firstFreeDevice() {
+  const taken = new Set(src.cams.filter((c) => c.type === "usb").map((c) => Number(c.device)));
+  const seen = Object.keys(usb.found).map(Number).sort((a, b) => a - b);      // found ones first
+  return seen.find((d) => !taken.has(d)) ?? [...Array(10).keys()].find((d) => !taken.has(d)) ?? 0;
+}
 $("#src-cams").addEventListener("click", (ev) => {
   const d = ev.target.dataset && ev.target.dataset.del;
   if (d === undefined) return;
@@ -152,19 +180,97 @@ $("#src-add").addEventListener("click", () => {
   src.cams.push({ name: `cam${n}`, url: "", use: true }); renderCams();
 });
 $("#src-test").addEventListener("click", async () => {
-  const cams = Object.fromEntries(src.cams.filter((c) => c.url).map((c) => [c.name, c.url]));
-  document.querySelectorAll("#src-cams [data-test]").forEach((td) => (td.textContent = cams[td.dataset.test] ? "testing…" : "–"));
+  const rows = src.cams.filter((c) => c.url || (c.type === "usb" && c.use));
+  const names = new Set(rows.map((c) => c.name));
+  const anyUsb = rows.some((c) => c.type === "usb");
+  document.querySelectorAll("#src-cams [data-test]").forEach((td) => {
+    td.className = "test";
+    td.textContent = names.has((src.cams[Number(td.dataset.test)] || {}).name) ? (anyUsb ? "starting the USB cameras / testing…" : "testing…") : "–";
+  });
   try {
-    const r = await api("/api/input/test", { cameras: cams });
+    const r = await api("/api/input/test", { rows, fps: Number($("#src-fps").value) });
+    let moved = false;
     Object.entries(r).forEach(([v, x]) => {
-      const td = document.querySelector(`#src-cams [data-test="${CSS.escape(v)}"]`);
+      const c = src.cams.find((k) => k.name === v);
+      if (c && x.url && c.url !== x.url) { c.url = x.url; moved = true; }
+    });
+    if (moved) renderCams();                        // shows the USB cameras' stream addresses
+    Object.entries(r).forEach(([v, x]) => {
+      const td = document.querySelector(`#src-cams [data-test="${src.cams.findIndex((k) => k.name === v)}"]`);
       if (!td) return;
       td.className = "test " + (x.ok ? "good" : "badc");
       td.textContent = x.ok ? `✓ ${x.size[0]}×${x.size[1]} (${x.ms} ms)` : `✗ ${x.error}`;
       if (x.thumb) { const img = document.createElement("img"); img.src = x.thumb; img.className = "cam-thumb"; td.append(img); }
     });
-  } catch (e) { toast(e.message, 7000); }
+    if (anyUsb) usbStatus();
+  } catch (e) {
+    toast(e.message, 12000);
+    document.querySelectorAll("#src-cams [data-test]").forEach((td) => (td.textContent = "–"));
+  }
 });
+
+// v0.8.7 USB cameras on this PC: Find lists them (preview each), "+ Use" adds a row; the relay status line
+function renderUsbFound() {
+  const list = $("#src-usb-list"), cams = Object.values(usb.found).sort((a, b) => a.index - b.index);
+  if (!cams.length) { list.innerHTML = ""; return; }
+  const inTable = (d) => src.cams.find((c) => c.type === "usb" && Number(c.device) === d);
+  list.innerHTML = cams.map((f) => {
+    const row = inTable(f.index);
+    const what = f.in_use ? `in use: ${esc(f.in_use)}` : `${f.size ? f.size[0] + "×" + f.size[1] : "?"}${f.fps ? " · " + f.fps + " fps" : ""}`;
+    return `<div class="usb-card">${f.thumb ? `<img src="${f.thumb}" alt="">` : `<div class="usb-nothumb">${f.in_use ? "streaming" : "no preview"}</div>`}
+      <div class="small"><b>${f.index}</b>${f.name ? " · " + esc(f.name) : ""}</div><div class="tiny muted">${what}</div>
+      ${row ? `<div class="tiny">= ${esc(row.name)}</div>` : `<button class="btn small" data-usb-add="${f.index}">+ Use</button>`}</div>`;
+  }).join("");
+}
+$("#src-usb-list").addEventListener("click", (ev) => {
+  const d = ev.target.dataset && ev.target.dataset.usbAdd;
+  if (d === undefined) return;
+  let n = src.cams.length + 1;
+  while (src.cams.some((c) => c.name === `cam${n}`)) n++;
+  const blank = src.cams.findIndex((c) => c.type !== "usb" && !c.url);       // fill an empty row first
+  const row = { name: blank >= 0 ? src.cams[blank].name : `cam${n}`, url: "", use: true, type: "usb", device: Number(d) };
+  if (blank >= 0) src.cams[blank] = row; else src.cams.push(row);
+  renderCams(); renderUsbFound();
+  $("#src-msg").textContent = `${row.name} = USB camera ${d}. Test cameras, then Save source.`;
+});
+$("#src-usb-find").addEventListener("click", async () => {
+  const b = $("#src-usb-find");
+  b.disabled = true;
+  $("#src-usb-list").innerHTML = "";
+  $("#src-usb-note").textContent = "Looking for USB cameras (each one is opened for a frame; a few seconds)…";
+  try {
+    const r = await api("/api/usb/find", { fps: Number($("#src-fps").value) });
+    usb.where = r.where;
+    usb.found = Object.fromEntries(r.cameras.map((f) => [f.index, f]));
+    renderCams(); renderUsbFound();
+    await usbStatus(r.cameras.length ? null
+      : `No USB camera opens${r.where === "Windows" ? " on Windows" : ""} (plugged in? another app using it?).`);
+  } catch (e) { toast(e.message, 15000); $("#src-usb-note").textContent = ""; }
+  finally { b.disabled = false; }
+});
+async function usbStatus(extra) {
+  let s;
+  try { s = await api("/api/usb"); } catch (e) { return; }      // older server
+  const note = $("#src-usb-note");
+  const parts = [];
+  if (extra) parts.push(esc(extra));
+  if (s.running) {
+    const devs = Object.entries(s.devices).map(([nm, d]) => `${esc(nm)} = camera ${d}`).join(", ");
+    parts.push(`<b>USB cameras streaming</b> (${esc(s.where)}, ${s.fps} fps asked): ${devs}.
+      <button class="btn small" id="src-usb-stop" title="frees the USB cameras for other apps; Save, Test or Warm up starts them again">Stop USB cameras</button>`);
+    if (s.error) parts.push(`<b class="badc">${esc(s.error)}</b>`);
+  } else if (s.error) {
+    parts.push(`USB cameras stopped: ${esc(s.error)}`);
+  } else if (Object.keys(usb.found).length) {
+    parts.push(`USB cameras found${usb.where === "Windows" ? " on Windows (this server runs in WSL)" : ""}: pick one with <b>+ Use</b> or the Type column.`);
+  }
+  note.innerHTML = parts.join(" ");
+  const stop = $("#src-usb-stop");
+  if (stop) stop.addEventListener("click", async () => {
+    try { await api("/api/usb/stop", {}); } catch (e) { toast(e.message, 7000); }
+    usbStatus();
+  });
+}
 // v0.8.7 one-click test cameras: the server plays the clip's ticked angles as looping cameras and saves them as the source
 function renderTestcams(s) {
   const note = $("#src-testcams-note"), b = $("#src-testcams");
@@ -207,13 +313,16 @@ $("#src-save").addEventListener("click", async () => {
   const c = clipOf(src.clip);
   const body = { kind: src.kind, clip: src.clip, views: src.views[src.clip] || c.live_views,
     video_variant: $("#src-variant").value || null, cameras: src.cams, fps: Number($("#src-fps").value), max_minutes: Number($("#src-mins").value) };
+  const usbRows = src.kind === "camera" && src.cams.some((c) => c.type === "usb" && c.use);
+  $("#src-msg").textContent = usbRows ? "Saving (starting the USB cameras)…" : "";
   try {
     state.input = await api("/api/input", body);
-    await camCalibStatus(); renderCams(); sidebar();
+    src.cams = (state.input.cameras || []).map((x) => ({ ...x }));              // USB rows now carry their address
+    await camCalibStatus(); renderCams(); sidebar(); usbStatus();
     const what = state.input.kind === "camera" ? `${usedCams().length} live camera${usedCams().length === 1 ? "" : "s"}`
       : `${c.label}, ${state.input.views.length} angle${state.input.views.length === 1 ? "" : "s"}`;
     $("#src-msg").textContent = `Saved: ${what}. Calibrate them (step 2), then warm up again (step 3).`;
-  } catch (e) { toast(e.message, 7000); }
+  } catch (e) { toast(e.message, usbRows ? 15000 : 7000); $("#src-msg").textContent = ""; }
 });
 
 // ------------------------------------------------------------------ settings form
@@ -325,7 +434,7 @@ function markChanged() {
   updateSecs();
 }
 
-async function loadSettings() {
+async function loadSettings(fresh) {       // fresh: drop the values changed on the page (a preset was picked)
   try { state.input = await api("/api/input"); } catch (e) { /* keep the last one */ }
   const clip = currentClip();
   if (!clip) return;
@@ -345,7 +454,13 @@ async function loadSettings() {
   if (blocked) { $("#groups").innerHTML = ""; $("#clip-info").textContent = ""; sourceLine(); return; }
   try {
     const d = await api(`/api/settings?clip=${encodeURIComponent(clip)}&preset=${encodeURIComponent(preset)}`);
-    state.base = d.values; state.values = JSON.parse(JSON.stringify(d.values));
+    const key = clip + "|" + preset, keep = {};      // same clip + preset as shown: the values changed here stay
+    if (!fresh && state.settingsKey === key && state.values && state.base)
+      Object.keys(state.values).forEach((k) => {
+        if (JSON.stringify(state.values[k]) !== JSON.stringify(state.base[k])) keep[k] = state.values[k];
+      });
+    state.base = d.values; state.values = Object.assign(JSON.parse(JSON.stringify(d.values)), keep);
+    state.settingsKey = key;
     renderForm();
   } catch (e) { toast("settings: " + e.message); }
   const p = state.presets.find((x) => x.name === preset);
@@ -372,7 +487,7 @@ async function loadPresets(select) {
   await loadSettings();
 }
 
-$("#preset").addEventListener("change", () => { state.presetPicked = true; loadSettings(); });
+$("#preset").addEventListener("change", () => { state.presetPicked = true; loadSettings(true); });
 $("#reset").addEventListener("click", () => { state.values = JSON.parse(JSON.stringify(state.base)); renderForm(); });
 $("#save").addEventListener("click", async () => {
   const name = $("#save-name").value.trim().toLowerCase();

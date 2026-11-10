@@ -136,6 +136,9 @@ class LiveEngine:
                 f"offsets {ws.get('offsets')}")
             self._set_state("ready", warm={k: ws.get(k) for k in ("players", "offsets", "ankle_h_m", "signs", "made",
                                                                    "warmup_steps", "seconds", "input")})
+        except Exception:                # the reason goes into this run's log before it closes
+            log(traceback.format_exc())
+            raise
         finally:
             log.close()
 
@@ -176,6 +179,9 @@ class LiveEngine:
                 log(f"  report failed: {type(e).__name__}: {e}")
             emit(ev="stream_done", run_dir=rd, written=res["written"], steps=res["steps"],
                  stopped=self.stop_ev.is_set())
+        except Exception:                # the reason goes into this run's log before it closes
+            log(traceback.format_exc())
+            raise
         finally:
             log.close()
             self._set_state("ready")
