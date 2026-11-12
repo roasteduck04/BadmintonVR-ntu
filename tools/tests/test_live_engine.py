@@ -724,3 +724,125 @@ def test_live_camera_calibration_frame_is_taken_again_after_a_new_source(tmp_pat
     c.frame_path("cam1.jpg")
     c.frame_path("back_051.jpg")                         # a recorded video never changes: its frame stays
     assert grabs == [("cam1", "cam1.jpg")]
+
+
+# ---------------------------------------------------------------------------------- cameras mounted upside down
+def test_rotate_tag_travels_with_the_camera_address(tmp_path, monkeypatch):
+    assert live_config.with_rotate("rtsp://pc:8554/unit1", 180) == "rtsp://pc:8554/unit1#rotate=180"
+    assert live_config.with_rotate("rtsp://pc:8554/unit1#rotate=180", 180) == "rtsp://pc:8554/unit1#rotate=180"
+    assert live_config.with_rotate("rtsp://pc:8554/unit1", None) == "rtsp://pc:8554/unit1"
+    assert live_config.split_rotate("rtsp://pc:8554/unit1#rotate=180") == ("rtsp://pc:8554/unit1", 180)
+    assert live_config.split_rotate("rtsp://pc:8554/unit1") == ("rtsp://pc:8554/unit1", 0)
+    img = np.arange(24, dtype=np.uint8).reshape(2, 4, 3)
+    assert np.array_equal(live_config.upright(img, 180), img[::-1, ::-1]) and live_config.upright(img, 0) is img
+    srv, s, _ = _usb_server(tmp_path, monkeypatch)
+    rows = [{"name": "unit1", "url": "rtsp://pc:8554/unit1", "rotate": 180},
+            {"name": "unit2", "url": "rtsp://pc:8554/unit2"},
+            {"name": "desk", "type": "usb", "device": 0, "rotate": True}]
+    d = s.set_input({"kind": "camera", "clip": "singles_05x", "cameras": rows, "fps": 60})
+    assert [c.get("rotate") for c in d["cameras"]] == [180, None, 180] and "rotate" not in d["cameras"][1]
+    cams = json.loads(next(x for x in s.input_sets() if x.startswith("input.cameras="))[len("input.cameras="):])
+    assert cams == {"unit1": "rtsp://pc:8554/unit1#rotate=180", "unit2": "rtsp://pc:8554/unit2",
+                    "desk": "http://127.0.0.1:8091/desk.mjpg#rotate=180"}
+    tested = {}
+    monkeypatch.setattr(s, "test_cameras", lambda cams, timeout_s=5.0: tested.update(cams) or {k: {"ok": True} for k in cams})
+    s.test_rows(rows)
+    assert tested["unit1"].endswith("#rotate=180") and tested["desk"].endswith("desk.mjpg#rotate=180")
+
+
+def test_camera_reader_and_camera_test_turn_an_upside_down_camera(tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import fake_camera as fc
+    from http.server import ThreadingHTTPServer
+    import cv2
+    from analysis.live import pose2d_fast as pf
+
+    img = np.zeros((48, 64, 3), np.uint8)
+    img[:24] = 255                                       # white on top, black below
+    ok, buf = cv2.imencode(".jpg", img)
+
+    class Cam:
+        size, fps, running = (64, 48), 30.0, True
+        cond = threading.Condition()
+        jpeg, seq = buf.tobytes(), 0
+
+        def wait_next(self, seq, timeout=2.0):
+            time.sleep(0.03)
+            Cam.seq += 1
+            return Cam.jpeg, Cam.seq
+
+    http = ThreadingHTTPServer(("127.0.0.1", 0), fc.make_handler({"v": Cam()}))
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{http.server_address[1]}/v.mjpg"
+    try:
+        for tag, top_white in (("", True), ("#rotate=180", False)):
+            rd = pf.open_reader("camera", url + tag, 0, 30.0)
+            try:
+                frame = rd.read(0)
+                assert (frame[:12].mean() > 200) == top_white and (frame[-12:].mean() > 200) != top_white
+            finally:
+                rd.close()
+        srv, s = _server(tmp_path)
+        t = s.test_cameras({"up": url, "down": url + "#rotate=180"})
+        assert t["up"]["ok"] and t["down"]["ok"] and t["up"]["thumb"] != t["down"]["thumb"]
+        assert live_config.probe_camera(url + "#rotate=180", 30, 1)["width"] == 64
+    finally:
+        Cam.running = False
+        http.shutdown()
+
+
+def test_calibration_frame_of_an_upside_down_camera_is_saved_upright(tmp_path, monkeypatch):
+    sys.path.insert(0, os.path.join(ROOT, "tools", "pipeline_server"))
+    import calib as calibmod
+    import cv2
+    img = np.zeros((48, 64, 3), np.uint8)
+    img[:24] = 255
+
+    class Cap:
+        def __init__(self, src, *a):
+            Cap.src = src
+
+        def read(self):
+            return True, img.copy()
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(calibmod.cv2, "VideoCapture", Cap)
+    c = calibmod.Calib(str(tmp_path), str(tmp_path))
+    c.grab({"view": "unit1", "video": "rtsp://pc:8554/unit1#rotate=180", "has_video": True}, 1.0, "unit1.jpg")
+    assert Cap.src == "rtsp://pc:8554/unit1"             # the tag never reaches FFmpeg
+    saved = cv2.imread(os.path.join(c.frames_dir, "unit1.jpg"))
+    assert saved[:12].mean() < 50 and saved[-12:].mean() > 200
+
+
+def test_ros_rtsp_bridge_command_and_restart():
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import ros_rtsp_bridge as rb
+    cmd = rb.ffmpeg_cmd("unit2", "rtsp://127.0.0.1:8554/", fps=60, flip=True)
+    assert cmd[-1] == "rtsp://127.0.0.1:8554/unit2" and cmd[cmd.index("-vf") + 1] == "hflip,vflip"
+    assert cmd.index("-use_wallclock_as_timestamps") < cmd.index("-i") < cmd.index("-fps_mode")
+    assert "-vf" not in rb.ffmpeg_cmd("unit1") and rb.ffmpeg_cmd("unit1")[-1].endswith(":8554/unit1")
+
+    class Proc:
+        made = []
+
+        def __init__(self, cmd, stdin=None):
+            self.dead, self.got = False, []
+            self.stdin = self
+            Proc.made.append(self)
+
+        def write(self, data):
+            self.got.append(data)
+
+        def poll(self):
+            return 1 if self.dead else None
+
+    now, logs = [0.0], []
+    p = rb.Pipe("unit1", ["ffmpeg"], log=logs.append, popen=Proc, clock=lambda: now[0])
+    assert p.write(b"a") and Proc.made[0].got == [b"a"]
+    Proc.made[0].dead = True                             # ffmpeg exited (the RTSP server went away)
+    assert not p.write(b"b") and len(logs) == 1 and len(Proc.made) == 1
+    now[0] = rb.RESTART_S + 0.1
+    assert p.write(b"c") and len(Proc.made) == 2 and Proc.made[1].got == [b"c"] and p.restarts == 1
+    assert rb.parse_args(["--flip-units", "unit3"]).flip_units == "unit3"

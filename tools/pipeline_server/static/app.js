@@ -148,6 +148,7 @@ function renderCams() {
     <td><select class="typ" data-i="${i}" data-f="type"><option value="network">Network</option>
       <option value="usb"${c.type === "usb" ? " selected" : ""}>USB on this PC</option></select></td>
     <td>${addrCell(c, i)}</td>
+    <td><input type="checkbox" data-i="${i}" data-f="rotate"${c.rotate ? " checked" : ""} title="this camera hangs upside down: turn its picture 180°"></td>
     <td class="test" data-test="${i}">–</td>
     <td>${c.name in state.camCalib ? calChip(state.camCalib[c.name], true) : calChip(null, false)}</td>
     <td><button class="btn small" data-del="${i}" title="remove this camera">×</button></td></tr>`).join("");
@@ -162,6 +163,7 @@ $("#src-cams").addEventListener("input", (ev) => {
     renderCams(); return;
   }
   if (f === "device") { c.device = Number(t.value); c.url = ""; renderCams(); return; }
+  if (f === "rotate") { if (t.checked) c.rotate = 180; else delete c.rotate; return; }
   c[f] = t.type === "checkbox" ? t.checked : t.value.trim();
 });
 function firstFreeDevice() {
