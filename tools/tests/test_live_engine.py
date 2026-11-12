@@ -1031,3 +1031,16 @@ def test_live_preview_feed_check_and_delay_test(tmp_path, monkeypatch):
     finally:
         Cam.running = False
         http.shutdown()
+
+
+def test_camera_warm_up_is_as_short_as_a_video_warm_up(tmp_path):
+    # the config turns camera input into "from now, up to input.max_minutes": a warm-up must not run that long
+    assert eng.warmup_sets({"input": {"kind": "video"}}, ["a=1"], 6.5, 7.5) == ["a=1", "section_s=[6.5, 7.5]"]
+    sets = eng.warmup_sets({"input": {"kind": "camera"}}, None, 0.0, 32 / 30.0)
+    assert sets[0].startswith("section_s=[0.0, ") and sets[1].startswith("input.max_minutes=")
+    minutes = float(sets[1].split("=")[1])
+    assert abs(minutes * 60 - 32 / 30.0) < 1e-9
+    srv, s = _server(tmp_path)
+    assert s.cpu_sets("live2d") == ["device=cpu"] and s.cpu_sets("stored2d") == []      # a PC without a GPU
+    s.machine = "rtx5090"
+    assert s.cpu_sets("live2d") == []

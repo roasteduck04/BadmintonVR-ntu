@@ -1144,9 +1144,14 @@ class Server:
                 out[k] = v
         return out
 
+    def cpu_sets(self, src) -> list:
+        """A PC without an NVIDIA GPU (machine preset laptop-cached) that is asked for the 2D from the video or the
+        cameras: the 2D models run on the CPU (slow; for checking a setup)."""
+        return ["device=cpu"] if src == "live2d" and self.machine == "laptop-cached" else []
+
     def warmup(self, clip, preset=None, values=None) -> dict:
         cfg, over, fps, src = self._request(clip, preset, values)
-        sets = st.as_set_args(over) + self.input_sets()
+        sets = st.as_set_args(over) + self.input_sets() + self.cpu_sets(src)
         if self.get_input()["kind"] == "camera" and src != "live2d":
             raise HTTPException(400, "camera input needs the 2D from the video (backend live, GPU PC)")
         j = self._ensure_engine(clip)
@@ -1166,7 +1171,7 @@ class Server:
         if j.engine.get("state") == "streaming":
             raise HTTPException(409, "a stream is already running")
         cfg, over, fps, src = self._request(clip, preset, values)
-        sets = st.as_set_args(over) + self.input_sets()
+        sets = st.as_set_args(over) + self.input_sets() + self.cpu_sets(src)
         changed = sorted(k for k in set(self._warm_part(sets)) | set((self.warm_request or {}).get("warm", {}))
                          if self._warm_part(sets).get(k) != (self.warm_request or {}).get("warm", {}).get(k))
         if changed:

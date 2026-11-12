@@ -619,8 +619,11 @@ async function waitEngine(ok, seconds, what) {
 $("#testrun").addEventListener("click", async () => {
   const b = $("#testrun"), msg = $("#testrun-msg"), TEST_S = 20;
   const say = (t) => { msg.hidden = false; msg.textContent = t; };
-  const noGpu = state.info.machine === "laptop-cached" && (state.input || {}).kind !== "camera";   // stored 2D instead
-  const preset = noGpu ? state.info.default_settings : state.presets.some((p) => p.name === "live_test") ? "live_test" : "live_30";
+  const noGpu = state.info.machine === "laptop-cached", cams = (state.input || {}).kind === "camera";
+  const has = (n) => state.presets.some((p) => p.name === n);
+  // no GPU: recorded videos use their stored 2D; live cameras run the smallest 2D models on the CPU (slow)
+  const preset = noGpu ? (cams && has("laptop_cameras") ? "laptop_cameras" : state.info.default_settings)
+    : has("live_test") ? "live_test" : "live_30";
   const clip = currentClip();
   b.disabled = true;
   try {
