@@ -460,7 +460,8 @@ class Server:
 
     def used_cameras(self, d=None) -> dict:
         d = d or self.get_input()
-        return {c["name"]: c["url"] for c in d.get("cameras") or [] if c.get("use", True) and c.get("url")}
+        return {c["name"]: live_config.with_rotate(c["url"], c.get("rotate"))
+                for c in d.get("cameras") or [] if c.get("use", True) and c.get("url")}
 
     @staticmethod
     def _camera_rows(raw):
@@ -480,6 +481,7 @@ class Server:
             if name in seen:
                 raise HTTPException(400, f"camera name {name!r} is used twice")
             seen.add(name)
+            rot = {"rotate": 180} if str(c.get("rotate")) in ("180", "True", "true", "1") else {}   # upside down
             if usb:
                 try:
                     dev = int(c.get("device", 0))
@@ -493,11 +495,11 @@ class Server:
                     raise HTTPException(400, f"{name}: USB camera {dev} is already {other}")
                 if use:
                     devs[name] = dev
-                cams.append({"name": name, "url": "", "use": use, "type": "usb", "device": dev})
+                cams.append({"name": name, "url": "", "use": use, "type": "usb", "device": dev, **rot})
                 continue
             if url and "://" not in url:
                 raise HTTPException(400, f"{name}: not a stream address (rtsp://, http://, tcp://, udp://...)")
-            cams.append({"name": name, "url": url, "use": bool(c.get("use", True)) and bool(url)})
+            cams.append({"name": name, "url": url, "use": bool(c.get("use", True)) and bool(url), **rot})
         return cams, devs
 
     def set_input(self, d) -> dict:
@@ -582,8 +584,8 @@ class Server:
         result of a USB row carries its relay address (url)."""
         cams, devs = self._camera_rows(rows)
         urls = self.usb_start(devs, float(fps or self.get_input().get("fps") or 60)) if devs else {}
-        out = self.test_cameras({c["name"]: urls.get(c["name"]) or c["url"] for c in cams
-                                 if c["url"] or c["name"] in urls}, timeout_s)
+        out = self.test_cameras({c["name"]: live_config.with_rotate(urls.get(c["name"]) or c["url"], c.get("rotate"))
+                                 for c in cams if c["url"] or c["name"] in urls}, timeout_s)
         for nm, u in urls.items():
             out[nm]["url"] = u
         return out
@@ -595,6 +597,7 @@ class Server:
         t = time.perf_counter()
         if "://" not in str(url):
             return {"ok": False, "error": "not a stream address"}
+        url, rot = live_config.split_rotate(url)
         where = "WSL" if in_wsl() else "this PC"
         reach = stream_reachable(url)                    # the network first: it tells a wrong address from a wrong path
         if reach is False:
@@ -616,6 +619,7 @@ class Server:
             if reach:
                 return {"ok": False, "error": f"the stream opened but sent no picture in {timeout_s:g} s"}
             return {"ok": False, "error": f"no frame in {timeout_s:g} s (address, port, firewall?)"}
+        img = live_config.upright(img, rot)
         h, w = img.shape[:2]
         ms = round(1000 * (time.perf_counter() - t))
         s = THUMB_W / w

@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from starlette.concurrency import run_in_threadpool
 
 from analysis import multiview as mv
+from analysis.live import config as live_config
 from analysis.pose24 import config as p24config
 
 SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
@@ -97,7 +98,7 @@ class Calib:
             cams = inp.get("cameras") or []
             if isinstance(cams, dict):
                 cams = [{"name": k, "url": v, "use": True} for k, v in cams.items()]
-            return [self.entry(c["name"], None, clip, mode, group="broadcast", url=c["url"])
+            return [self.entry(c["name"], None, clip, mode, group="broadcast", url=live_config.with_rotate(c["url"], c.get("rotate")))
                     for c in cams if c.get("use", True) and c.get("url") and SAFE.match(c.get("name") or "")]
         chosen = inp.get("views") or self.live_views(clip) or e.get("views") or []
         views = [v for v in (e.get("views") or []) if v in chosen]
@@ -159,7 +160,8 @@ class Calib:
             raise HTTPException(404, f"video of {cam['view']} not found ({cam.get('video')})")
         os.makedirs(self.frames_dir, exist_ok=True)
         is_url = "://" in str(cam["video"])
-        cap = (cv2.VideoCapture(cam["video"], cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, LIVE_GRAB_MS,
+        src, rot = live_config.split_rotate(cam["video"]) if is_url else (cam["video"], 0)
+        cap = (cv2.VideoCapture(src, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, LIVE_GRAB_MS,
                                                                cv2.CAP_PROP_READ_TIMEOUT_MSEC, LIVE_GRAB_MS])
                if is_url else cv2.VideoCapture(os.path.join(self.repo, cam["video"])))
         try:
@@ -175,6 +177,7 @@ class Calib:
         if not ok or img is None:
             at = f"frame {frame}" if frame is not None else f"{t_s} s"
             raise HTTPException(500, f"could not read {cam['view']} at {at}")
+        img = live_config.upright(img, rot)                   # an upside-down camera: calibrated the right way up
         cv2.imwrite(os.path.join(self.frames_dir, name), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
         return name
 

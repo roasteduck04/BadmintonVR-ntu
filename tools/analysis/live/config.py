@@ -157,9 +157,33 @@ def video_info(path) -> dict:
     return info
 
 
+ROTATE_TAG = "#rotate=180"
+
+
+def with_rotate(url, rotate) -> str:
+    """A camera mounted upside down: its address carries '#rotate=180' to every place that opens it."""
+    url = split_rotate(url)[0]
+    return url + ROTATE_TAG if url and str(rotate) in ("180", "True", "true", "1") else url
+
+
+def split_rotate(url):
+    """(address to open, 180 | 0): the '#rotate=180' ending of a camera address (with_rotate) taken off."""
+    url = str(url or "")
+    return (url[:-len(ROTATE_TAG)], 180) if url.endswith(ROTATE_TAG) else (url, 0)
+
+
+def upright(img, rot):
+    """The frame turned 180 degrees when its camera hangs upside down (same size, so calibration sizes hold)."""
+    if rot == 180 and img is not None:
+        import cv2
+        return cv2.rotate(img, cv2.ROTATE_180)
+    return img
+
+
 def probe_camera(url, fps, max_minutes) -> dict:
     """A camera stream: size from its first frame; fps and length (the longest stream) from the input config."""
     import cv2
+    url = split_rotate(url)[0]
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     try:
         ok, img = cap.read() if cap.isOpened() else (False, None)

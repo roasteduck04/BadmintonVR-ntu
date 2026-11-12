@@ -322,7 +322,9 @@ class CameraReader(Reader):
 
     def __init__(self, path, first, fps, short_side, threads=0, timeout_s=5.0):
         import cv2
-        self.cv2 = cv2
+        from .config import split_rotate, upright
+        self.cv2, self._upright = cv2, upright
+        path, self.rot = split_rotate(path)              # '#rotate=180': a camera mounted upside down
         self.path, self.fps, self.threads, self.timeout_s = path, float(fps), int(threads or 0), float(timeout_s)
         self.cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
         if not self.cap.isOpened():
@@ -330,6 +332,7 @@ class CameraReader(Reader):
         ok, img = self.cap.read()
         if not ok or img is None:
             raise FileNotFoundError(f"camera stream {path} sends no frames")
+        img = upright(img, self.rot)
         self.src_h, self.src_w = img.shape[:2]
         self.codec = "stream"
         self.out_w, self.out_h, self.scale = target_size(self.src_w, self.src_h, short_side)
@@ -346,6 +349,7 @@ class CameraReader(Reader):
             if not ok or img is None:
                 time.sleep(0.01)
                 continue
+            img = self._upright(img, self.rot)
             with self.cond:
                 self.latest, self.count, self.last_arrival_ns = img, self.count + 1, time.monotonic_ns()
                 self.cond.notify_all()
