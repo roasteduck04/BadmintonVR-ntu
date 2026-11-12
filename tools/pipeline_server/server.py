@@ -33,7 +33,7 @@ for p in (str(TOOLS), str(HERE)):
 import yaml  # noqa: E402
 from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 import calib as calibmod  # noqa: E402
@@ -55,6 +55,7 @@ USBCAMS_FILE = "usbcams.json"    # in the runs folder: the relay's pid / address
 USB_SIZE = "1920x1080"           # asked of every USB camera (it picks its nearest mode; the 2D shrinks to 1080 anyway)
 USB_MAX_DEVICE = 9
 USB_LOST_RE = re.compile(r"^camera (\S+): (no frames|frames again)\b")
+PREVIEW_W, PREVIEW_FPS, PREVIEW_MAX_S = 480, 12, 900     # step 1 live preview: width px, pictures / s, longest
 CAM_TEST_S = 10.0                # Test cameras: seconds each camera gets to open and to send a frame
 WSL_NET_HINT = (". The server runs in WSL: a camera that plays in VLC on Windows can still be out of reach from WSL - "
                 "in a WSL terminal try  ping <camera address>")
@@ -253,6 +254,9 @@ class Server:
         self._beat = {"t": None, "mono": 0.0}   # last heartbeat stamp seen + when (this process's monotonic clock)
         self.testcams = None             # v0.8.7 test cameras job (runs next to the engine / stream job)
         self.usbcams = None              # v0.8.7 USB camera relay job (USB rows of the live camera table)
+        self.preview_cams, self.preview_epoch = {}, 0     # v0.8.7 live preview of the camera rows (step 1)
+        self._feed = None                # v0.8.7 delay test in progress: {watches, toggles, fps}
+        self._feed_lock = threading.Lock()
         self._usb_lock = threading.RLock()
 
     # ------------------------------------------------------------------ catalogue
@@ -589,6 +593,154 @@ class Server:
         for nm, u in urls.items():
             out[nm]["url"] = u
         return out
+
+    # ------------------------------------------------------------------ v0.8.7 live preview (step 1)
+    def preview_set(self, rows, fps=None) -> dict:
+        """The camera rows to preview (USB rows start their relay): GET /api/input/preview/<name>.mjpg plays each."""
+        cams, devs = self._camera_rows(rows)
+        urls = self.usb_start(devs, float(fps or self.get_input().get("fps") or 60)) if devs else {}
+        self.preview_epoch += 1                          # earlier previews end
+        self.preview_cams = {c["name"]: live_config.with_rotate(urls.get(c["name"]) or c["url"], c.get("rotate"))
+                             for c in cams if c["url"] or c["name"] in urls}
+        return {"cameras": list(self.preview_cams), "epoch": self.preview_epoch}
+
+    def preview_stop(self) -> dict:
+        self.preview_epoch += 1
+        self.preview_cams = {}
+        return {"cameras": [], "epoch": self.preview_epoch}
+
+    def preview_frames(self, name):
+        """The camera's pictures as they arrive, small, a few per second, each labelled with the frame rate the
+        camera really delivers and the time - one multipart JPEG part per picture (an <img> plays it)."""
+        import collections
+        import cv2
+        import numpy as np
+        url, rot = live_config.split_rotate(self.preview_cams.get(name) or "")
+        epoch = self.preview_epoch
+
+        def part(img):
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            data = buf.tobytes() if ok else b""
+            return (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(data)).encode()
+                    + b"\r\n\r\n" + data + b"\r\n")
+
+        def label(img, text, colour=(255, 255, 255)):
+            cv2.putText(img, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(img, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
+            return img
+
+        def card(text):
+            return part(label(np.zeros((PREVIEW_W * 9 // 16, PREVIEW_W, 3), np.uint8), f"{name}: {text}", (80, 90, 255)))
+
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
+                                                     cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000])
+        try:
+            if not cap.isOpened():
+                yield card("the stream does not open (press Test cameras for the reason)")
+                return
+            arrivals, last, fails = collections.deque(maxlen=600), 0.0, 0
+            t_end = time.monotonic() + PREVIEW_MAX_S
+            while epoch == self.preview_epoch and time.monotonic() < t_end:
+                ok, img = cap.read()                     # every frame is read (and dropped) so the picture is current
+                now = time.monotonic()
+                if not ok or img is None:
+                    fails += 1
+                    if fails > 100:
+                        yield card("stopped sending pictures")
+                        return
+                    time.sleep(0.01)
+                    continue
+                fails = 0
+                arrivals.append(now)
+                if now - last < 1.0 / PREVIEW_FPS:
+                    continue
+                last = now
+                h, w = img.shape[:2]
+                img = cv2.resize(live_config.upright(img, rot), (PREVIEW_W, max(1, round(h * PREVIEW_W / w))),
+                                 interpolation=cv2.INTER_AREA)
+                got = sum(1 for t in arrivals if now - t <= 1.0)
+                yield part(label(img, f"{name}  {got} fps arriving  {w}x{h}  {time.strftime('%H:%M:%S')}"))
+        finally:
+            cap.release()
+
+    # ------------------------------------------------------------------ v0.8.7 feed check + delay test (step 1)
+    def _feed_watches(self, rows, fps):
+        import camera_check as cc                        # tools/camera_check.py: the same numbers as the command
+        cams, devs = self._camera_rows(rows)
+        fps = float(fps or self.get_input().get("fps") or 60)
+        urls = self.usb_start(devs, fps) if devs else {}
+        addr = {c["name"]: live_config.with_rotate(urls.get(c["name"]) or c["url"], c.get("rotate"))
+                for c in cams if c["url"] or c["name"] in urls}
+        if not addr:
+            raise HTTPException(400, "no camera address to check")
+        watches = {n: cc.Watch(n, u) for n, u in addr.items()}
+        for w in watches.values():
+            w.start()
+        t_end = time.monotonic() + cc.OPEN_MS / 1000 + 2
+        while time.monotonic() < t_end and any(w.first is None and w.error is None and w.is_alive()
+                                               for w in watches.values()):
+            time.sleep(0.1)
+        return cc, watches, fps
+
+    def _feed_result(self, cc, watches, fps, toggles=None) -> dict:
+        import cv2
+        for w in watches.values():
+            w.running = False
+        for w in watches.values():
+            w.join(cc.OPEN_MS / 1000 + 2)
+        out_dir = self.runs / ("camera_check_" + time.strftime("%Y-%m-%d_%H%M%S"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cams, lines = {}, [f"camera check {time.strftime('%Y-%m-%d %H:%M:%S')}, {fps:g} fps expected"]
+        for n, w in watches.items():
+            t, b, d = w.series()
+            st_ = cc.stats(t, d, fps)
+            delays = cc.flash_delays(t, b, toggles) if toggles else None
+            seen = [x for x in (delays or []) if x is not None]
+            cams[n] = {"size": w.size, "codec": w.codec, "open_s": w.open_s, "first_frame_s": w.first_s,
+                       "error": w.error, "stats": st_, "verdict": cc.verdict(st_, fps), "delays_s": delays,
+                       "flashes_seen": len(seen)}
+            if len(seen) >= min(3, len(delays or [])) and seen:      # one odd brightness change is not a delay
+                cams[n].update(delay_s=round(cc.pct(seen, 50), 2), delay_min_s=round(min(seen), 2),
+                               delay_max_s=round(max(seen), 2))
+            lines += [""] + cc.report_lines(n, w, st_, fps, delays)
+            if w.last is not None:
+                cv2.imwrite(str(out_dir / f"{n}.jpg"), w.last, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        (out_dir / "report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        atomic_json(out_dir / "report.json", {"fps": fps, "cameras": cams})
+        return {"fps": fps, "cameras": cams, "folder": win_path(out_dir), "flashes": len(toggles or [])}
+
+    def feed_check(self, rows, fps=None, seconds=15.0) -> dict:
+        """Read every camera row for `seconds` the way the engine does: frame rate, gaps, freezes, repeated frames."""
+        cc, watches, fps = self._feed_watches(rows, fps)
+        time.sleep(max(2.0, min(120.0, float(seconds))))
+        return self._feed_result(cc, watches, fps)
+
+    def delay_start(self, rows, fps=None) -> dict:
+        """Delay test: the page flashes white / black (delay_flash at each change) while the cameras are read here;
+        delay_finish gives each camera's delay from the screen to this PC."""
+        with self._feed_lock:
+            if self._feed is not None:
+                for w in self._feed["watches"].values():
+                    w.running = False
+            cc, watches, fps = self._feed_watches(rows, fps)
+            self._feed = {"cc": cc, "watches": watches, "fps": fps, "toggles": []}
+        return {"cameras": [n for n, w in watches.items() if w.first is not None],
+                "failed": {n: w.error or "no picture yet" for n, w in watches.items() if w.first is None}}
+
+    def delay_flash(self, white) -> dict:
+        f = self._feed
+        if f is None:
+            raise HTTPException(409, "no delay test is running")
+        f["toggles"].append((time.perf_counter(), 1 if white else -1))
+        return {"flashes": len(f["toggles"])}
+
+    def delay_finish(self) -> dict:
+        with self._feed_lock:
+            f, self._feed = self._feed, None
+        if f is None:
+            raise HTTPException(409, "no delay test is running")
+        time.sleep(3.0)                                  # the last flash arrives too
+        return self._feed_result(f["cc"], f["watches"], f["fps"], f["toggles"])
 
     @staticmethod
     def _test_camera(url, timeout_s) -> dict:
@@ -1303,6 +1455,44 @@ def create_app(server: Server, allowed_hosts=("127.0.0.1", "localhost"), port=87
         if b.get("rows") is not None:                            # v0.8.7: the table's rows (network + USB)
             return await run_in_threadpool(server.test_rows, b["rows"], b.get("fps"))
         return await run_in_threadpool(server.test_cameras, b.get("cameras") or server.used_cameras())
+
+    @app.post("/api/input/check")
+    async def input_check(request: Request):
+        from starlette.concurrency import run_in_threadpool
+        b = await request.json()
+        return await run_in_threadpool(server.feed_check, b.get("rows") or [], b.get("fps"), b.get("seconds") or 15)
+
+    @app.post("/api/input/delay/start")
+    async def input_delay_start(request: Request):
+        from starlette.concurrency import run_in_threadpool
+        b = await request.json()
+        return await run_in_threadpool(server.delay_start, b.get("rows") or [], b.get("fps"))
+
+    @app.post("/api/input/delay/flash")
+    async def input_delay_flash(request: Request):
+        return server.delay_flash(bool((await request.json()).get("white")))
+
+    @app.post("/api/input/delay/finish")
+    async def input_delay_finish():
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(server.delay_finish)
+
+    @app.post("/api/input/preview")
+    async def input_preview(request: Request):
+        from starlette.concurrency import run_in_threadpool     # USB rows start their relay (seconds)
+        b = await request.json()
+        return await run_in_threadpool(server.preview_set, b.get("rows") or [], b.get("fps"))
+
+    @app.post("/api/input/preview/stop")
+    def input_preview_stop():
+        return server.preview_stop()
+
+    @app.get("/api/input/preview/{name}.mjpg")
+    def input_preview_stream(name: str):
+        if not CAM_NAME.match(name) or name not in server.preview_cams:
+            raise HTTPException(404, f"no preview for camera {name!r} (press Live preview in step 1)")
+        return StreamingResponse(server.preview_frames(name), media_type="multipart/x-mixed-replace; boundary=frame",
+                                 headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/usb")
     def usb_get():

@@ -97,6 +97,17 @@ const Calib = (() => {
       ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
       ctx.beginPath(); ctx.arc(ax, ay, 5, 0, Math.PI * 2); ctx.stroke();
     }
+    for (const [n, p] of Object.entries(C.sugg || {})) {    // suggestions: where the other points should be
+      if (C.pts[n]) continue;
+      const [x, y] = toScr(p[0], p[1]), next = n === C.sel;
+      ctx.setLineDash([4, 3]); ctx.lineWidth = next ? 2.5 : 1.5;
+      ctx.strokeStyle = next ? "#5dff9a" : "rgba(93, 255, 154, .55)";
+      ctx.beginPath(); ctx.arc(x, y, next ? 11 : 7, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0,0,0,.7)"; ctx.strokeText(n, x + 12, y + 4);
+      ctx.fillStyle = next ? "#5dff9a" : "rgba(93, 255, 154, .75)"; ctx.fillText(n, x + 12, y + 4);
+    }
+    ctx.lineWidth = 2;
     C.order.forEach((n, i) => {
       const [x, y] = toScr(C.pts[n][0], C.pts[n][1]);
       const bad = C.proj[n] && C.proj[n][2] > RMS_WARN;
@@ -159,7 +170,20 @@ const Calib = (() => {
   }
   const nextName = () => C.names.find((n) => !C.pts[n]) || null;
 
+  // suggested places of the points not clicked yet (4+ clicks): dashed rings, the next point's ring is brighter
+  async function suggest() {
+    const cam = C.cam, tok = (C.suggTok = (C.suggTok || 0) + 1);
+    if (!cam || C.order.length < 4) { C.sugg = {}; return; }
+    try {
+      const r = await api("/calib/api/suggest", { view: cam.view,
+        points: C.order.map((n) => ({ name: n, px: C.pts[n][0], py: C.pts[n][1] })) });
+      if (tok !== C.suggTok || C.cam !== cam) return;
+      C.sugg = r.points || {};
+    } catch (e) { if (tok === C.suggTok) C.sugg = {}; }
+    draw();
+  }
   function listPoints() {
+    suggest();
     $("#cal-pts tbody").innerHTML = C.order.map((n) => {
       const p = C.pts[n], e = C.proj[n] ? C.proj[n][2] : null;
       return `<tr class="${n === C.sel ? "sel" : ""}"><td>${n}</td><td>${Math.round(p[0])}, ${Math.round(p[1])}</td>
@@ -214,8 +238,13 @@ const Calib = (() => {
       if (f === null) return;
       body.frame = Number(f);
     }
-    try { await api("/calib/api/re-extract", body); loadFrame(); }
-    catch (e) { toast(e.message, 6000); }
+    const btn = $("#cal-frame");
+    btn.disabled = true;
+    try {
+      const r = await api("/calib/api/re-extract", body); loadFrame();
+      if (C.cam.input === "camera" && r.taken) toast(`New picture from ${C.cam.view}, taken at ${r.taken}. If it shows an older moment, the stream itself is behind (python tools/camera_check.py --latency measures it).`, 7000);
+    } catch (e) { toast(e.message, 6000); }
+    finally { btn.disabled = false; }
   });
 
   async function save() {
