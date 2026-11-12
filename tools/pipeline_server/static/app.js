@@ -46,6 +46,7 @@ function showStep(step) {
   state.step = step;
   document.querySelectorAll("#steps .step").forEach((x) => x.classList.toggle("on", x.dataset.step === step));
   document.querySelectorAll(".panel").forEach((p) => (p.hidden = p.id !== "step-" + step));
+  if (step !== "source") stopLive();
   if (step === "source") loadSource();
   if (step === "calibrate") Calib.open();
   if (step === "stream") loadSettings();          // a new calibration / sync file shows in the clip line
@@ -209,6 +210,82 @@ $("#src-test").addEventListener("click", async () => {
     toast(e.message, 12000);
     document.querySelectorAll("#src-cams [data-test]").forEach((td) => (td.textContent = "–"));
   }
+});
+
+// v0.8.7 what the feed really does: Check the feed (15 s of reading, like the engine) and Measure delay (the page
+// flashes, the server times when each camera shows it)
+const feedRows = () => src.cams.filter((c) => c.url || c.type === "usb");
+function showFeed(r, what) {
+  const rows = Object.entries(r.cameras).map(([n, c]) => {
+    const s = c.stats || {};
+    if (!s.fps) return `<tr><td><b>${esc(n)}</b></td><td colspan="5" class="badc">${esc(c.error || "no frames arrived")}</td></tr>`;
+    const low = s.fps < 0.9 * r.fps;
+    const delay = c.delays_s ? (c.delay_s != null ? `<b>${c.delay_s} s</b> <span class="tiny muted">(${c.delay_min_s}–${c.delay_max_s}, ${c.flashes_seen} of ${c.delays_s.length} flashes)</span>`
+      : '<span class="muted">screen not seen</span>') : "–";
+    return `<tr><td><b>${esc(n)}</b><div class="tiny muted">${c.size ? c.size[0] + "×" + c.size[1] : ""} ${esc(c.codec || "")}</div></td>
+      <td class="${low ? "badc" : "good"}">${s.fps} fps<div class="tiny muted">worst second ${s.fps_worst_second}</div></td>
+      <td>${s.gap_ms_p50} ms<div class="tiny muted">1 in 20 above ${s.gap_ms_p95} · longest ${s.gap_ms_max}</div></td>
+      <td>${delay}</td>
+      <td>${c.verdict.map((v) => `<div class="${v === "steady" ? "good" : "warnc"}">${esc(v)}</div>`).join("")}</td></tr>`;
+  }).join("");
+  $("#src-feed").innerHTML = `<div class="small"><b>${esc(what)}</b> · ${r.fps} fps expected · even spacing = ${(1000 / r.fps).toFixed(1)} ms</div>
+    <div class="table-wrap"><table class="tbl"><thead><tr><th>Camera</th><th>Arriving</th><th>Time between frames</th><th>Delay</th><th>Findings</th></tr></thead>
+    <tbody>${rows}</tbody></table></div><div class="tiny muted">Report and one picture per camera: ${esc(r.folder)}</div>`;
+}
+$("#src-check").addEventListener("click", async () => {
+  const rows = feedRows();
+  if (!rows.length) { toast("Add a camera address first."); return; }
+  const b = $("#src-check"); b.disabled = true; b.textContent = "Checking (15 s)…";
+  try { showFeed(await api("/api/input/check", { rows, fps: Number($("#src-fps").value), seconds: 15 }), "Feed check, 15 s"); }
+  catch (e) { toast(e.message, 12000); }
+  finally { b.disabled = false; b.textContent = "Check the feed"; }
+});
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+$("#src-delay").addEventListener("click", async () => {
+  const rows = feedRows();
+  if (!rows.length) { toast("Add a camera address first."); return; }
+  if (!confirm("Aim one or more cameras at this screen (the closer it fills the picture, the better). The page will flash white and black for about 40 seconds.")) return;
+  const b = $("#src-delay"), fl = $("#flash"); b.disabled = true;
+  try {
+    const s = await api("/api/input/delay/start", { rows, fps: Number($("#src-fps").value) });
+    if (!s.cameras.length) throw new Error("no camera sends a picture: " + Object.entries(s.failed).map(([n, e]) => `${n} ${e}`).join(", "));
+    fl.className = ""; fl.hidden = false;
+    await pause(3000);
+    let white = false;
+    for (let i = 0; i < 10; i++) {
+      white = !white;
+      fl.className = white ? "white" : "";
+      await new Promise((r) => requestAnimationFrame(r));
+      await api("/api/input/delay/flash", { white });
+      await pause(3000 + Math.random() * 1000);
+    }
+    fl.hidden = true;
+    showFeed(await api("/api/input/delay/finish", {}), "Delay test, 10 flashes");
+  } catch (e) { fl.hidden = true; toast(e.message, 12000); api("/api/input/delay/finish", {}).catch(() => {}); }
+  finally { b.disabled = false; }
+});
+
+// v0.8.7 live preview: every camera row with an address plays in the page (small, a few pictures a second, each
+// labelled with the frame rate that really arrives) while the cameras are set up and tested
+let liveOn = false;
+function stopLive() {
+  if (!liveOn) return;
+  liveOn = false;
+  $("#src-live-grid").innerHTML = ""; $("#src-live").textContent = "Live preview";
+  api("/api/input/preview/stop", {}).catch(() => {});
+}
+$("#src-live").addEventListener("click", async () => {
+  if (liveOn) { stopLive(); return; }
+  const rows = src.cams.filter((c) => c.url || c.type === "usb");
+  if (!rows.length) { toast("Add a camera address first."); return; }
+  const b = $("#src-live"); b.disabled = true;
+  try {
+    const r = await api("/api/input/preview", { rows, fps: Number($("#src-fps").value) });
+    liveOn = true; b.textContent = "Stop preview";
+    $("#src-live-grid").innerHTML = r.cameras.map((n) =>
+      `<figure><img src="/api/input/preview/${encodeURIComponent(n)}.mjpg?e=${r.epoch}" alt="${esc(n)}"><figcaption class="tiny muted">${esc(n)}</figcaption></figure>`).join("");
+  } catch (e) { toast(e.message, 12000); }
+  finally { b.disabled = false; }
 });
 
 // v0.8.7 USB cameras on this PC: Find lists them (preview each), "+ Use" adds a row; the relay status line
@@ -524,6 +601,49 @@ async function warmup() {
   } catch (e) { $("#warm").disabled = false; toast(e.message, 8000); }
 }
 $("#warm").addEventListener("click", warmup);
+
+// v0.8.7 one click: warm up on the lightest settings, stream 20 s without Unity, stop, show the time report
+async function engineNow() { const d = await api("/api/job"); showJob(d.current); return d.current && d.current.kind === "engine" ? d.current : null; }
+async function waitEngine(ok, seconds, what) {
+  const t_end = Date.now() + seconds * 1000;
+  while (Date.now() < t_end) {
+    const j = await engineNow();
+    if (!j || j.state !== "running") throw new Error(`the engine stopped while ${what}` + (j && j.error ? `: ${j.error}` : ""));
+    const e = j.engine || {};
+    if (e.error && e.error.message) throw new Error(e.error.message);
+    if (ok(e)) return e;
+    await pause(1000);
+  }
+  throw new Error(`still ${what} after ${Math.round(seconds / 60)} min`);
+}
+$("#testrun").addEventListener("click", async () => {
+  const b = $("#testrun"), msg = $("#testrun-msg"), TEST_S = 20;
+  const say = (t) => { msg.hidden = false; msg.textContent = t; };
+  const noGpu = state.info.machine === "laptop-cached" && (state.input || {}).kind !== "camera";   // stored 2D instead
+  const preset = noGpu ? state.info.default_settings : state.presets.some((p) => p.name === "live_test") ? "live_test" : "live_30";
+  const clip = currentClip();
+  b.disabled = true;
+  try {
+    say(`Test run 1/4: warming up on preset ${preset} (the first time on this PC can take minutes)…`);
+    await api("/api/engine/warmup", { clip, preset, values: {} });
+    await waitEngine((e) => ["loading", "warming"].includes(e.state), 30, "starting the warm-up").catch(() => {});
+    const w = await waitEngine((e) => e.state === "ready" && e.warm, 45 * 60, "warming up");
+    const players = Object.entries((w.warm || {}).players || {}).map(([p, ok]) => `${p} ${ok ? "✓" : "✗"}`).join(" ");
+    say(`Test run 2/4: warm (${players}). Streaming for ${TEST_S} s…`);
+    await api("/api/stream/start", { clip, preset, values: {}, force: true });
+    await waitEngine((e) => e.state === "streaming", 60, "starting the stream");
+    const t0 = Date.now();
+    while (Date.now() - t0 < TEST_S * 1000) { await engineNow(); await pause(1000); }
+    say("Test run 3/4: stopping, saving the analysis file and the report…");
+    await api("/api/stream/stop", {});
+    const e = await waitEngine((x) => x.state === "ready", 5 * 60, "saving the stream");
+    const run = e.last_stream && e.last_stream.run_dir ? e.last_stream.run_dir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() : null;
+    say(`Test run 4/4: done${e.last_stream ? ` · ${e.last_stream.written} frames written` : ""}${run ? ` · ${run}` : ""}. The time report is below.`);
+    await loadRuns();
+    if (run) await loadTiming(run);
+  } catch (err) { say("Test run failed: " + err.message + " (the full output is in runs/server_logs/)"); toast(err.message, 12000); }
+  finally { b.disabled = false; pollJob(); }
+});
 $("#engine-off").addEventListener("click", async () => {
   try { showJob(await api("/api/engine/stop", {})); toast("Engine shut down (the models are unloaded)."); } catch (e) { toast(e.message); }
 });

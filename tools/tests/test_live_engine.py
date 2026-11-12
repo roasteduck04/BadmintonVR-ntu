@@ -846,3 +846,188 @@ def test_ros_rtsp_bridge_command_and_restart():
     now[0] = rb.RESTART_S + 0.1
     assert p.write(b"c") and len(Proc.made) == 2 and Proc.made[1].got == [b"c"] and p.restarts == 1
     assert rb.parse_args(["--flip-units", "unit3"]).flip_units == "unit3"
+
+
+# ---------------------------------------------------------------------------------- camera check (what the feed does)
+def test_camera_check_numbers_and_plain_words():
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import camera_check as cc
+    even = [i / 60.0 for i in range(600)]
+    st = cc.stats(even, [255.0] + [3.0] * 599, 60)
+    assert st["fps"] == 60.0 and st["freezes"] == 0 and st["late_gaps"] == 0 and st["still_pct"] == 0
+    assert abs(st["gap_ms_p50"] - 16.7) < 0.1 and cc.verdict(st, 60) == ["steady"]
+    # half the frames lost and repeated by the bridge, one freeze, frames in bursts of four
+    t, bad = 0.0, []
+    for i in range(400):
+        t += 0.001 if i % 4 else 0.064
+        if i == 200:
+            t += 1.2
+        bad.append(t)
+    st = cc.stats(bad, [255.0] + [0.0 if i % 2 else 3.0 for i in range(399)], 60)
+    v = " | ".join(cc.verdict(st, 60))
+    assert st["freezes"] == 1 and st["longest_freeze_s"] >= 1.2 and st["burst_pct"] > 60 and 45 < st["still_pct"] < 55
+    assert "froze 1 time" in v and "bursts" in v and "no change" in v
+    assert cc.verdict(cc.stats([0.0], [255.0], 60), 60) == ["no frames arrived"]
+    assert cc.hide_login("rtsp://user:pw@10.0.0.9/s") == "rtsp://<login>@10.0.0.9/s"
+
+
+def test_camera_check_flash_delay_and_saved_source(tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import camera_check as cc
+    toggles = [(5.0, 1), (9.0, -1), (13.0, 1)]
+    times = [i / 30.0 for i in range(30 * 17)]
+    delay = 0.8
+
+    def level(t):                                        # the camera shows each flash 0.8 s late
+        lit = False
+        for t0, sign in toggles:
+            if t >= t0 + delay:
+                lit = sign > 0
+        return 180.0 if lit else 40.0
+
+    d = cc.flash_delays(times, [level(t) for t in times], toggles)
+    assert all(x is not None and abs(x - delay) < 0.05 for x in d)
+    assert cc.flash_delays(times, [90.0] * len(times), toggles) == [None, None, None]     # never saw the screen
+    p = tmp_path / "input.json"
+    p.write_text(json.dumps({"kind": "camera", "fps": 60, "cameras": [
+        {"name": "unit1", "url": "rtsp://pc:8554/unit1", "use": True, "rotate": 180},
+        {"name": "unit2", "url": "rtsp://pc:8554/unit2", "use": False},
+        {"name": "unit3", "url": "", "use": True}]}))
+    assert cc.cameras_from_input(str(p)) == ({"unit1": "rtsp://pc:8554/unit1#rotate=180"}, 60.0)
+    out = io.StringIO()
+    tg = cc.run_latency({}, n=3, gap_s=(0.0, 0.0), out=out, sleep=lambda s: None)
+    assert [s for _, s in tg] == [1, -1, 1] and out.getvalue().endswith("\x1b[0m\x1b[2J\x1b[H")
+
+
+def test_camera_check_reads_a_stream_end_to_end(tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import camera_check as cc
+    import fake_camera as fc
+    import cv2
+    from http.server import ThreadingHTTPServer
+
+    class Cam:
+        size, fps, running = (64, 48), 30.0, True
+        cond = threading.Condition()
+        seq = 0
+
+        def wait_next(self, seq, timeout=2.0):
+            time.sleep(1 / 30.0)
+            Cam.seq += 1
+            img = np.full((48, 64, 3), (Cam.seq * 7) % 255, np.uint8)       # every frame differs
+            return cv2.imencode(".jpg", img)[1].tobytes(), Cam.seq
+
+    http = ThreadingHTTPServer(("127.0.0.1", 0), fc.make_handler({"v": Cam()}))
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    try:
+        out = tmp_path / "check"
+        rc = cc.main(["--url", f"v=http://127.0.0.1:{http.server_address[1]}/v.mjpg", "--seconds", "2", "--fps", "30",
+                      "--out", str(out)])
+    finally:
+        Cam.running = False
+        http.shutdown()
+    doc = json.loads((out / "report.json").read_text())
+    st = doc["cameras"]["v"]["stats"]
+    assert rc == 0 and doc["cameras"]["v"]["size"] == [64, 48] and 20 < st["fps"] < 40 and st["freezes"] == 0
+    assert (out / "v.jpg").exists() and (out / "report.txt").read_text().count("fps") >= 2
+    assert (out / "v_frames.csv").read_text().splitlines()[0] == "t_s,gap_ms,brightness,change"
+
+
+def test_live_calibration_frame_is_the_newest_one(tmp_path, monkeypatch):
+    sys.path.insert(0, os.path.join(ROOT, "tools", "pipeline_server"))
+    import calib as calibmod
+    import cv2
+
+    class Cap:                                           # a stream that opens on 5 buffered (old) frames
+        def __init__(self, src, *a):
+            self.n = 0
+
+        def read(self):
+            self.n += 1
+            if self.n > 40:
+                return False, None
+            return True, np.full((48, 64, 3), 10 if self.n <= 5 else 200, np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(calibmod.cv2, "VideoCapture", Cap)
+    c = calibmod.Calib(str(tmp_path), str(tmp_path))
+    c.grab({"view": "unit1", "video": "rtsp://pc:8554/unit1", "has_video": True}, 1.0, "unit1.jpg")
+    assert cv2.imread(os.path.join(c.frames_dir, "unit1.jpg")).mean() > 150       # not the first, old frame
+
+
+# ---------------------------------------------------------------------------------- setup helpers on the page
+def test_calibration_suggests_the_points_not_clicked_yet(tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "tools", "pipeline_server"))
+    import calib as calibmod
+    import cv2
+    c = calibmod.Calib(str(tmp_path), str(tmp_path))
+    cp = calibmod._court_points()
+    names = list(cp)
+    H = np.array([[60.0, 8.0, 900.0], [-4.0, -35.0, 600.0], [0.002, -0.03, 1.0]])      # a court seen in perspective
+    px = cv2.perspectiveTransform(np.array([cp[n] for n in names], np.float64).reshape(-1, 1, 2), H).reshape(-1, 2)
+    spread = [names[i] for i in (0, len(names) // 5, 2 * len(names) // 5, 3 * len(names) // 5, len(names) - 1)]
+    body = {"points": [{"name": n, "px": float(px[names.index(n)][0]), "py": float(px[names.index(n)][1])}
+                       for n in spread]}
+    r = c.suggest(body)
+    assert set(r["points"]) == set(names) - set(spread) and r["fit_px"] < 1.0
+    for n, (x, y) in r["points"].items():
+        assert abs(x - px[names.index(n)][0]) < 1.0 and abs(y - px[names.index(n)][1]) < 1.0
+    assert c.suggest({"points": body["points"][:3]}) == {"points": {}, "fit_px": None}         # 4 clicks needed
+    body["points"][0]["px"] += 900                       # one click far off its line crossing: no guess is shown
+    body["points"][1]["py"] -= 700
+    assert c.suggest(body)["points"] == {}
+
+
+def test_live_preview_feed_check_and_delay_test(tmp_path, monkeypatch):
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import fake_camera as fc
+    import cv2
+    from fastapi import HTTPException
+    from http.server import ThreadingHTTPServer
+
+    class Cam:
+        size, fps, running = (64, 48), 30.0, True
+        cond = threading.Condition()
+        seq, level = 0, 40
+
+        def wait_next(self, seq, timeout=2.0):
+            time.sleep(1 / 30.0)
+            Cam.seq += 1
+            img = np.full((48, 64, 3), Cam.level + Cam.seq % 3, np.uint8)
+            return cv2.imencode(".jpg", img)[1].tobytes(), Cam.seq
+
+    http = ThreadingHTTPServer(("127.0.0.1", 0), fc.make_handler({"v": Cam()}))
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{http.server_address[1]}/v.mjpg"
+    srv, s = _server(tmp_path)
+    rows = [{"name": "unit1", "url": url, "rotate": 180}, {"name": "empty", "url": ""}]
+    try:
+        p = s.preview_set(rows)
+        assert p["cameras"] == ["unit1"] and s.preview_cams["unit1"].endswith("#rotate=180")
+        gen = s.preview_frames("unit1")
+        part = next(gen)
+        assert part.startswith(b"--frame\r\nContent-Type: image/jpeg") and b"\xff\xd8" in part
+        s.preview_stop()                                 # the page left step 1: the stream ends
+        assert list(gen) == [] and s.preview_cams == {}
+        r = s.feed_check(rows, fps=30, seconds=2)
+        st = r["cameras"]["unit1"]["stats"]
+        assert 20 < st["fps"] < 40 and list(r["cameras"]["unit1"]["size"]) == [64, 48] and r["flashes"] == 0
+        assert (tmp_path / "runs").glob("camera_check_*/report.txt") and "unit1" in r["cameras"]
+        with pytest.raises(HTTPException):
+            s.feed_check([{"name": "empty", "url": ""}])
+        with pytest.raises(HTTPException):
+            s.delay_flash(True)                          # no test running
+        monkeypatch.setattr(srv.time, "sleep", time.sleep)
+        assert s.delay_start(rows, fps=30)["cameras"] == ["unit1"]
+        for white in (True, False, True):
+            time.sleep(0.7)
+            Cam.level = 200 if white else 40             # the "screen" the camera looks at
+            s.delay_flash(white)
+        time.sleep(0.7)
+        d = s.delay_finish()["cameras"]["unit1"]
+        assert d["flashes_seen"] == 3 and 0 <= d["delay_s"] < 0.6 and len(d["delays_s"]) == 3
+    finally:
+        Cam.running = False
+        http.shutdown()

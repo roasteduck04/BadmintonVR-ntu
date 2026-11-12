@@ -21,7 +21,7 @@ from analysis.live import config as live_config
 
 SETTINGS_DIR = os.path.join(live_config.CONFIG_DIR, "settings")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
-BUILTIN = ("best_live", "pure_live", "laptop_realtime", "live_30")     # shipped presets: Save as preset never overwrites them
+BUILTIN = ("best_live", "pure_live", "laptop_realtime", "live_30", "live_test")     # shipped presets: Save as preset never overwrites them
 
 # group, key, label, kind, extra. kinds: choice (options), int, float, bool, optfloat (a number or off = null),
 # range (two floats). "live_only": only sent when the 2D comes from the video (backend live). "frames": the config value

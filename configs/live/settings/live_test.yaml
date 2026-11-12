@@ -1,0 +1,16 @@
+_about: "Lightest settings, for checking a setup (v0.8.7): live_30 with the person detector every 10 frames. Used by the 'Warm up + 20 s test' button; for a real session pick live_30 or best_live."
+backend: live
+output_fps: 30
+pace: realtime
+sync.offsets: file
+sync.mode: nearest
+rtmpose.engine: fast
+rtmpose.decoder: pyav
+rtmpose.decode_short_side: 1080
+rtmpose.court_filter_m: 1.0
+rtmpose.det_every: 10
+cpu.limits: true
+stream.late_policy: behind
+stream.solver_tol: 1.0e-4
+stream.lsmr_maxiter: 20
+warmup.seconds: 1.0

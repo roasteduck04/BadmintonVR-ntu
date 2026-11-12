@@ -106,6 +106,15 @@ td .acts { display: flex; gap: 6px; }
 #src-cams select.dev { min-width: 0; width: 100%; max-width: 360px; }
 .usb-list { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
 .usb-list:empty { display: none; }
+.live-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; margin-top: 10px; }
+.live-grid:empty { display: none; }
+#src-feed:empty { display: none; }
+#src-feed { margin-top: 10px; }
+#src-feed td, #src-feed th { vertical-align: top; white-space: normal; }
+#flash { position: fixed; inset: 0; z-index: 9999; background: #000; }
+#flash.white { background: #fff; }
+.live-grid figure { margin: 0; }
+.live-grid img { width: 100%; display: block; border-radius: 6px; background: #000; min-height: 120px; }
 .usb-card { width: 180px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--panel);
   display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
 .usb-card img, .usb-nothumb { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: var(--frame); border-radius: 4px; }

@@ -41,6 +41,8 @@ def _court_points():
     return COURT_POINTS
 
 
+SUGGEST_MAX_FIT_PX = 60.0        # suggestions are hidden when the clicked points disagree by more than this
+LIVE_DRAIN_S = 1.0               # a live camera's frame: the newest one after reading this long
 LIVE_GRAB_MS = 10000             # a live camera gets this long to open and to send its frame
 
 
@@ -172,6 +174,13 @@ class Calib:
             else:
                 cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(t_s)) * 1000.0)
             ok, img = cap.read()
+            if is_url and ok:                             # a stream opens on frames it had buffered: read on for a
+                t_end = time.monotonic() + LIVE_DRAIN_S   # moment and keep the newest one
+                while time.monotonic() < t_end:
+                    ok2, img2 = cap.read()
+                    if not ok2 or img2 is None:
+                        break
+                    img = img2
         finally:
             cap.release()
         if not ok or img is None:
@@ -227,6 +236,31 @@ class Calib:
         image_px = np.array([[float(p["px"]), float(p["py"])] for p in pts], dtype=np.float64)
         court_xz = np.array([cp[n] for n in names], dtype=np.float64)
         return names, image_px, court_xz
+
+    def suggest(self, body):
+        """Where the court points not clicked yet should be in the picture, from the clicked ones (4 or more): the
+        court floor is a plane, so a plane-to-picture fit of the clicks places every other point. A guide only - the
+        lens bends lines a little, so each point is still clicked on the real line crossing."""
+        pts = body.get("points")
+        if not isinstance(pts, list) or len(pts) < 4:
+            return {"points": {}, "fit_px": None}
+        names, image_px, court_xz = self.points(body)
+        H, _ = cv2.findHomography(court_xz, image_px, 0)
+        if H is None or not np.all(np.isfinite(H)):
+            return {"points": {}, "fit_px": None}
+        fit = cv2.perspectiveTransform(court_xz.reshape(-1, 1, 2), H).reshape(-1, 2)
+        err = float(np.median(np.linalg.norm(fit - image_px, axis=1)))
+        if not np.isfinite(err) or err > SUGGEST_MAX_FIT_PX:     # clicks on one line, or a wrong click: no guess
+            return {"points": {}, "fit_px": None if not np.isfinite(err) else round(err, 1)}
+        cp = _court_points()
+        rest = [n for n in cp if n not in names]
+        out = {}
+        if rest:
+            xy = cv2.perspectiveTransform(np.array([cp[n] for n in rest], dtype=np.float64).reshape(-1, 1, 2), H)
+            for n, (x, y) in zip(rest, xy.reshape(-1, 2)):
+                if np.isfinite(x) and np.isfinite(y) and abs(x) < 1e5 and abs(y) < 1e5:
+                    out[n] = [round(float(x), 1), round(float(y), 1)]
+        return {"points": out, "fit_px": round(err, 1)}
 
     def auto_fov(self, body):
         view = self.camera(body.get("view"))["view"]
@@ -383,6 +417,10 @@ def router(calib: Calib, tools_dir) -> APIRouter:
     def frame(fname: str):
         return FileResponse(calib.frame_path(fname), media_type="image/jpeg", headers={"Cache-Control": "no-cache"})
 
+    @r.post("/calib/api/suggest")
+    async def suggest(request: Request):
+        return calib.suggest(await request.json())
+
     @r.post("/calib/api/auto-fov")
     async def auto_fov(request: Request):
         return await run_in_threadpool(calib.auto_fov, await request.json())
@@ -412,7 +450,7 @@ def router(calib: Calib, tools_dir) -> APIRouter:
             await run_in_threadpool(lambda: calib.grab(cam, None, f"{cam['view']}.jpg", frame=f))
         else:
             await run_in_threadpool(calib.grab, cam, float(b.get("time", 1.0)), f"{cam['view']}.jpg")
-        return {"ok": True}
+        return {"ok": True, "taken": time.strftime("%H:%M:%S")}
 
     @r.get("/calib/api/seeds/{clip}")
     def seeds(clip: str):
