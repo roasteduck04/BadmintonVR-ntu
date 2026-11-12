@@ -1,0 +1,20 @@
+_about: "Live cameras on a PC without a GPU (v0.8.7, for checking a setup, not for a session): the 2D models run on the CPU, far below real time - the stream shows a frame whenever one is ready. Body + feet model (balanced size), 720 px frames, person detector every 10 frames."
+backend: live
+output_fps: 30
+pace: realtime
+sync.offsets: auto
+sync.mode: nearest
+rtmpose.engine: fast
+rtmpose.decoder: pyav
+rtmpose.decode_short_side: 720
+rtmpose.court_filter_m: 1.0
+rtmpose.det_every: 10
+rtmpose.det_trt: false
+rtmpose.ep: cuda
+rtmpose.model: body_feet
+rtmpose.mode: balanced
+cpu.limits: true
+stream.late_policy: behind
+stream.solver_tol: 1.0e-4
+stream.lsmr_maxiter: 20
+warmup.seconds: 1.0
