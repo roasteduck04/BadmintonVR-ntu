@@ -188,6 +188,7 @@ def damage_stats(flags, health=None) -> dict:
     if health:
         out["decoder_errors"] = health.get("errors", 0)
         out["reconnects"] = health.get("reconnects", 0)
+        out["skipped_behind"] = health.get("skipped", 0)
     return out
 
 
@@ -236,10 +237,16 @@ def verdict(st, fps_expected) -> list:
         out.append(f"worst second had {st['fps_worst_second']} frames")
     if st.get("damaged_pct", 0) >= 0.5:
         out.append(f"{st['damaged_pct']:g} % of pictures damaged (grey / smeared blocks; {st['damaged_frames']} hit by "
-                   f"lost packets, longest damaged run {st['longest_damaged_run']} frames): packets were lost BEFORE "
-                   "this PC - check the camera's Wi-Fi / bridge (keyframes every 0.5 s: ros_rtsp_bridge.py --gop) "
-                   "and that MediaMTX takes the camera over TCP (notes at the top of tools/ros_rtsp_bridge.py). The "
-                   "engine holds the last clean picture meanwhile (page step 1, Damaged pictures: hold)")
+                   f"lost packets, longest damaged run {st['longest_damaged_run']} frames). If MediaMTX's window says "
+                   "'reader is too slow', MediaMTX threw the packets away because this PC read too slowly (a busy "
+                   "CPU: close other programs, or lower the camera's bitrate / size); otherwise they were lost on the "
+                   "way into MediaMTX - check the camera's Wi-Fi / bridge (keyframes every 0.5 s: ros_rtsp_bridge.py "
+                   "--gop) and that MediaMTX takes the camera over TCP (notes at the top of tools/ros_rtsp_bridge.py). "
+                   "The engine holds the last clean picture meanwhile (page step 1, Damaged pictures: hold)")
+    if st.get("skipped_behind", 0) >= max(1, 0.005 * st["frames"]):
+        out.append(f"this PC fell behind: {st['skipped_behind']} pictures skipped (jumped to the next keyframe, so no "
+                   "smear) - a busy CPU, or a stream too heavy for it: close other programs, or lower the camera's "
+                   "bitrate / size")
     return out or ["steady"]
 
 
@@ -295,7 +302,9 @@ def report_lines(name, w, st, fps_expected, delays=None) -> list:
     if "damaged_pct" in st:
         lines.append(f"   damaged pictures: {st['damaged_pct']:g} % ({st['damaged_frames']} damaged + "
                      f"{st['tainted_frames']} after them until the next keyframe; decoder errors "
-                     f"{st.get('decoder_errors', '?')})")
+                     f"{st.get('decoder_errors', '?')})"
+                     + (f"; {st['skipped_behind']} skipped because this PC fell behind" if st.get("skipped_behind")
+                        else ""))
     elif getattr(w, "so", None) is None:
         lines.append("   damaged pictures: not counted (read with OpenCV only; install PyAV: pip install av)")
     if delays is not None:

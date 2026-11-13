@@ -15,13 +15,20 @@ cannot tell those pictures from good ones. This reader can:
 Settings (input.* in the live config, "Damaged frames" / "Camera reader" / "Transport" in step 1 of the server page):
     reader     pyav (this module) | opencv (the old OpenCV reader: no damage check)
     transport  tcp (default) | udp | auto - how RTSP is pulled from the server (MediaMTX); TCP never loses packets on
-               this last leg, so damage that remains was lost before MediaMTX (camera / bridge / Wi-Fi)
+               this last leg (unless MediaMTX drops them for a reader that is too slow - see below), so damage that
+               remains was lost before MediaMTX (camera / bridge / Wi-Fi)
     damaged    hold | use
     hold_max_s longest a tainted stretch is held without a keyframe (default 1.0 s)
 
 Each camera decodes on one thread (decoder threads would hide which camera an error message belongs to; one 720p
 H.264 stream needs a few ms per picture). The FFmpeg error lines are not printed one by one any more: each camera logs
 one summary line every few seconds while it has damage.
+
+A live stream is RECEIVED on its own thread, apart from decoding: the network is always read at once, so the RTSP
+server never finds this PC "too slow" and throws packets away (MediaMTX does that per reader, and the pictures after
+the gap come out smeared - damage made on this PC, not on the Wi-Fi). When decoding falls behind anyway (a busy CPU)
+and the oldest waiting packet is older than `backlog_s`, the waiting packets are dropped up to the newest keyframe:
+a short clean gap ("skipped", logged as "this PC fell behind") instead of seconds of smear.
 """
 from __future__ import annotations
 
@@ -36,6 +43,15 @@ DAMAGED = ("hold", "use")
 DEFAULTS = {"reader": "pyav", "transport": "tcp", "damaged": "hold", "hold_max_s": 1.0}
 RETRY_S = 1.0                    # a stream that failed or ended is opened again after this long
 LOG_S = 5.0                      # a camera with damage logs one summary line this often
+BACKLOG_S = 0.5                  # live: packets waiting longer than this to be decoded -> jump to the newest keyframe
+QUEUE_MAX_S = 4.0                # received packets kept at most (this many seconds of video), whatever their age
+WAIT_S = 0.2                     # the decoding thread checks for a stop this often while no packet arrives
+
+
+def is_live(url) -> bool:
+    """A network stream (it keeps coming whether we read it or not), not a file (read at our own pace)."""
+    u = str(url).lower()
+    return "://" in u and not u.startswith("file:")
 
 _lock = threading.Lock()
 _by_thread = {}                  # decoding thread id -> Stream (whose decoder errors land there)
@@ -165,18 +181,23 @@ class Stream:
     clean | held (damaged "hold": the last clean picture instead; nothing is yielded before the first clean one)."""
 
     def __init__(self, url, name=None, transport="tcp", damaged="hold", hold_max_s=1.0, open_s=15.0, read_s=5.0,
-                 threads=1, log=print):
+                 threads=1, log=print, live=None, backlog_s=BACKLOG_S):
         self.url, self.name = str(url), name or str(url)
         self.transport, self.damaged = transport, damaged
         self.open_s, self.read_s, self.threads = float(open_s), float(read_s), max(1, int(threads or 1))
         self.log = log
+        self.live = is_live(self.url) if live is None else bool(live)
+        self.backlog_s = float(backlog_s)
         self.dmg = Damage(hold_max_s)
         self.running = True
         self.container, self.vstream = None, None
         self.error, self.codec, self.size, self.declared_fps = None, None, None, None
-        self.counts = {"frames": 0, "clean": 0, "damaged": 0, "tainted": 0, "held": 0, "errors": 0, "reconnects": 0}
-        self._win = {"frames": 0, "damaged": 0, "tainted": 0, "errors": 0, "t": time.monotonic(), "example": None}
+        self.counts = {"frames": 0, "clean": 0, "damaged": 0, "tainted": 0, "held": 0, "errors": 0, "reconnects": 0,
+                       "skipped": 0}
+        self._win = {"frames": 0, "damaged": 0, "tainted": 0, "errors": 0, "skipped": 0, "t": time.monotonic(),
+                     "example": None}
         self.last_clean = None
+        self._q, self._qcond, self._rx, self._rx_stop = [], threading.Condition(), None, False
 
     # ------------------------------------------------------------------ decoder errors
     def decode_error(self, message):
@@ -205,7 +226,87 @@ class Stream:
         self.declared_fps = float(rate) if rate else None
         self.error = None
 
+    # ------------------------------------------------------------------ receiving (its own thread)
+    def _queue_cap(self) -> int:
+        return max(8, int(round((self.declared_fps or 30.0) * QUEUE_MAX_S)))
+
+    def _receive(self, container, vstream):
+        """Read packets off the network as fast as they come; a file waits for the decoder instead. Ends with a None
+        item (end of stream) or an exception item."""
+        _register(self)
+        cap, skipping, skip_end = self._queue_cap(), False, None
+        try:
+            for pkt in container.demux(vstream):
+                if self._rx_stop or not self.running:
+                    return
+                if pkt.size == 0:                        # demuxer's end-of-stream marker
+                    continue
+                now = time.monotonic()
+                with self._qcond:
+                    if not self.live:
+                        while len(self._q) >= cap and not self._rx_stop and self.running:
+                            self._qcond.wait(WAIT_S)
+                    elif skipping:                       # dropped the backlog: wait for a keyframe to restart on
+                        if not pkt.is_keyframe and now < skip_end:
+                            self._skip(1)
+                            continue
+                        if not pkt.is_keyframe:          # no keyframe in time (intra refresh): restart, marked tainted
+                            self.dmg.dirty_since = now
+                        skipping = False
+                    self._q.append((now, pkt))
+                    if self.live and (now - self._q[0][0] > self.backlog_s or len(self._q) > cap):
+                        keys = [i for i, (_, p) in enumerate(self._q) if p.is_keyframe]
+                        if keys and keys[-1] > 0:        # jump to the newest keyframe waiting
+                            self._skip(keys[-1])
+                            del self._q[:keys[-1]]
+                        elif not keys:                   # none waiting: drop all, restart at the next one
+                            self._skip(len(self._q))
+                            self._q.clear()
+                            skipping, skip_end = True, now + max(self.dmg.hold_max_s, 2.0)
+                    self._qcond.notify_all()
+            item = None
+        except Exception as e:  # noqa: BLE001 - read timeout / connection dropped: the decoding thread reopens
+            item = e
+        with self._qcond:
+            self._q.append((time.monotonic(), item))
+            self._qcond.notify_all()
+
+    def _skip(self, n):
+        self.counts["skipped"] += n
+        self._win["skipped"] += n
+
+    def _packets(self):
+        """Packets from the receiving thread, in order; returns at the end of the stream, raises its error."""
+        while self.running:
+            with self._qcond:
+                if not self._q:
+                    self._qcond.wait(WAIT_S)
+                    continue
+                _, item = self._q.pop(0)
+                self._qcond.notify_all()
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    def _start_receiving(self):
+        self._q, self._rx_stop = [], False
+        self._rx = threading.Thread(target=self._receive, args=(self.container, self.vstream), daemon=True,
+                                    name=f"receive-{self.name}")
+        self._rx.start()
+
+    def _stop_receiving(self):
+        rx, self._rx = self._rx, None
+        self._rx_stop = True
+        with self._qcond:
+            self._qcond.notify_all()
+        if rx is not None:
+            rx.join(self.read_s + 1.0)                   # blocked in a network read: returns at the read timeout
+        self._q = []
+
     def _close_container(self):
+        self._stop_receiving()
         c, self.container, self.vstream = self.container, None, None
         if c is not None:
             try:
@@ -233,12 +334,21 @@ class Stream:
                         time.sleep(RETRY_S)
                         continue
                 try:
-                    for fr in self.container.decode(self.vstream):
+                    self._start_receiving()
+                    for pkt in self._packets():
+                        for fr in self.vstream.decode(pkt):
+                            if not self.running:
+                                break
+                            out = self._one(fr)
+                            if out is not None:
+                                yield out
                         if not self.running:
                             break
-                        out = self._one(fr)
-                        if out is not None:
-                            yield out
+                    if self.running:
+                        for fr in self.vstream.decode(None):     # end of stream: the pictures still in the decoder
+                            out = self._one(fr)
+                            if out is not None:
+                                yield out
                 except Exception as e:  # noqa: BLE001 - read timeout / connection dropped: open it again
                     self.error = f"{type(e).__name__}: {e}"
                 if not self.running:
@@ -282,7 +392,10 @@ class Stream:
             self._say(f"camera {self.name}: {bad} of {w['frames']} pictures in {now - w['t']:.0f} s damaged by lost "
                       f"packets ({100.0 * bad / max(1, w['frames']):.0f} %, {w['errors']} decoder errors"
                       + (f", e.g. '{w['example']}'" if w["example"] else "") + f"), {what}")
-        self._win = {"frames": 0, "damaged": 0, "tainted": 0, "errors": 0, "t": now, "example": None}
+        if w["skipped"]:
+            self._say(f"camera {self.name}: this PC fell behind - {w['skipped']} pictures skipped in {now - w['t']:.0f} s "
+                      "(jumped to the next keyframe; a busy CPU, or a stream too heavy for it: lower its bitrate / size)")
+        self._win = {"frames": 0, "damaged": 0, "tainted": 0, "errors": 0, "skipped": 0, "t": now, "example": None}
 
     def _say(self, msg):
         if self.log is not None:
@@ -292,7 +405,8 @@ class Stream:
                 pass
 
     def health(self) -> dict:
-        """Totals so far: frames, clean, damaged, tainted, held, decoder errors, reconnects + damaged_pct."""
+        """Totals so far: frames, clean, damaged, tainted, held, decoder errors, reconnects, skipped (pictures dropped
+        because this PC fell behind) + damaged_pct."""
         c = dict(self.counts)
         c["damaged_pct"] = round(100.0 * (c["damaged"] + c["tainted"]) / c["frames"], 1) if c["frames"] else 0.0
         return c

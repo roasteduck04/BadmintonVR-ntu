@@ -645,34 +645,54 @@ class Server:
 
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000,
                                                      cv2.CAP_PROP_READ_TIMEOUT_MSEC, 10000])
+        if not cap.isOpened():
+            cap.release()
+            yield card("the stream does not open (press Test cameras for the reason)")
+            return
+        # Every frame is read on its own thread, whatever the page does: while this generator waits for the browser
+        # to take a picture, a capture read here would stop, and MediaMTX throws away a reader's packets when it
+        # falls behind ("reader is too slow") - the preview would show smears that the cameras never had.
+        lock, box = threading.Lock(), {"img": None, "n": 0, "fails": 0, "run": True}
+        arrivals = collections.deque(maxlen=600)
+
+        def drain():
+            try:
+                while box["run"]:
+                    ok, img = cap.read()
+                    if not ok or img is None:
+                        box["fails"] += 1
+                        if box["fails"] > 100:
+                            return
+                        time.sleep(0.01)
+                        continue
+                    with lock:
+                        box["img"], box["n"], box["fails"] = img, box["n"] + 1, 0
+                        arrivals.append(time.monotonic())
+            finally:
+                box["run"] = False
+                cap.release()
+
+        threading.Thread(target=drain, daemon=True, name=f"preview-{name}").start()
         try:
-            if not cap.isOpened():
-                yield card("the stream does not open (press Test cameras for the reason)")
-                return
-            arrivals, last, fails = collections.deque(maxlen=600), 0.0, 0
+            seen = 0
             t_end = time.monotonic() + PREVIEW_MAX_S
             while epoch == self.preview_epoch and time.monotonic() < t_end:
-                ok, img = cap.read()                     # every frame is read (and dropped) so the picture is current
-                now = time.monotonic()
-                if not ok or img is None:
-                    fails += 1
-                    if fails > 100:
-                        yield card("stopped sending pictures")
-                        return
-                    time.sleep(0.01)
+                time.sleep(1.0 / PREVIEW_FPS)
+                if not box["run"]:
+                    yield card("stopped sending pictures")
+                    return
+                with lock:
+                    img, n, now = box["img"], box["n"], time.monotonic()
+                    got = sum(1 for t in arrivals if now - t <= 1.0)
+                if img is None or n == seen:
                     continue
-                fails = 0
-                arrivals.append(now)
-                if now - last < 1.0 / PREVIEW_FPS:
-                    continue
-                last = now
+                seen = n
                 h, w = img.shape[:2]
                 img = cv2.resize(live_config.upright(img, rot), (PREVIEW_W, max(1, round(h * PREVIEW_W / w))),
                                  interpolation=cv2.INTER_AREA)
-                got = sum(1 for t in arrivals if now - t <= 1.0)
                 yield part(label(img, f"{name}  {got} fps arriving  {w}x{h}  {time.strftime('%H:%M:%S')}"))
         finally:
-            cap.release()
+            box["run"] = False                            # the thread releases the capture
 
     # ------------------------------------------------------------------ v0.8.7 feed check + delay test (step 1)
     def _feed_watches(self, rows, fps):
