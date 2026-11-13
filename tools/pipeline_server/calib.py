@@ -29,6 +29,7 @@ from starlette.concurrency import run_in_threadpool
 
 from analysis import multiview as mv
 from analysis.live import config as live_config
+from analysis.live import stream_open
 from analysis.pose24 import config as p24config
 
 SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
@@ -53,6 +54,17 @@ class Calib:
         self.input_fn = input_fn or (lambda: {"kind": "video"})     # v0.8.4: the Source tab's choice
         self.calib_dir = os.path.join(self.repo, "data", "calib")
         self.frames_dir = os.path.join(self.calib_dir, "frames")
+
+    def _stream_settings(self):
+        """v0.8.7: the Source step's camera reader settings when the reader is PyAV and PyAV is installed, else None
+        (then OpenCV reads the frame as before)."""
+        try:
+            so = (self.input_fn() or {}).get("stream")
+        except Exception:  # noqa: BLE001 - no saved source: the old reader
+            return None
+        if not so or so.get("reader") != "pyav" or not stream_open.pyav_available():
+            return None
+        return stream_open.options(so)
 
     # ------------------------------------------------------------------ cameras
     def registry(self):
@@ -163,6 +175,15 @@ class Calib:
         os.makedirs(self.frames_dir, exist_ok=True)
         is_url = "://" in str(cam["video"])
         src, rot = live_config.split_rotate(cam["video"]) if is_url else (cam["video"], 0)
+        so = self._stream_settings() if is_url else None
+        if so is not None:                                # v0.8.7: PyAV, the newest picture without decoder damage
+            img, info = stream_open.grab_clean(src, drain_s=LIVE_DRAIN_S, transport=so["transport"],
+                                               open_s=LIVE_GRAB_MS / 1000, read_s=LIVE_GRAB_MS / 1000)
+            if img is None:
+                raise HTTPException(500, f"could not read a clean picture from {cam['view']}: {info.get('error')}")
+            img = live_config.upright(img, rot)
+            cv2.imwrite(os.path.join(self.frames_dir, name), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            return name
         cap = (cv2.VideoCapture(src, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, LIVE_GRAB_MS,
                                                                cv2.CAP_PROP_READ_TIMEOUT_MSEC, LIVE_GRAB_MS])
                if is_url else cv2.VideoCapture(os.path.join(self.repo, cam["video"])))

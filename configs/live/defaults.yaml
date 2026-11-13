@@ -152,3 +152,8 @@ input:                          # v0.8.4 Source tab: where the frames come from
   max_minutes: 5                # camera: longest stream (the 3D core keeps a whole stream in memory)
   cameras: {}                   # camera: {view: stream address}, e.g. back_051: rtsp://pi1:8554/cam,
                                 # http://pi1:8080/stream.mjpg, tcp://pi1:5000 (test: python tools/fake_camera.py)
+  # v0.8.7 (analysis/live/stream_open.py): pictures damaged by packets lost on Wi-Fi ("[h264] error while decoding MB")
+  reader: pyav                  # pyav = finds damaged pictures | opencv = the old reader (no damage check)
+  transport: tcp                # RTSP from the server: tcp (never loses packets on this leg) | udp | auto
+  damaged: hold                 # hold = give the last clean picture until the next keyframe | use = as decoded
+  hold_max_s: 1.0               # longest a damaged stretch is held without a keyframe (intra-refresh streams)

@@ -192,6 +192,13 @@ def _worker(view, path, frames, rcfg, device, fps, origin, t0_val, go_ev, realti
     out_q.put(("done", view, None))
 
 
+def camera_opts(c) -> dict:
+    """v0.8.7: how camera streams are read (input.reader / transport / damaged / hold_max_s; stream_open.py)."""
+    from . import stream_open
+    ip = c.get("input") or {}
+    return stream_open.options({k: ip.get(k) for k in stream_open.DEFAULTS})
+
+
 def _missing():
     return {"t_avail_ns": None, "t_done_ns": time.monotonic_ns(), "decode_ns": 0, "infer_ns": 0, "wait_ns": 0,
             "dropped": True}
@@ -223,6 +230,7 @@ class VideoRtmlibSource:
             from . import pose2d_fast
             rc["_cam_paths"] = dict(c["cam_paths"])
             rc["_video_to_calib"] = dict(c.get("video_to_calib") or {})
+            rc["_camera"] = camera_opts(c)
             groups = [list(c["views"])] if rc.get("batch_views") else [[v] for v in c["views"]]
             for v in c["views"]:
                 # one process feeding every camera's queue: unbounded, else a full queue of one camera blocks the
@@ -281,6 +289,7 @@ class VideoRtmlibSource:
             ready_timeout_s = max(ready_timeout_s, 3600)
         rc["_cam_paths"] = dict(c["cam_paths"])
         rc["_video_to_calib"] = dict(c.get("video_to_calib") or {})
+        rc["_camera"] = camera_opts(c)
         groups = [list(c["views"])] if rc.get("batch_views") else [[v] for v in c["views"]]
         for v in c["views"]:
             self.queues[v] = self.ctx.Queue(maxsize=0)

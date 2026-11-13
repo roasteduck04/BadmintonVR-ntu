@@ -76,6 +76,7 @@ class Runner:
         self.source, self.clock, self.sleep = source, clock, sleep
         self.session, self.warm_state, self.stop_event = bool(session), warm_state, stop_event
         self.export_warm, self.on_step = bool(export_warm), on_step
+        self.cam_health = {}             # v0.8.7 camera streams: {view: {frames, held, damaged}} of the steps' pictures
         framewriter.refuse_inside_assets(run_dir)
 
     # ------------------------------------------------------------------ helpers
@@ -120,6 +121,14 @@ class Runner:
                            "dropped": sum(bool(t["dropped"]) for t in pv_t), "n_frames": len(pv_t),
                            "n_dets": sum(len(fr["dets"]) for fr in frames),
                            "first_call": any(t.get("first_call") for t in pv_t)}
+            flags = [t.get("cam") for t in pv_t if t.get("cam")]
+            if flags:                    # v0.8.7 camera streams: pictures damaged by lost packets (stream_open.py)
+                per_view[v]["held"] = sum(1 for x in flags if x == "held")
+                per_view[v]["damaged"] = sum(1 for x in flags if x in ("damaged", "tainted"))
+                h = self.cam_health.setdefault(v, {"frames": 0, "held": 0, "damaged": 0})
+                h["frames"] += len(flags)
+                h["held"] += per_view[v]["held"]
+                h["damaged"] += per_view[v]["damaged"]
         return views, per_view, (max(t_av) if t_av else None), max(t_done)
 
     # ------------------------------------------------------------------ run
@@ -182,6 +191,7 @@ class Runner:
                 f"setup {setup_s:.1f} s (source ready {src_ready_s:.1f} s)")
             t_loop = time.perf_counter()
             i = 0
+            last_bad = {}
             while i < n:
                 if self.stop_event is not None and self.stop_event.is_set():
                     log(f"  stopped at step {i}")
@@ -220,8 +230,12 @@ class Runner:
                             f"needed (was {n_before} from here on)")
                 i += 1
                 if i % max(1, int(c["fps"])) == 0:
+                    bad = {v: h["held"] + h["damaged"] for v, h in self.cam_health.items()}
+                    new = {v: b - last_bad.get(v, 0) for v, b in bad.items()}
+                    last_bad = bad
+                    dmg = ", ".join(f"{v} {k}" for v, k in sorted(new.items()) if k)
                     log(f"    step {i}/{n}  written {len(self.outs)}  "
-                        f"({(time.perf_counter() - t_loop):.1f} s)")
+                        f"({(time.perf_counter() - t_loop):.1f} s)" + (f"  damaged pictures held: {dmg}" if dmg else ""))
             self._emit(self.core.flush(), cap)
             self.writer.close()
             loop_s = time.perf_counter() - t_loop
@@ -243,7 +257,9 @@ class Runner:
         res = {"steps": n, "written": len(self.outs), "loop_s": loop_s, "setup_s": setup_s, "warm_state": warm,
                "source_ready_s": src_ready_s, "writer": self.writer.stats(), "sync": sync_info,
                "offsets": dict(c["offsets"]), "gpu_sampler_error": gs.error, "cpu_sampler_error": cs.error,
-               "source_info": getattr(self.src, "info", {})}
+               "source_info": getattr(self.src, "info", {}),
+               "camera_health": {v: dict(h, damaged_pct=round(100.0 * (h["held"] + h["damaged"]) / h["frames"], 1)
+                                         if h["frames"] else 0.0) for v, h in self.cam_health.items()}}
         if c["output"]["final_doc"]:
             t = time.perf_counter()
             path = docwriter.write(c, self.outs, cams, sides, self.run_dir, image_size=image_size)

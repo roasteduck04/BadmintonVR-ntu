@@ -12,7 +12,12 @@ seconds and prints one block per camera in plain words, then saves a report and 
 every few seconds; the time until each camera's picture turns bright / dark is its delay (camera + Wi-Fi + bridge +
 RTSP + decoding, plus about 0.05 s of this screen). Cameras that do not see the screen say so.
 
-Needs only OpenCV and NumPy. Stop the live engine first when the cameras allow one reader only.
+Damaged pictures (v0.8.7): with PyAV installed the cameras are read the way the engine reads them (analysis/live/
+stream_open.py) and every picture the decoder had to patch because packets were lost ("[h264] error while decoding
+MB") is counted, with the pictures after it until the next keyframe. --transport udp|auto pulls RTSP another way
+(default tcp, like the engine); --reader opencv reads with OpenCV only (no damage count).
+
+Needs OpenCV and NumPy (+ PyAV for the damage count). Stop the live engine first when the cameras allow one reader only.
 """
 from __future__ import annotations
 
@@ -53,20 +58,54 @@ def cameras_from_input(path) -> tuple:
     return cams, float(d.get("fps") or 60)
 
 
-class Watch(threading.Thread):
-    """Reads one camera: arrival time, brightness and change of every frame; keeps the first and the last picture."""
+def stream_module():
+    """analysis.live.stream_open when it and PyAV can be imported, else None (OpenCV only)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from analysis.live import stream_open
+        return stream_open if stream_open.pyav_available() else None
+    except ImportError:
+        return None
 
-    def __init__(self, name, url):
+
+class Watch(threading.Thread):
+    """Reads one camera: arrival time, brightness and change of every frame; keeps the first and the last picture.
+    v0.8.7: through PyAV (reader pyav, when installed) every frame also gets its damage flag (clean | damaged |
+    tainted)."""
+
+    def __init__(self, name, url, reader="pyav", transport="tcp"):
         super().__init__(daemon=True, name=f"check-{name}")
         self.name_, (self.url, self.rot) = name, split_rotate(url)
-        self.t, self.bright, self.diff = [], [], []
+        self.t, self.bright, self.diff, self.flags = [], [], [], []
         self.first, self.last, self.size = None, None, None
         self.open_s, self.first_s, self.error, self.fails = None, None, None, 0
         self.declared_fps, self.codec = None, None
+        self.so = stream_module() if reader == "pyav" else None
+        self.transport, self.stream = transport, None
         self.running, self.lock = True, threading.Lock()
+
+    def _frame(self, cv2, img, now, t0, prev, flag=None):
+        if self.rot == 180:
+            img = cv2.rotate(img, cv2.ROTATE_180)
+        small = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (32, 18), interpolation=cv2.INTER_AREA)
+        small = small.astype("float32")
+        with self.lock:
+            if self.first is None:
+                self.first, self.first_s, self.size = img, now - t0, (img.shape[1], img.shape[0])
+            self.last = img
+            self.t.append(now)
+            self.bright.append(float(small.mean()))
+            self.diff.append(float(abs(small - prev).mean()) if prev is not None else 255.0)
+            if flag is not None:
+                self.flags.append(flag)
+        return small
 
     def run(self):
         import cv2
+        if self.so is not None:
+            return self._run_pyav(cv2)
         t0 = time.perf_counter()
         cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG,
                                [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, OPEN_MS, cv2.CAP_PROP_READ_TIMEOUT_MSEC, OPEN_MS])
@@ -89,20 +128,36 @@ class Watch(threading.Thread):
                         return
                     time.sleep(0.01)
                     continue
-                if self.rot == 180:
-                    img = cv2.rotate(img, cv2.ROTATE_180)
-                small = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (32, 18), interpolation=cv2.INTER_AREA)
-                small = small.astype("float32")
-                with self.lock:
-                    if self.first is None:
-                        self.first, self.first_s, self.size = img, now - t0, (img.shape[1], img.shape[0])
-                    self.last = img
-                    self.t.append(now)
-                    self.bright.append(float(small.mean()))
-                    self.diff.append(float(abs(small - prev).mean()) if prev is not None else 255.0)
-                prev = small
+                prev = self._frame(cv2, img, now, t0, prev)
         finally:
             cap.release()
+
+    def _run_pyav(self, cv2):
+        """Through stream_open.Stream in "use" mode: every picture arrives (damaged ones too) with its flag."""
+        t0 = time.perf_counter()
+        self.stream = s = self.so.Stream(self.url, name=self.name_, transport=self.transport, damaged="use",
+                                         open_s=OPEN_MS / 1000, read_s=OPEN_MS / 1000, log=None)
+        gen = s.frames()
+        prev = None
+        try:
+            for img, flag, _ in gen:
+                now = time.perf_counter()
+                if self.open_s is None:
+                    self.open_s, self.codec, self.declared_fps = now - t0, s.codec, s.declared_fps or 0.0
+                prev = self._frame(cv2, img, now, t0, prev, flag)
+                if not self.running:
+                    break
+        except Exception as e:  # noqa: BLE001 - first open failed: report it
+            self.error = f"did not open: {type(e).__name__}: {e}"
+        finally:
+            s.close()
+            gen.close()
+            if s.counts["reconnects"] and not self.error:
+                self.error = f"stream dropped and was opened again {s.counts['reconnects']} time(s)"
+
+    def damage(self):
+        """Decoder health of this camera ({} when read with OpenCV only)."""
+        return self.stream.health() if self.stream is not None else {}
 
     def series(self):
         with self.lock:
@@ -118,11 +173,30 @@ def pct(values, q):
     return v[lo] + (v[hi] - v[lo]) * (k - lo)
 
 
-def stats(times, diffs, fps_expected) -> dict:
-    """Numbers of one camera from its frame arrival times (s) and frame-to-frame change."""
+def damage_stats(flags, health=None) -> dict:
+    """Damaged-picture numbers from per-frame flags (clean | damaged | tainted); {} when none were recorded."""
+    if not flags:
+        return {}
+    n = len(flags)
+    dmg, tnt = flags.count("damaged"), flags.count("tainted")
+    worst = run = 0
+    for f in flags:
+        run = run + 1 if f != "clean" else 0
+        worst = max(worst, run)
+    out = {"damaged_frames": dmg, "tainted_frames": tnt, "damaged_pct": round(100.0 * (dmg + tnt) / n, 1),
+           "longest_damaged_run": worst}
+    if health:
+        out["decoder_errors"] = health.get("errors", 0)
+        out["reconnects"] = health.get("reconnects", 0)
+    return out
+
+
+def stats(times, diffs, fps_expected, flags=None, health=None) -> dict:
+    """Numbers of one camera from its frame arrival times (s) and frame-to-frame change (+ damage flags)."""
     n = len(times)
     if n < 2:
         return {"frames": n}
+    extra = damage_stats(flags, health)
     nominal = 1.0 / float(fps_expected)
     gaps = [b - a for a, b in zip(times, times[1:])]
     span = times[-1] - times[0]
@@ -138,7 +212,8 @@ def stats(times, diffs, fps_expected) -> dict:
             "late_gaps": sum(1 for g in gaps if g > 2.5 * nominal),          # at least one frame time missing
             "freezes": len(freezes), "longest_freeze_s": round(max(freezes), 2) if freezes else 0.0,
             "burst_pct": round(100.0 * sum(1 for g in gaps if g < 0.25 * nominal) / len(gaps), 1),
-            "still_pct": round(100.0 * sum(1 for d in diffs[1:] if d < STILL_DIFF) / max(1, len(diffs) - 1), 1)}
+            "still_pct": round(100.0 * sum(1 for d in diffs[1:] if d < STILL_DIFF) / max(1, len(diffs) - 1), 1),
+            **extra}
 
 
 def verdict(st, fps_expected) -> list:
@@ -159,6 +234,12 @@ def verdict(st, fps_expected) -> list:
                    "moved in front of the camera (have someone move, then compare)")
     if st["fps_worst_second"] < 0.6 * fps_expected:
         out.append(f"worst second had {st['fps_worst_second']} frames")
+    if st.get("damaged_pct", 0) >= 0.5:
+        out.append(f"{st['damaged_pct']:g} % of pictures damaged (grey / smeared blocks; {st['damaged_frames']} hit by "
+                   f"lost packets, longest damaged run {st['longest_damaged_run']} frames): packets were lost BEFORE "
+                   "this PC - check the camera's Wi-Fi / bridge (keyframes every 0.5 s: ros_rtsp_bridge.py --gop) "
+                   "and that MediaMTX takes the camera over TCP (notes at the top of tools/ros_rtsp_bridge.py). The "
+                   "engine holds the last clean picture meanwhile (page step 1, Damaged pictures: hold)")
     return out or ["steady"]
 
 
@@ -211,6 +292,12 @@ def report_lines(name, w, st, fps_expected, delays=None) -> list:
                  f"{st['fps_worst_second']}, best {st['fps_best_second']})")
     lines.append(f"   time between frames: usual {st['gap_ms_p50']:g} ms, 1 in 20 above {st['gap_ms_p95']:g} ms, "
                  f"longest {st['gap_ms_max']:g} ms (even = {1000 / fps_expected:.1f} ms)")
+    if "damaged_pct" in st:
+        lines.append(f"   damaged pictures: {st['damaged_pct']:g} % ({st['damaged_frames']} damaged + "
+                     f"{st['tainted_frames']} after them until the next keyframe; decoder errors "
+                     f"{st.get('decoder_errors', '?')})")
+    elif getattr(w, "so", None) is None:
+        lines.append("   damaged pictures: not counted (read with OpenCV only; install PyAV: pip install av)")
     if delays is not None:
         seen = [d for d in delays if d is not None]
         if len(seen) >= min(3, len(delays)):
@@ -235,6 +322,9 @@ def parse_args(argv=None):
     ap.add_argument("--fps", type=float, help="frames per second the cameras should send (default: the saved source's)")
     ap.add_argument("--latency", action="store_true", help="flash this terminal and time each camera's delay")
     ap.add_argument("--out", help="report folder (default: camera_check_<time> next to the input file)")
+    ap.add_argument("--reader", choices=("pyav", "opencv"), default="pyav",
+                    help="pyav (default) counts damaged pictures; opencv = the old reader")
+    ap.add_argument("--transport", choices=("tcp", "udp", "auto"), default="tcp", help="RTSP transport (default tcp)")
     return ap.parse_args(argv)
 
 
@@ -255,7 +345,7 @@ def main(argv=None):
     import cv2
     print(f"checking {len(cams)} camera(s) for {'the flash test' if a.latency else f'{a.seconds:g} s'}, "
           f"{fps:g} fps expected ...", flush=True)
-    watches = {n: Watch(n, u) for n, u in cams.items()}
+    watches = {n: Watch(n, u, reader=a.reader, transport=a.transport) for n, u in cams.items()}
     for w in watches.values():
         w.start()
     t_end = time.perf_counter() + OPEN_MS / 1000 + 2
@@ -278,7 +368,7 @@ def main(argv=None):
     lines, doc = [f"camera check {time.strftime('%Y-%m-%d %H:%M:%S')}, {fps:g} fps expected"], {"fps": fps, "cameras": {}}
     for n, w in watches.items():
         t, b, d = w.series()
-        st = stats(t, d, fps)
+        st = stats(t, d, fps, list(w.flags), w.damage())
         delays = flash_delays(t, b, toggles) if toggles else None
         lines += [""] + report_lines(n, w, st, fps, delays)
         doc["cameras"][n] = {"url": hide_login(w.url), "rotate": w.rot, "size": w.size, "codec": w.codec,

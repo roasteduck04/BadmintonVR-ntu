@@ -44,13 +44,16 @@ def warm_key(cfg) -> str:
     return json.dumps(key, sort_keys=True, default=str)
 
 
+SECONDS_PER_MINUTE = 60
+
+
 def warmup_sets(cfg, sets, a, b) -> list:
     """The warm-up run's settings: the part [a, b] s of the videos. Camera input has no part (the config makes it
     "from now, up to input.max_minutes"), so there the warm-up's length is given as its longest stream - without
     it a camera warm-up ran for the whole input.max_minutes (5 min by default) before it was ready."""
     out = list(sets or []) + [f"section_s=[{a}, {b}]"]
     if (cfg.get("input") or {}).get("kind") == "camera":
-        out.append(f"input.max_minutes={(float(b) - float(a)) / 60.0}")
+        out.append(f"input.max_minutes={(float(b) - float(a)) / SECONDS_PER_MINUTE}")
     return out
 
 
