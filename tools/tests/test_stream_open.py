@@ -112,6 +112,29 @@ def test_stream_flags_damaged_pictures_and_holds_the_last_clean_one(tmp_path):
             assert img is last_clean
 
 
+def test_live_stream_that_falls_behind_skips_to_a_keyframe_instead_of_smearing(tmp_path):
+    """A file read as a live stream arrives all at once (like a backlog after a slow spell): the receiving thread
+    drops the waiting packets up to the newest keyframe, so every picture handed out is clean - fewer of them."""
+    clean, _ = _clip(str(tmp_path), n=150)
+    holder = {}
+
+    def log(msg):
+        holder.setdefault("msgs", []).append(msg)
+        if "opening it again" in msg:
+            holder["s"].running = False
+
+    s = so.Stream(clean, name="t", damaged="use", live=True, backlog_s=0.05, log=log)
+    holder["s"] = s
+    got = []
+    for img, flag, _ in s.frames():
+        got.append(flag)
+        time.sleep(0.01)                                 # a slow consumer: the backlog gets old
+    h = s.health()
+    assert h["skipped"] > 0 and len(got) < 150 and h["skipped"] + len(got) <= 150
+    assert set(got) == {"clean"} and h["errors"] == 0    # jumped to keyframes: no smear
+    assert so.is_live("rtsp://pc:8554/unit1") and so.is_live("tcp://pi:8888") and not so.is_live(clean)
+
+
 def test_grab_clean_returns_a_clean_picture_or_the_error(tmp_path):
     clean, _ = _clip(str(tmp_path), n=40)
     img, info = so.grab_clean(clean, drain_s=0.0)
@@ -142,7 +165,10 @@ def test_camera_check_damage_numbers_and_verdict():
     assert st["damaged_pct"] == 10.0 and st["damaged_frames"] == 1 and st["longest_damaged_run"] == 10
     assert st["decoder_errors"] == 7
     v = " | ".join(cc.verdict(st, 60))
-    assert "10 % of pictures damaged" in v and "BEFORE this PC" in v
+    assert "10 % of pictures damaged" in v and "reader is too slow" in v and "Wi-Fi" in v
+    assert "fell behind" not in v
+    st = cc.stats([i / 60.0 for i in range(100)], [255.0] + [3.0] * 99, 60, ["clean"] * 100, {"skipped": 30})
+    assert st["skipped_behind"] == 30 and any("this PC fell behind: 30 pictures" in x for x in cc.verdict(st, 60))
     st = cc.stats([i / 60.0 for i in range(100)], [255.0] + [3.0] * 99, 60, ["clean"] * 100)
     assert st["damaged_pct"] == 0.0 and cc.verdict(st, 60) == ["steady"]
     assert "damaged_pct" not in cc.stats([i / 60.0 for i in range(10)], [3.0] * 10, 60)      # OpenCV: not counted

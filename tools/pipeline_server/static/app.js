@@ -223,7 +223,7 @@ function showFeed(r, what) {
     const s = c.stats || {};
     if (!s.fps) return `<tr><td><b>${esc(n)}</b></td><td colspan="6" class="badc">${esc(c.error || "no frames arrived")}</td></tr>`;
     const dmg = s.damaged_pct == null ? '<span class="muted">not counted</span>'
-      : `<span class="${s.damaged_pct >= 0.5 ? "badc" : "good"}">${s.damaged_pct} %</span><div class="tiny muted">${s.damaged_frames} hit · longest run ${s.longest_damaged_run}</div>`;
+      : `<span class="${s.damaged_pct >= 0.5 ? "badc" : "good"}">${s.damaged_pct} %</span><div class="tiny muted">${s.damaged_frames} hit · longest run ${s.longest_damaged_run}${s.skipped_behind ? ` · ${s.skipped_behind} skipped (PC behind)` : ""}</div>`;
     const low = s.fps < 0.9 * r.fps;
     const delay = c.delays_s ? (c.delay_s != null ? `<b>${c.delay_s} s</b> <span class="tiny muted">(${c.delay_min_s}–${c.delay_max_s}, ${c.flashes_seen} of ${c.delays_s.length} flashes)</span>`
       : '<span class="muted">screen not seen</span>') : "–";

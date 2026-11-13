@@ -22,8 +22,10 @@ What it does differently from a plain pipe:
 Damaged pictures ("[h264] error while decoding MB ...", grey / smeared blocks) - packets lost on the way:
 - the live server reads every RTSP stream over TCP (page step 1, RTSP transport: TCP) and flags each damaged picture:
   "Check the feed" shows the damaged %, and the engine holds the last clean picture until the next keyframe (Damaged
-  pictures: hold). With TCP on the reading side the loss happened BEFORE MediaMTX: between the camera and this node /
-  the encoder, or on the hop that publishes into MediaMTX;
+  pictures: hold). With TCP on the reading side the loss happened BEFORE MediaMTX (between the camera and this node /
+  the encoder, or on the hop that publishes into MediaMTX) - unless MediaMTX's window says "reader is too slow": then
+  MediaMTX threw packets away because a reader on the server PC fell behind (a busy CPU; the live server's reader
+  receives on its own thread and skips to the next keyframe instead, so look for another reader such as VLC);
 - publish into MediaMTX over TCP (this node does: -rtsp_transport tcp). For an encoder that publishes over UDP, or a
   camera MediaMTX pulls itself (paths: <name>: source: rtsp://...), make MediaMTX use TCP only - in mediamtx.yml:
       rtspTransports: [tcp]          # older MediaMTX versions: protocols: [tcp]
