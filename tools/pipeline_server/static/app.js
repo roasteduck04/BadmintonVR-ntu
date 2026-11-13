@@ -78,6 +78,9 @@ async function loadSource() {
   $("#src-clip").innerHTML = state.clips.map((c) => `<option value="${c.name}">${esc(c.label)}${c.streamable ? "" : " — calibrate only"}</option>`).join("");
   $("#src-clip").value = src.clip;
   $("#src-fps").value = inp.fps; $("#src-mins").value = inp.max_minutes;
+  const so = inp.stream || {};                                       // v0.8.7 camera reader settings
+  $("#src-reader").value = so.reader || "pyav"; $("#src-transport").value = so.transport || "tcp";
+  $("#src-damaged").value = so.damaged || "hold";
   $("#src-msg").textContent = "";
   await camCalibStatus();
   renderSourceKind(); await renderClip();
@@ -218,18 +221,21 @@ const feedRows = () => src.cams.filter((c) => c.url || c.type === "usb");
 function showFeed(r, what) {
   const rows = Object.entries(r.cameras).map(([n, c]) => {
     const s = c.stats || {};
-    if (!s.fps) return `<tr><td><b>${esc(n)}</b></td><td colspan="5" class="badc">${esc(c.error || "no frames arrived")}</td></tr>`;
+    if (!s.fps) return `<tr><td><b>${esc(n)}</b></td><td colspan="6" class="badc">${esc(c.error || "no frames arrived")}</td></tr>`;
+    const dmg = s.damaged_pct == null ? '<span class="muted">not counted</span>'
+      : `<span class="${s.damaged_pct >= 0.5 ? "badc" : "good"}">${s.damaged_pct} %</span><div class="tiny muted">${s.damaged_frames} hit · longest run ${s.longest_damaged_run}</div>`;
     const low = s.fps < 0.9 * r.fps;
     const delay = c.delays_s ? (c.delay_s != null ? `<b>${c.delay_s} s</b> <span class="tiny muted">(${c.delay_min_s}–${c.delay_max_s}, ${c.flashes_seen} of ${c.delays_s.length} flashes)</span>`
       : '<span class="muted">screen not seen</span>') : "–";
     return `<tr><td><b>${esc(n)}</b><div class="tiny muted">${c.size ? c.size[0] + "×" + c.size[1] : ""} ${esc(c.codec || "")}</div></td>
       <td class="${low ? "badc" : "good"}">${s.fps} fps<div class="tiny muted">worst second ${s.fps_worst_second}</div></td>
       <td>${s.gap_ms_p50} ms<div class="tiny muted">1 in 20 above ${s.gap_ms_p95} · longest ${s.gap_ms_max}</div></td>
+      <td>${dmg}</td>
       <td>${delay}</td>
       <td>${c.verdict.map((v) => `<div class="${v === "steady" ? "good" : "warnc"}">${esc(v)}</div>`).join("")}</td></tr>`;
   }).join("");
   $("#src-feed").innerHTML = `<div class="small"><b>${esc(what)}</b> · ${r.fps} fps expected · even spacing = ${(1000 / r.fps).toFixed(1)} ms</div>
-    <div class="table-wrap"><table class="tbl"><thead><tr><th>Camera</th><th>Arriving</th><th>Time between frames</th><th>Delay</th><th>Findings</th></tr></thead>
+    <div class="table-wrap"><table class="tbl"><thead><tr><th>Camera</th><th>Arriving</th><th>Time between frames</th><th title="Pictures the decoder had to patch because packets were lost before this PC (grey / smeared blocks), with the ones after them until the next keyframe">Damaged pictures</th><th>Delay</th><th>Findings</th></tr></thead>
     <tbody>${rows}</tbody></table></div><div class="tiny muted">Report and one picture per camera: ${esc(r.folder)}</div>`;
 }
 $("#src-check").addEventListener("click", async () => {
@@ -391,7 +397,9 @@ $("#src-testcams").addEventListener("click", async () => {
 $("#src-save").addEventListener("click", async () => {
   const c = clipOf(src.clip);
   const body = { kind: src.kind, clip: src.clip, views: src.views[src.clip] || c.live_views,
-    video_variant: $("#src-variant").value || null, cameras: src.cams, fps: Number($("#src-fps").value), max_minutes: Number($("#src-mins").value) };
+    video_variant: $("#src-variant").value || null, cameras: src.cams, fps: Number($("#src-fps").value), max_minutes: Number($("#src-mins").value),
+    stream: { ...((state.input || {}).stream || {}), reader: $("#src-reader").value, transport: $("#src-transport").value,
+              damaged: $("#src-damaged").value } };
   const usbRows = src.kind === "camera" && src.cams.some((c) => c.type === "usb" && c.use);
   $("#src-msg").textContent = usbRows ? "Saving (starting the USB cameras)…" : "";
   try {

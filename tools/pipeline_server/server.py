@@ -41,6 +41,7 @@ import jobs as jobmod  # noqa: E402
 import settings as st  # noqa: E402
 from analysis.live import config as live_config  # noqa: E402
 from analysis.live import framewriter as fw  # noqa: E402
+from analysis.live import stream_open  # noqa: E402
 
 STATIC = HERE / "static"
 NOW_PLAYING = "now_playing.json"
@@ -446,7 +447,8 @@ class Server:
     def get_input(self) -> dict:
         """The Source step: {kind video|camera, clip, views (chosen angles of the clip), video_variant, cameras [{name,
         url, use} + type usb, device for a USB camera on this PC (v0.8.7; url = its relay address)] (live broadcast;
-        names are the user's, default cam1, cam2, ...), fps, max_minutes}. v0.8.4 files
+        names are the user's, default cam1, cam2, ...), fps, max_minutes, stream {reader, transport, damaged,
+        hold_max_s} (v0.8.7: how the camera streams are read, analysis/live/stream_open.py)}. v0.8.4 files
         ({view: url} cameras, no clip) are read too."""
         p = self.runs / INPUT_FILE
         d = {"kind": "video", "clip": None, "views": [], "fps": 60, "max_minutes": 5, "cameras": [], "video_variant": None}
@@ -455,6 +457,10 @@ class Server:
                 d.update(json.load(fh) or {})
         except (OSError, ValueError):
             pass
+        try:
+            d["stream"] = stream_open.options(d.get("stream") if isinstance(d.get("stream"), dict) else None)
+        except ValueError:
+            d["stream"] = dict(stream_open.DEFAULTS)
         if isinstance(d.get("cameras"), dict):
             d["cameras"] = [{"name": k, "url": v, "use": True} for k, v in d["cameras"].items()]
         names = [c["name"] for c in self.clips()]
@@ -532,6 +538,11 @@ class Server:
         vv = d.get("video_variant") or None
         if vv is not None and not re.match(r"^[A-Za-z0-9_-]{1,20}$", str(vv)):
             raise HTTPException(400, "bad video_variant")
+        try:
+            stream = stream_open.options(d.get("stream") if isinstance(d.get("stream"), dict)
+                                         else self.get_input().get("stream"))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         if kind == "camera" and devs:                    # v0.8.7: USB rows stream through the relay (started here)
             urls = self.usb_start(devs, fps)
             for c in cams:
@@ -540,7 +551,7 @@ class Server:
         else:
             self.usb_stop()                              # frees the USB cameras for other apps
         out = {"kind": kind, "clip": clip, "views": views, "fps": fps, "max_minutes": mins, "cameras": cams,
-               "video_variant": vv}
+               "video_variant": vv, "stream": stream}
         atomic_json(self.runs / INPUT_FILE, out)
         return out
 
@@ -569,7 +580,7 @@ class Server:
             cams = self.used_cameras(d)
             return ["input.kind=camera", "input.cameras=" + json.dumps(cams), f"views=[{', '.join(cams)}]",
                     f"input.fps={d['fps']}", f"input.max_minutes={d['max_minutes']}", "video_variant=null",
-                    "sync.offsets=auto"]
+                    "sync.offsets=auto"] + [f"input.{k}={v}" for k, v in d["stream"].items()]
         out = ["input.kind=video"] + ([f"video_variant={d['video_variant']}"] if d.get("video_variant") else [])
         return out + ([f"views=[{', '.join(d['views'])}]"] if d.get("views") else [])
 
@@ -673,7 +684,8 @@ class Server:
                 for c in cams if c["url"] or c["name"] in urls}
         if not addr:
             raise HTTPException(400, "no camera address to check")
-        watches = {n: cc.Watch(n, u) for n, u in addr.items()}
+        so = self.get_input()["stream"]                  # v0.8.7: the engine's reader + transport (damage counted)
+        watches = {n: cc.Watch(n, u, reader=so["reader"], transport=so["transport"]) for n, u in addr.items()}
         for w in watches.values():
             w.start()
         t_end = time.monotonic() + cc.OPEN_MS / 1000 + 2
@@ -693,7 +705,7 @@ class Server:
         cams, lines = {}, [f"camera check {time.strftime('%Y-%m-%d %H:%M:%S')}, {fps:g} fps expected"]
         for n, w in watches.items():
             t, b, d = w.series()
-            st_ = cc.stats(t, d, fps)
+            st_ = cc.stats(t, d, fps, list(getattr(w, "flags", [])), w.damage() if hasattr(w, "damage") else None)
             delays = cc.flash_delays(t, b, toggles) if toggles else None
             seen = [x for x in (delays or []) if x is not None]
             cams[n] = {"size": w.size, "codec": w.codec, "open_s": w.open_s, "first_frame_s": w.first_s,

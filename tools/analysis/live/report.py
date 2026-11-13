@@ -422,6 +422,14 @@ def render_run(run_dir, log=print) -> str:
     if cpu and cpu.get("samples"):
         L.append(f"- **CPU:** mean {cpu['cpu_mean']:.0f} %, max {cpu['cpu_max']:.0f} %, this run's RSS up to "
                  f"{_f(cpu['rss_max_mb'], 0)} MB.")
+    ch = S.get("camera_health") or {}
+    if ch:                               # v0.8.7: pictures damaged by packets lost before this PC (stream_open.py)
+        L += ["", "## Camera pictures", "",
+              "Pictures damaged by lost packets (smeared blocks until the next keyframe). With input.damaged hold "
+              "they were replaced by the camera's last clean picture.", "",
+              "| camera | pictures used | held (damaged, replaced) | damaged, passed on | damaged % |", "|---|---|---|---|---|"]
+        L += [f"| {v} | {h['frames']} | {h['held']} | {h['damaged']} | {_f(h.get('damaged_pct'))} |"
+              for v, h in sorted(ch.items())]
     L += ["", "## Machine", ""] + _machine_lines(R["machine"], S.get("source_info")) + [""]
     L += ["## Settings", "",
           f"- sync **{cfg['sync']['mode']}**, offsets **{cfg['offsets_source']}** → "

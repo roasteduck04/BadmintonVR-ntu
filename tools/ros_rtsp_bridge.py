@@ -16,7 +16,19 @@ What it does differently from a plain pipe:
 - frames are stamped with the time they arrive (-use_wallclock_as_timestamps) and sent at a constant rate, so a frame
   lost on Wi-Fi does not make the stream run ahead of real time;
 - --flip turns the picture 180 degrees for a camera mounted upside down (the pose model needs upright people);
-- an ffmpeg that exits is started again, and each unit's real frame rate is printed every few seconds.
+- an ffmpeg that exits is started again, and each unit's real frame rate is printed every few seconds;
+- a keyframe every half second (--gop, default fps/2), or --intra-refresh: a picture damaged by lost packets heals fast.
+
+Damaged pictures ("[h264] error while decoding MB ...", grey / smeared blocks) - packets lost on the way:
+- the live server reads every RTSP stream over TCP (page step 1, RTSP transport: TCP) and flags each damaged picture:
+  "Check the feed" shows the damaged %, and the engine holds the last clean picture until the next keyframe (Damaged
+  pictures: hold). With TCP on the reading side the loss happened BEFORE MediaMTX: between the camera and this node /
+  the encoder, or on the hop that publishes into MediaMTX;
+- publish into MediaMTX over TCP (this node does: -rtsp_transport tcp). For an encoder that publishes over UDP, or a
+  camera MediaMTX pulls itself (paths: <name>: source: rtsp://...), make MediaMTX use TCP only - in mediamtx.yml:
+      rtspTransports: [tcp]          # older MediaMTX versions: protocols: [tcp]
+  and for a pulled camera, under its path:  rtspTransport: tcp   (older: sourceProtocol: tcp);
+- a Pi on Wi-Fi: a wired link, a 5 GHz network, or a lower --bitrate (fewer packets to lose) helps most.
 """
 from __future__ import annotations
 
@@ -32,9 +44,12 @@ REPORT_S = 5.0
 
 
 def ffmpeg_cmd(unit, server="rtsp://127.0.0.1:8554", fps=60, bitrate="8M", preset="veryfast", flip=False,
-               ffmpeg="ffmpeg") -> list:
-    """The ffmpeg command of one unit: JPEG frames on stdin -> H.264 -> <server>/<unit>."""
+               ffmpeg="ffmpeg", gop=None, intra_refresh=False) -> list:
+    """The ffmpeg command of one unit: JPEG frames on stdin -> H.264 -> <server>/<unit>. gop = frames between
+    keyframes (default half a second: a picture damaged by lost packets heals within 0.5 s); intra_refresh = x264
+    periodic intra refresh instead of whole keyframes (no bitrate spikes, damage heals as a moving stripe)."""
     fps = int(round(float(fps)))
+    gop = max(1, int(gop)) if gop else max(1, fps // 2)
     cmd = [ffmpeg, "-loglevel", "warning",
            "-use_wallclock_as_timestamps", "1",          # the time each frame arrived, not a counted 1/fps
            "-f", "image2pipe", "-c:v", "mjpeg", "-i", "-"]
@@ -43,8 +58,10 @@ def ffmpeg_cmd(unit, server="rtsp://127.0.0.1:8554", fps=60, bitrate="8M", prese
     cmd += ["-fps_mode", "cfr", "-r", str(fps),          # constant rate: a lost frame is repeated, not skipped
             "-c:v", "libx264", "-preset", preset, "-tune", "zerolatency",
             "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
-            "-g", str(fps), "-pix_fmt", "yuv420p",       # a keyframe every second: a reader joins within 1 s
-            "-f", "rtsp", "-rtsp_transport", "tcp", f"{server.rstrip('/')}/{unit}"]
+            "-g", str(gop), "-pix_fmt", "yuv420p"]       # keyframe every gop frames: a reader joins / heals fast
+    if intra_refresh:
+        cmd += ["-intra-refresh", "1"]
+    cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", f"{server.rstrip('/')}/{unit}"]
     return cmd
 
 
@@ -100,6 +117,10 @@ def parse_args(argv=None):
     ap.add_argument("--preset", default="veryfast", help="x264 preset; ultrafast is lighter but blockier")
     ap.add_argument("--flip", action="store_true", help="turn every picture 180 degrees (cameras mounted upside down)")
     ap.add_argument("--flip-units", default="", help="turn only these units 180 degrees, comma-separated")
+    ap.add_argument("--gop", type=int, default=0,
+                    help="frames between keyframes (default: half a second, fps/2; damaged pictures heal at the next)")
+    ap.add_argument("--intra-refresh", action="store_true",
+                    help="x264 periodic intra refresh instead of whole keyframes (smoother bitrate on Wi-Fi)")
     ap.add_argument("--ffmpeg", default="ffmpeg")
     return ap.parse_args(argv)
 
@@ -120,7 +141,8 @@ def main(argv=None):
             super().__init__("rtsp_bridge")
             self.pipes = {}
             for u in units:
-                self.pipes[u] = Pipe(u, ffmpeg_cmd(u, a.server, a.fps, a.bitrate, a.preset, u in flips, a.ffmpeg),
+                self.pipes[u] = Pipe(u, ffmpeg_cmd(u, a.server, a.fps, a.bitrate, a.preset, u in flips, a.ffmpeg,
+                                                   gop=a.gop or None, intra_refresh=a.intra_refresh),
                                      log=lambda m: self.get_logger().warning(m))
                 # a callback group per unit: one slow ffmpeg does not hold the other cameras back
                 self.create_subscription(CompressedImage, a.topic.format(unit=u),

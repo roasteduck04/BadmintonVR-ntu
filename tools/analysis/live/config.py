@@ -291,6 +291,8 @@ def resolve(c, probe=probe_sources) -> dict:
         if c["backend"] != "live" or c["video_variant"]:
             raise ValueError("input.kind camera needs backend live and no video_variant")
         c["videos"] = {v: str(cams[v]) for v in c["views"]}
+        from . import stream_open
+        ip.update(stream_open.options({k: ip.get(k) for k in stream_open.DEFAULTS}))   # v0.8.7 reader settings
         c["section_s"] = [0.0, None]                   # cameras: from now, up to input.max_minutes
         c["sync"]["mode"] = "nearest"                  # a live stream has no "two frames around the instant" to blend
     for k, allowed in (("backend", BACKENDS), ("device", DEVICES), ("pace", PACES)):

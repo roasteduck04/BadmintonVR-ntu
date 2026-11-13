@@ -317,70 +317,124 @@ class CameraReader(Reader):
     """v0.8.4 camera source: a live stream address read by OpenCV (FFmpeg backend: RTSP, HTTP MJPEG, TCP, UDP...) on
     a background thread that keeps only the newest frame. read(f) returns the newest frame that arrived after the one
     returned before (waiting up to `timeout_s`), so a step gets whatever the camera has at that moment - frame numbers
-    are the schedule's, not the camera's; the frame's arrival time is kept in `last_arrival_ns`."""
+    are the schedule's, not the camera's; the frame's arrival time is kept in `last_arrival_ns`.
+
+    v0.8.7 `cam` = the input's camera settings (analysis/live/stream_open.py): reader pyav (default) decodes with PyAV,
+    finds pictures damaged by lost packets and (damaged hold) gives the last clean picture instead; reader opencv is
+    the old OpenCV path. The flag of every picture handed out (clean | held | damaged | tainted | None for opencv) is
+    kept for the frame's timing (flag_of)."""
     kind = "camera"
 
-    def __init__(self, path, first, fps, short_side, threads=0, timeout_s=5.0):
+    def __init__(self, path, first, fps, short_side, threads=0, timeout_s=5.0, cam=None, log=print):
         import cv2
+        from . import stream_open
         from .config import split_rotate, upright
         self.cv2, self._upright = cv2, upright
+        self.opts = stream_open.options(cam)
         path, self.rot = split_rotate(path)              # '#rotate=180': a camera mounted upside down
         self.path, self.fps, self.threads, self.timeout_s = path, float(fps), int(threads or 0), float(timeout_s)
-        self.cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
-        if not self.cap.isOpened():
-            raise FileNotFoundError(f"cannot open camera stream {path}")
-        ok, img = self.cap.read()
-        if not ok or img is None:
-            raise FileNotFoundError(f"camera stream {path} sends no frames")
-        img = upright(img, self.rot)
-        self.src_h, self.src_w = img.shape[:2]
+        self.flags, self.stream, self.cap = {}, None, None
+        self.cond = threading.Condition()
+        self.latest, self.latest_flag, self.count, self.given = None, None, 0, 0
+        self.last_arrival_ns, self.error = time.monotonic_ns(), None
+        self.running = True
+        if self.opts["reader"] == "pyav" and not stream_open.pyav_available():
+            log(f"camera {path}: PyAV is not installed (pip install av) - reading with OpenCV, no damage check")
+            self.opts["reader"] = "opencv"
+        if self.opts["reader"] == "pyav":
+            self.stream = stream_open.Stream(path, name=path, transport=self.opts["transport"],
+                                             damaged=self.opts["damaged"], hold_max_s=self.opts["hold_max_s"],
+                                             read_s=max(2.0, self.timeout_s), log=log)
+            target = self._loop_pyav
+        else:
+            self.cap = stream_open.opencv_capture(path, self.opts["transport"])
+            if not self.cap.isOpened():
+                raise FileNotFoundError(f"cannot open camera stream {path}")
+            target = self._loop_cv2
         self.codec = "stream"
+        self.thread = threading.Thread(target=target, daemon=True, name=f"camera-{path}")
+        self.thread.start()
+        with self.cond:                                  # the first (clean) picture gives the size
+            self.cond.wait_for(lambda: self.count > 0 or not self.running, timeout=self.stream.open_s + 10.0
+                               if self.stream else 15.0)
+            img = self.latest
+        if img is None:
+            self.close()
+            why = f" ({self.error})" if self.error else ""
+            raise FileNotFoundError(f"camera stream {path} sends no frames{why}")
+        self.src_h, self.src_w = img.shape[:2]
         self.out_w, self.out_h, self.scale = target_size(self.src_w, self.src_h, short_side)
         self.pos = int(first)
-        self.cond = threading.Condition()
-        self.latest, self.count, self.given, self.last_arrival_ns = img, 1, 0, time.monotonic_ns()
-        self.running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True, name=f"camera-{path}")
-        self.thread.start()
 
-    def _loop(self):
+    def _put(self, img, flag):
+        img = self._upright(img, self.rot)
+        with self.cond:
+            self.latest, self.latest_flag = img, flag
+            self.count, self.last_arrival_ns = self.count + 1, time.monotonic_ns()
+            self.cond.notify_all()
+
+    def _loop_pyav(self):
+        try:
+            for img, flag, _t in self.stream.frames():
+                if not self.running:
+                    break
+                self._put(img, flag)
+        except Exception as e:  # noqa: BLE001 - the first open failed: __init__ reports it
+            self.error = f"{type(e).__name__}: {e}"
+        finally:
+            self.running = False
+            with self.cond:
+                self.cond.notify_all()
+
+    def _loop_cv2(self):
         while self.running:
             ok, img = self.cap.read()
             if not ok or img is None:
                 time.sleep(0.01)
                 continue
-            img = self._upright(img, self.rot)
-            with self.cond:
-                self.latest, self.count, self.last_arrival_ns = img, self.count + 1, time.monotonic_ns()
-                self.cond.notify_all()
+            self._put(img, None)
 
     def read(self, f):
         with self.cond:
             self.cond.wait_for(lambda: self.count > self.given or not self.running, timeout=self.timeout_s)
             if self.count <= self.given:
                 return None
-            img, self.given = self.latest, self.count
+            img, flag, self.given = self.latest, self.latest_flag, self.count
         self.pos = int(f) + 1
+        if flag is not None:
+            if len(self.flags) > 512:                    # frames whose flag nobody asked for (dropped steps)
+                for k in sorted(self.flags)[:256]:
+                    del self.flags[k]
+            self.flags[f] = flag
         if self.scale != 1.0:
             img = self.cv2.resize(img, (self.out_w, self.out_h), interpolation=self.cv2.INTER_AREA)
         return img
 
+    def flag_of(self, f):
+        return self.flags.pop(f, None)
+
+    def health(self):
+        return self.stream.health() if self.stream is not None else None
+
     def close(self):
         self.running = False
+        if self.stream is not None:
+            self.stream.close()
         with self.cond:
             self.cond.notify_all()
-        self.thread.join(timeout=2.0)
-        self.cap.release()
+        self.thread.join(timeout=2.0 if self.stream is None else self.stream.read_s + 1.0)
+        if self.cap is not None:
+            self.cap.release()
 
 
 READERS = {"cv2": Cv2Reader, "pyav": PyAvReader, "ffmpeg": FfmpegReader, "nvdec": NvdecReader, "nvcodec": NvCodecReader,
            "camera": CameraReader}
 
 
-def open_reader(kind, path, first, fps, short_side=None, threads=0):
+def open_reader(kind, path, first, fps, short_side=None, threads=0, **kw):
     if kind not in READERS:
         raise ValueError(f"rtmpose.decoder {kind!r} is not one of {DECODERS}")
-    return READERS[kind](path, first, fps, short_side, threads)
+    return READERS[kind](path, first, fps, short_side, threads, **kw)
 
 
 # ---------------------------------------------------------------------------------------------------- pose engine
@@ -975,7 +1029,8 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
     def reader_for(v, first):
         if is_stream_url(paths[v]):
             if v not in cams_open:
-                cams_open[v] = open_reader("camera", paths[v], first, fps, short, rcfg.get("decode_threads", 0))
+                cams_open[v] = open_reader("camera", paths[v], first, fps, short, rcfg.get("decode_threads", 0),
+                                           cam=rcfg.get("_camera"), log=lambda m: print("  " + m, flush=True))
             return cams_open[v]
         return open_reader(kind, paths[v], first, fps, short, rcfg.get("decode_threads", 0))
 
@@ -1034,7 +1089,8 @@ def fast_worker(views, paths, plans, origins, rcfg, device, fps, t0_val, go_ev, 
                                       "video_size": [rd[v].src_w, rd[v].src_h], "video_to_calib": k_cal[v],
                                       "ep": engine.ep, "trt_version": engine.trt_version, "trt_notes": engine.trt_notes,
                                       "batch_views": len(views) > 1, "model": engine.model,
-                                      "det_async": engine.det_async}, **(extra or {}))))
+                                      "det_async": engine.det_async,
+                                      "camera": getattr(rd[v], "opts", None)}, **(extra or {}))))
 
     def wait_go():
         while not go_ev.wait(0.05):
@@ -1161,7 +1217,8 @@ def _run_session(engine, readers, k_cal, views, plans, origins, fps, t0_ns, real
                     "t_avail_ns": t_av, "t_done_ns": time.monotonic_ns(), "decode_ns": dec_ns, "wait_ns": wait_ns,
                     "infer_ns": t3 - t1, "det_ns": det_ns, "prep_ns": t2 - t1, "pose_ns": t3 - t2,
                     "batch_images": len(items), "batch_crops": len(all_crops), "persons": n, "detected": detected,
-                    "dropped": img is None, "first_call": first_call}))
+                    "dropped": img is None, "first_call": first_call,
+                    "cam": readers[v].flag_of(f) if hasattr(readers[v], "flag_of") else None}))
             first_call = False
     except Exception as e:  # noqa: BLE001
         reason = "error"
